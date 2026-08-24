@@ -1,0 +1,21 @@
+{
+  "name": "ai-product-studio",
+  "version": "2.0.0",
+  "description": "AI product photography/video studio — migrated from Google (Gemini/Veo) to Fal.ai",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+    
+  },
+  "dependencies": {
+    "@fal-ai/client": "^1.2.0",
+    "@imgly/background-removal": "^1.7.0",
+    "better-sqlite3": "^11.3.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "nodemon": "^3.1.14",
+    "vite": "^8.1.5"
+  }
+}

@@ -1,0 +1,17 @@
+node_modules/
+
+test data/
+
+.env
+
+.env.example
+
+public/generated-videos/
+
+public/imgly-assets/
+
+data/
+
+flow-outputs/
+
+package.tgz

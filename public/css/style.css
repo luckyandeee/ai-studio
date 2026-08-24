@@ -1,0 +1,62 @@
+.cursor-pointer {
+    cursor: pointer;
+}
+.max-h-200mx {
+    max-height: 260px;
+    object-fit: contain;
+}
+.border-dashed {
+    border-style: dashed !important;
+}
+#dropzone {
+    transition: background-color 0.2s, border-color 0.2s;
+}
+#dropzone:hover {
+    background-color: #f8f9fa !important;
+    border-color: #0d6efd !important;
+}
+.img-select-card {
+    transition: transform 0.2s, box-shadow 0.2s;
+    cursor: pointer;
+}
+.img-select-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+}
+.img-select-card.selected {
+    border: 3px solid #0d6efd !important;
+}
+.checkerboard {
+    background-image: 
+      linear-gradient(45deg, #e0e0e0 25%, transparent 25%), 
+      linear-gradient(-45deg, #e0e0e0 25%, transparent 25%), 
+      linear-gradient(45deg, transparent 75%, #e0e0e0 75%), 
+      linear-gradient(-45deg, transparent 75%, #e0e0e0 75%);
+    background-size: 20px 20px;
+    background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+    background-color: #ffffff;
+}
+
+.processing-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 99999;
+
+    display: flex;
+    justify-content: center;
+    align-items: center;
+
+    background: rgba(255,255,255,.75);
+    backdrop-filter: blur(4px);
+
+    pointer-events: all;
+}
+
+.processing-card {
+    background: #fff;
+    padding: 2rem 2.5rem;
+    border-radius: 16px;
+    box-shadow: 0 12px 40px rgba(0,0,0,.2);
+    text-align: center;
+    min-width: 320px;
+}

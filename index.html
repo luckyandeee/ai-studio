@@ -1,0 +1,1599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Studio - Smart Marketing Suite</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body class="bg-light">
+    <nav class="navbar navbar-dark bg-dark shadow-sm">
+        <div class="container">
+            <a class="navbar-brand fw-bold" href="#">🎨 AI Studio</a>
+            <div class="d-flex align-items-center gap-2">
+                <button class="btn btn-outline-light btn-sm" id="videoLibraryNavBtn">🎞️ Video Library</button>
+                <button class="btn btn-outline-light btn-sm" data-bs-toggle="modal" data-bs-target="#campaignsModal">📂 Past Campaigns</button>
+                <button class="btn btn-outline-light btn-sm" id="brandProfileNavBtn">🧑‍💼 Brand Profile</button>
+                <button class="btn btn-outline-light btn-sm" id="batchModeNavBtn">👗 Batch Mode</button>
+                <button class="btn btn-outline-light btn-sm" id="wizardModeNavBtn">✨ Smart Wizard</button>
+                <button class="btn btn-outline-light btn-sm" data-bs-toggle="modal" data-bs-target="#imageToolsModal">🛠️ Image Tools</button>
+                <button class="btn btn-outline-light btn-sm" data-bs-toggle="modal" data-bs-target="#voiceStudioModal">🎙️ Voice Studio</button>
+                <button class="btn btn-outline-light btn-sm" data-bs-toggle="modal" data-bs-target="#songStudioModal">🎵 Song Studio</button>
+                <button class="btn btn-outline-light btn-sm" id="flowModeNavBtn">🎬 Flow Studio</button>
+                <button class="btn btn-outline-light btn-sm" data-bs-toggle="offcanvas" data-bs-target="#trustSummaryOffcanvas">🧠 Model Trust</button>
+                <button class="btn btn-outline-light btn-sm position-relative" data-bs-toggle="offcanvas" data-bs-target="#activityLogOffcanvas">
+                    📋 Activity Log
+                    <span id="activityLogBadge" class="badge rounded-pill bg-danger position-absolute top-0 start-100 translate-middle d-none" style="font-size: 0.6rem;">0</span>
+                </button>
+                <button class="btn btn-outline-light btn-sm" data-bs-toggle="modal" data-bs-target="#creditsModal">
+                    💳 <span id="navCreditsSpent">$0.00</span> spent <span id="navBackendDot" class="d-none">🔴</span>
+                </button>
+                <button class="btn btn-outline-light btn-sm" data-bs-toggle="modal" data-bs-target="#settingsModal">⚙️ API Settings</button>
+            </div>
+        </div>
+    </nav>
+    <!-- BACKEND OFFLINE BANNER: shown whenever a backend fetch fails with a
+         network error or a non-JSON response (502/HTML fallback page) — the
+         exact symptom of the Express server not running. Sits above
+         everything else so it's the first thing noticed, not buried in the
+         console. -->
+    <div id="backendOfflineBanner" class="d-none alert alert-danger rounded-0 mb-0 text-center py-2 small" style="position: sticky; top: 0; z-index: 2000;">
+        ⚠️ Can't reach the backend server. Make sure <code>node server.js</code> is running (it should print "Server executing seamlessly at http://localhost:3000"), then <button class="btn btn-sm btn-outline-danger py-0 px-2 ms-1" onclick="window.location.reload()">reload this page</button>.
+    </div>
+    <div id="statusView" class="processing-overlay d-none">
+        <div class="processing-card">
+            <div class="spinner-border text-primary mb-3" role="status"></div>
+            <h6 class="fw-bold mb-1" id="statusMessage">Processing data...</h6>
+            <div class="small text-muted mb-2" id="statusDetail"></div>
+            <div class="small text-muted" id="statusElapsed"></div>
+            <div class="small text-muted fst-italic mt-2" style="max-width: 320px;">Fal's image/video models occasionally run under heavy demand — this can take up to a minute or two. It'll automatically retry and switch models if needed rather than just fail.</div>
+        </div>
+    </div>
+    <div id="videoQueueBar" class="d-none" style="position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 1050; max-width: 92vw;">
+        <div class="bg-dark text-white rounded-pill shadow-lg d-flex align-items-center gap-3 px-4 py-2">
+            <span class="small fw-semibold">🎬 <span id="videoQueueCount">0</span> shot(s) selected for video</span>
+            <button type="button" class="btn btn-sm btn-light fw-bold" id="videoQueueContinueBtn">Continue →</button>
+            <button type="button" class="btn btn-sm btn-outline-light" id="videoQueueClearBtn">Clear</button>
+        </div>
+    </div>
+    <div class="container my-4 my-lg-5">
+        <div class="row g-4" id="singleProductRow">
+            <div class="col-12 col-lg-5">
+                <div class="card border-0 shadow-sm p-3 p-md-4">
+                    <h4 class="fw-bold text-dark mb-4">Product Director Config</h4>
+                    <form id="studioForm">
+<div class="mb-4">
+    <label class="form-label fw-semibold">Product Photograph</label>
+    <div id="dropzone" class="border border-2 border-dashed rounded p-3 p-md-4 text-center bg-white position-relative">
+        <input type="file" id="imageInput" accept="image/*"
+            class="position-absolute top-0 start-0 w-100 h-100 opacity-0 cursor-pointer" style="z-index: 5;">
+        <div id="dropzonePrompt">
+            <p class="mb-1">📸 Drag & drop or click to upload</p>
+            <small class="text-muted">Background will be isolated instantly in browser</small>
+        </div>
+        <div id="comparisonContainer" class="d-none mt-2 position-relative" style="z-index: 10;">
+            <div class="row g-3 align-items-center">
+                <div class="col-6">
+                    <p class="small fw-bold text-muted mb-2 text-start">Original</p>
+                    <canvas id="previewCanvas" class="img-fluid border border-2 rounded shadow-sm w-100 bg-light" style="object-fit: contain; max-height: 220px;"></canvas>
+                </div>
+                <div class="col-6">
+                    <p class="small fw-bold text-muted mb-2 text-start" id="resultImageLabel">Cutout Result</p>
+                    <img id="resultImage" class="img-fluid border border-2 rounded shadow-sm w-100 d-none" style="object-fit: contain; max-height: 220px;" alt="Isolated Product">
+                </div>
+            </div>
+            <div class="mt-3 p-2 bg-light border rounded d-flex flex-wrap align-items-center justify-content-between gap-2">
+                <span class="small text-muted" id="cutoutQualityNote">Not happy with the cutout? You can skip it and send your original photo instead.</span>
+                <button type="button" id="useOriginalToggleBtn" class="btn btn-sm btn-outline-dark fw-semibold">📷 Use Original Photo Instead</button>
+            </div>
+            <div class="mt-4 d-flex flex-wrap align-items-center gap-2">
+                <button type="button" id="uploadNewBtn" class="btn btn-sm btn-outline-secondary fw-bold px-3 d-none">🔄 Upload New</button>
+                <button type="button" id="downloadBtn" class="btn btn-sm btn-dark fw-bold px-4 d-none">⬇️ Download Cutout (PNG)</button>
+                <div id="chokeControl" class="d-none align-items-center gap-2 ms-auto bg-light border rounded px-3 py-1">
+                    <label for="chokeSlider" class="form-label small fw-bold text-muted mb-0 d-flex align-items-center gap-1">
+                        Edge Trim
+                        <span class="cursor-pointer" data-bs-toggle="tooltip" data-bs-placement="top" title="Slide to shave off lingering color halos from the edges.">ℹ️</span>
+                    </label>
+                    <input type="range" class="form-range" id="chokeSlider" min="0" max="40" step="1" value="5" style="width: 80px;">
+                    <span id="chokeValue" class="small fw-bold text-dark">1px</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+                        <div class="mb-3">
+                            <label for="brandName" class="form-label fw-semibold">Brand Name</label>
+                            <input type="text" class="form-control" id="brandName" placeholder="e.g., Velo Leather Co." required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="productDesc" class="form-label fw-semibold">Product Brief / Key Features</label>
+                            <textarea class="form-control" id="productDesc" rows="3" placeholder="Minimalist wallet made from premium Italian leather..." required></textarea>
+                        </div>
+                        <div class="mb-3">
+                            <label for="productDimensions" class="form-label fw-semibold">
+                                Actual Dimensions <span class="text-muted fw-normal small">(optional — overrides the AI's visual size estimate)</span>
+                            </label>
+                            <input type="text" class="form-control" id="productDimensions" placeholder="e.g., 30cm (12in) diameter, or 45cm x 30cm x 5cm">
+                        </div>
+                        <div class="mb-3">
+                            <label for="usageContext" class="form-label fw-semibold">
+                                Where & How It's Used <span class="text-muted fw-normal small">(optional)</span>
+                            </label>
+                            <textarea class="form-control" id="usageContext" rows="2" placeholder="e.g., 'mounted on living room walls' or 'carried daily'"></textarea>
+                        </div>
+                        <div class="mb-3">
+                            <label for="creativeDirection" class="form-label fw-semibold">
+                                Creative Direction <span class="text-muted fw-normal small">(optional — vague is fine)</span>
+                            </label>
+                            <textarea class="form-control" id="creativeDirection" rows="2" placeholder="e.g., 'moody golden hour, feels expensive'"></textarea>
+                        </div>
+                        <div id="classificationBanner" class="alert alert-info py-2 px-3 mb-3 d-none">
+                            <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+                                <div class="small">
+                                    <strong>AI-detected treatment:</strong> <span id="detectedCategoryLabel"></span>
+                                    <span class="text-muted">(<span id="detectedConfidence"></span>% confidence)</span>
+                                </div>
+                                <input type="text" id="categoryOverride" class="form-control form-control-sm w-auto" placeholder="Override label (optional)">
+                            </div>
+                            <div id="detectedReasoning" class="small text-muted fst-italic mt-1"></div>
+                        </div>
+                        <div class="border rounded p-3 mb-3 bg-white">
+                            <label class="form-label fw-semibold small text-uppercase text-muted mb-2 d-block">Shot Mix (max 10 total)</label>
+                            <div class="row g-3 align-items-end">
+                                <div class="col-6">
+                                    <label for="humanFrameCount" class="form-label small fw-semibold mb-1">With Human</label>
+                                    <input type="number" class="form-control" id="humanFrameCount" min="0" max="10" value="4">
+                                </div>
+                                <div class="col-6">
+                                    <label for="nonHumanFrameCount" class="form-label small fw-semibold mb-1">Product Only</label>
+                                    <input type="number" class="form-control" id="nonHumanFrameCount" min="0" max="10" value="0">
+                                </div>
+                            </div>
+                            <div class="mt-2 small">
+                                Total: <strong id="totalFrameCount">4</strong> / 10
+                                <span id="frameCountWarning" class="text-danger fw-semibold d-none ms-2">⚠️ reduce a count — max 10 total</span>
+                            </div>
+                            <div class="d-flex flex-wrap gap-3 mt-3 pt-2 border-top">
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" id="lockWardrobe" checked>
+                                    <label class="form-check-label small fw-semibold" for="lockWardrobe">Keep wardrobe identical across frames</label>
+                                </div>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" id="lockBackground" checked>
+                                    <label class="form-check-label small fw-semibold" for="lockBackground">Keep background identical across frames</label>
+                                </div>
+                            </div>
+                            <div id="wardrobeVarietyRow" class="d-none mt-2 pt-2 border-top">
+                                <label class="form-label small fw-semibold mb-1">When wardrobe varies, keep it:</label>
+                                <div class="btn-group btn-group-sm d-block" role="group">
+                                    <input type="radio" class="btn-check" name="wardrobeVarietyMode" id="wardrobeCohesive" value="cohesive" checked>
+                                    <label class="btn btn-outline-secondary" for="wardrobeCohesive">Cohesive campaign</label>
+                                    <input type="radio" class="btn-check" name="wardrobeVarietyMode" id="wardrobeIndependent" value="independent">
+                                    <label class="btn btn-outline-secondary" for="wardrobeIndependent">Fully independent</label>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="row g-3 mb-4">
+                            <div class="col-12">
+                                <label class="form-label fw-semibold small">Campaign Format (Aspect Ratio)</label>
+                                <select id="aspectRatio" class="form-select form-select-sm">
+                                    <option value="1:1">Square (Instagram Feed) - 1:1</option>
+                                    <option value="9:16">Vertical (Reels, TikTok, Stories) - 9:16</option>
+                                    <option value="16:9">Landscape (Web Banner, YouTube) - 16:9</option>
+                                    <option value="4:5">Portrait (Social Feed) - 4:5</option>
+                                </select>
+                            </div>
+                            <div class="col-12" id="humanDetailsDrawer">
+                                <div class="border rounded p-3 bg-light mt-1 shadow-sm">
+                                    <h6 class="fw-bold small text-primary mb-3">🧑‍🤝‍🧑 Casting & Wardrobe Directives</h6>
+                                    <div class="mb-2 p-2 border border-dashed rounded bg-white text-center">
+                                        <label class="small fw-bold text-muted d-block mb-1">Face Reference (Optional)</label>
+                                        <input type="file" id="modelReferenceInput" accept="image/*" class="form-control form-control-sm">
+                                        <small class="text-muted" style="font-size: 0.7rem;">For the most photorealistic results, a real reference photo is strongly recommended.</small>
+                                    </div>
+                                    <div id="clothingWarningBanner" class="d-none alert alert-warning py-2 px-3 small mb-2"></div>
+                                    <div id="matchReferenceOutfitRow" class="d-none form-check form-switch mb-2">
+                                        <input class="form-check-input" type="checkbox" id="matchReferenceOutfit">
+                                        <label class="form-check-label small" for="matchReferenceOutfit">Match the reference photo's actual outfit</label>
+                                    </div>
+                                    <div id="multiPersonPicker" class="d-none mb-3 p-2 border rounded bg-white">
+                                        <div class="small fw-bold text-dark mb-1">This photo has more than one person — who's the subject?</div>
+                                        <div id="multiPersonReasoning" class="small text-muted fst-italic mb-2"></div>
+                                        <div id="multiPersonOptions" class="d-flex flex-wrap gap-2"></div>
+                                    </div>
+                                    <div class="row g-2">
+                                        <div class="col-12 col-md-6">
+                                            <label class="small fw-semibold text-muted mb-1">Model Appearance</label>
+                                            <input type="text" id="modelAppearance" class="form-control form-control-sm" placeholder="Leave blank to let the AI decide">
+                                        </div>
+                                        <div class="col-12 col-md-6">
+                                            <label class="small fw-semibold text-muted mb-1">Personality / Vibe</label>
+                                            <input type="text" id="modelExpression" class="form-control form-control-sm" placeholder="Leave blank to let the AI decide">
+                                        </div>
+                                        <div class="col-12 col-md-6">
+                                            <label class="small fw-semibold text-muted mb-1">Wardrobe / Styling <span class="text-muted fw-normal">(ignored if the product is itself a full outfit)</span></label>
+                                            <input type="text" id="modelWardrobe" class="form-control form-control-sm" placeholder="Leave blank to let the AI decide">
+                                        </div>
+                                        <div class="col-12 col-md-6">
+                                            <label class="small fw-semibold text-muted mb-1">Pose & Interaction</label>
+                                            <input type="text" id="modelPose" class="form-control form-control-sm" placeholder="Leave blank to let the AI decide">
+                                        </div>
+                                        <div class="col-12 col-md-6">
+    <label class="small fw-semibold text-muted mb-1">Body Type / Build</label>
+    <input type="text" id="modelBodyType" class="form-control form-control-sm" value="Indian, natural realistic body proportions (not an idealized ultra-thin frame)">
+</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-12 mt-1">
+                                <label class="small fw-semibold text-danger mb-1">Negative Directives (Do NOT Include)</label>
+                                <input type="text" id="negativeDirectives" class="form-control form-control-sm border-danger-subtle" placeholder="e.g., No indoor plants, no neon lighting">
+                            </div>
+                        </div>
+                        <button type="submit" id="generateBtn" class="btn btn-primary w-100 py-2 fw-bold" disabled>
+                            ⚡ Step 1: Generate Visual Concepts
+                        </button>
+                    </form>
+                </div>
+            </div>
+            <div class="col-12 col-lg-7">
+                <div id="outputContainer" class="d-flex flex-column gap-4">
+                    <div class="card border-0 shadow-sm p-4 p-md-5 text-center bg-white text-muted" id="placeholderView">
+                        <div class="fs-1 mb-2">🚀</div>
+                        <h5>Your Asset Suite is Empty</h5>
+                        <p class="small mb-0">Upload a product shot and fill out the configuration guidelines to build marketing content.</p>
+                    </div>
+                    <div class="card border-0 shadow-sm p-3 p-md-4 bg-white d-none" id="stage1View">
+                        <h5 class="fw-bold text-dark mb-3">Generated Concepts</h5>
+                        <div class="bg-light p-3 rounded mb-4">
+                            <label class="small text-uppercase fw-bold text-muted d-block mb-2">Social Copy & Tags</label>
+                            <div id="captionContainer"></div>
+                            <div id="tagContainer" class="mt-2 text-primary fw-medium small"></div>
+                        </div>
+                    </div>
+                    <div id="promptReviewContainer" class="card border-0 shadow-sm p-3 p-md-4 bg-white d-none">
+                        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+                            <h6 class="fw-bold mb-0 text-primary">🎬 Review & Refine Camera Angles</h6>
+                            <span class="badge bg-secondary" id="promptCountBadge">0 Prompts</span>
+                        </div>
+                        <div id="dynamicPromptList" class="d-flex flex-column gap-3 mb-4"></div>
+                        <div class="mb-2">
+                            <label class="form-label small fw-semibold mb-1" for="globalImageModelSelect">Image model <span class="text-muted fw-normal">(applies to every frame unless a card above overrides it)</span></label>
+                            <div class="d-flex gap-1">
+                                <select class="form-select form-select-sm" id="globalImageModelSelect" data-model-custom-target="globalImageModelCustom">
+                                    <option value="">Auto (AI picks pro/fast)</option>
+                                </select>
+                                <button type="button" class="btn btn-sm btn-outline-secondary flex-shrink-0" data-model-guide-btn="globalImageModelSelect" title="What is this model?">ℹ️</button>
+                            </div>
+                            <input type="text" class="form-control form-control-sm mt-1 d-none" id="globalImageModelCustom" placeholder="e.g. fal-ai/some-model/edit">
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label small fw-semibold mb-1" for="globalImageResolutionSelect">Image resolution</label>
+                            <select class="form-select form-select-sm" id="globalImageResolutionSelect"></select>
+                            <small class="text-muted d-block mt-1">1K is plenty for Instagram/social feeds and costs the least; 2K/4K cost roughly 1.5x/2x more per image and only matter for print or heavy cropping.</small>
+                        </div>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="forceProModel">
+                            <label class="form-check-label small" for="forceProModel">Always use the stronger model <span class="text-muted fw-normal">(fallback when "Auto" above and no model is picked)</span></label>
+                        </div>
+                        <button id="lockSetBtn" class="btn btn-outline-primary w-100 fw-bold py-2">🔒 Step 2: Build & Preview Locked Set</button>
+                        <small class="text-muted d-block text-center mt-2" id="lockSetHint">Only needed if your Shot Mix includes at least one "With Human" frame.</small>
+                    </div>
+                    <div id="lockedSetView" class="card border-0 shadow-sm p-3 p-md-4 bg-white d-none">
+                        <h5 class="fw-bold text-dark mb-2">🔒 Locked Set Preview</h5>
+                        <img id="lockedSetImage" class="img-fluid rounded border shadow-sm mb-3" style="max-height: 420px; object-fit: contain; width: 100%; background: #f8f9fa;" alt="Locked set preview">
+                        <div id="lockedSetDiagnostics" class="small text-muted mb-3"></div>
+                        <div class="d-flex flex-wrap gap-2">
+                            <button id="regenerateLockBtn" class="btn btn-outline-secondary fw-semibold flex-fill">🔄 Regenerate Set</button>
+                            <button id="approveLockBtn" class="btn btn-success fw-bold flex-fill">✅ Step 3: Approve & Launch Full Photoshoot</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div id="photoshootResultsSection" class="col-12 mt-2 d-none">
+                <hr class="my-4">
+                <h4 class="fw-bold text-dark mb-3">📸 Final Photoshoot Assets</h4>
+                <div id="finalImageGrid" class="row g-3"></div>
+            </div>
+        </div>
+<div class="row g-4 d-none" id="batchModeRow">
+    <div class="col-12 col-lg-5">
+        <div class="card border-0 shadow-sm p-3 p-md-4">
+            <h4 class="fw-bold text-dark mb-1">📦 Batch Mode</h4>
+            <p class="text-muted small mb-4">Upload several products and shoot them all as one cohesive batch.</p>
+            <form id="batchForm">
+                <div class="mb-3">
+                    <label class="form-label fw-semibold">Product Photographs <span class="text-muted fw-normal small">(up to 8)</span></label>
+                    <div id="batchDropzone" class="border border-2 border-dashed rounded p-3 text-center bg-white position-relative">
+                        <input type="file" id="batchImageInput" accept="image/*" multiple class="position-absolute top-0 start-0 w-100 h-100 opacity-0 cursor-pointer" style="z-index: 5;">
+                        <p class="mb-1">📸 Drag & drop or click to add product photos</p>
+                        <small class="text-muted">Each one gets background-removed automatically.</small>
+                    </div>
+                    <small class="text-muted d-block mt-2">Per product: label, size, edge-trim, and cutout/original toggle are all adjustable below — same controls as single-product mode.</small>
+                    <div id="batchGarmentList" class="d-flex flex-wrap gap-2 mt-3"></div>
+                </div>
+                <div class="mb-3">
+                    <label for="batchBrandName" class="form-label fw-semibold">Brand Name</label>
+                    <input type="text" class="form-control" id="batchBrandName" placeholder="e.g., Velo Collective" required>
+                </div>
+                <div class="mb-3">
+                    <label for="batchProductDesc" class="form-label fw-semibold">Shared Product Brief</label>
+                    <textarea class="form-control" id="batchProductDesc" rows="2" placeholder="e.g., Handloom silk sarees, festive collection" required></textarea>
+                </div>
+                <div class="mb-3">
+                    <label for="batchUsageContext" class="form-label fw-semibold">Where & How They're Used <span class="text-muted fw-normal small">(optional)</span></label>
+                    <textarea class="form-control" id="batchUsageContext" rows="2" placeholder="e.g., 'worn daily to work'"></textarea>
+                </div>
+                <div class="mb-3">
+                    <label for="batchCreativeDirection" class="form-label fw-semibold">Creative Direction <span class="text-muted fw-normal small">(optional)</span></label>
+                    <textarea class="form-control" id="batchCreativeDirection" rows="2" placeholder="e.g., warm festive courtyard setting"></textarea>
+                </div>
+<div class="border rounded p-3 mb-3 bg-white">
+    <label class="form-label fw-semibold small text-uppercase text-muted mb-2 d-block">Shot Mix</label>
+    <div class="form-check form-switch mb-3">
+        <input class="form-check-input" type="checkbox" id="includeHumanToggle" checked>
+        <label class="form-check-label small fw-semibold" for="includeHumanToggle">Include a shared model (worn/held/used by one person)</label>
+        <small class="text-muted d-block">Uncheck for a pure product-only catalog batch. When checked, each product's own safety classification decides whether it's shown worn (e.g. a saree) vs. styled tastefully (e.g. intimate apparel) — this isn't manually overridable per product.</small>
+    </div>
+    <div class="row g-3">
+        <div class="col-6">
+            <label for="shotsPerGarment" class="form-label small fw-semibold mb-1">Shots per product</label>
+            <select id="shotsPerGarment" class="form-select form-select-sm">
+                <option value="1" selected>1 — fastest/cheapest</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4">4 — full hero/macro/context/editorial</option>
+            </select>
+        </div>
+        <div class="col-6">
+            <label class="form-label small fw-semibold mb-1 d-block">Background across products</label>
+            <div class="form-check form-switch mt-2">
+                <input class="form-check-input" type="checkbox" id="backgroundConsistentToggle" checked>
+                <label class="form-check-label small" for="backgroundConsistentToggle">Identical</label>
+            </div>
+        </div>
+    </div>
+    <div class="mt-3 pt-2 border-top">
+        <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="batchLockWardrobe" checked>
+            <label class="form-check-label small fw-semibold" for="batchLockWardrobe">Keep model's wardrobe identical across every product</label>
+        </div>
+        <small class="text-muted d-block mt-1">Uncheck to let each product restyle the model's base outfit freely — only meaningful for products shown alongside separate clothing (accessories, held items); products that ARE the outfit (a saree, a dress) always dress the model in the product itself regardless of this toggle.</small>
+    </div>
+</div>
+                <div class="border rounded p-3 mb-3 bg-light" id="batchModelSection">
+                    <h6 class="fw-bold small text-primary mb-3">🧑‍🤝‍🧑 Shared Model (same person across every product)</h6>
+                    <div class="mb-2 p-2 border border-dashed rounded bg-white text-center">
+                        <label class="small fw-bold text-muted d-block mb-1">Face Reference (Optional)</label>
+                        <input type="file" id="batchModelReferenceInput" accept="image/*" class="form-control form-control-sm">
+                        <small class="text-muted" style="font-size: 0.7rem;">For the most photorealistic, consistent-looking model across the whole batch, a real reference photo is strongly recommended.</small>
+                    </div>
+                    <div id="batchClothingWarningBanner" class="d-none alert alert-warning py-2 px-3 small mb-2"></div>
+                    <div id="batchMatchReferenceOutfitRow" class="d-none form-check form-switch mb-2">
+                        <input class="form-check-input" type="checkbox" id="batchMatchReferenceOutfit">
+                        <label class="form-check-label small" for="batchMatchReferenceOutfit">Match the reference photo's actual outfit</label>
+                    </div>
+                    <div id="batchMultiPersonPicker" class="d-none mb-3 p-2 border rounded bg-white">
+                        <div class="small fw-bold text-dark mb-1">This photo has more than one person — who's the subject?</div>
+                        <div id="batchMultiPersonReasoning" class="small text-muted fst-italic mb-2"></div>
+                        <div id="batchMultiPersonOptions" class="d-flex flex-wrap gap-2"></div>
+                    </div>
+                    <div class="row g-2">
+                        <div class="col-12 col-md-6">
+                            <label class="small fw-semibold text-muted mb-1">Model Appearance</label>
+                            <input type="text" id="batchModelAppearance" class="form-control form-control-sm" placeholder="Leave blank to let the AI decide">
+                        </div>
+                        <div class="col-12 col-md-6">
+                            <label class="small fw-semibold text-muted mb-1">Personality / Vibe</label>
+                            <input type="text" id="batchModelExpression" class="form-control form-control-sm" placeholder="Leave blank to let the AI decide">
+                        </div>
+                        <div class="col-12 col-md-6">
+                            <label class="small fw-semibold text-muted mb-1">Wardrobe / Styling <span class="text-muted fw-normal">(ignored for products that ARE the outfit)</span></label>
+                            <input type="text" id="batchModelWardrobe" class="form-control form-control-sm" placeholder="Leave blank to let the AI decide">
+                        </div>
+                        <div class="col-12 col-md-6">
+                            <label class="small fw-semibold text-muted mb-1">Pose & Interaction</label>
+                            <input type="text" id="batchModelPose" class="form-control form-control-sm" placeholder="Leave blank to let the AI decide">
+                        </div>
+                        <div class="col-12 col-md-6">
+    <label class="small fw-semibold text-muted mb-1">Body Type / Build</label>
+    <input type="text" id="batchModelBodyType" class="form-control form-control-sm" value="Indian, natural realistic body proportions (not an idealized ultra-thin frame)">
+</div>
+                    </div>
+                </div>
+                <div class="form-check form-switch mt-2">
+    <input class="form-check-input" type="checkbox" id="batchSkipCanonicalRender">
+    <label class="form-check-label small" for="batchSkipCanonicalRender">Maximize pattern/color fidelity (skip AI re-render of product photos)</label>
+</div>
+<small class="text-muted d-block">Best for intricate patterns like sarees with fine checks/motifs — trades studio-background normalization for exact fidelity.</small>
+                <div class="row g-3 mb-4">
+                    <div class="col-12">
+                        <label class="form-label fw-semibold small">Campaign Format (Aspect Ratio)</label>
+                        <select id="batchAspectRatio" class="form-select form-select-sm">
+                            <option value="1:1">Square - 1:1</option>
+                            <option value="9:16">Vertical - 9:16</option>
+                            <option value="16:9">Landscape - 16:9</option>
+                            <option value="4:5" selected>Portrait - 4:5</option>
+                        </select>
+                    </div>
+                    <div class="col-12">
+                        <label class="small fw-semibold text-danger mb-1">Negative Directives</label>
+                        <input type="text" id="batchNegativeDirectives" class="form-control form-control-sm border-danger-subtle" placeholder="e.g., No indoor plants">
+                    </div>
+                    <div class="col-12">
+                        <div class="form-check form-switch">
+                            <input class="form-check-input" type="checkbox" id="batchForceProModel">
+                            <label class="form-check-label small" for="batchForceProModel">Always use the stronger model</label>
+                        </div>
+                    </div>
+                </div>
+                <button type="submit" id="batchGenerateBtn" class="btn btn-primary w-100 py-2 fw-bold" disabled>⚡ Step 1: Generate Concepts</button>
+                <div id="batchStage1View" class="card border-0 shadow-sm p-3 p-md-4 bg-white d-none">
+    <h5 class="fw-bold text-dark mb-3">Generated Concepts</h5>
+    <div class="bg-light p-3 rounded mb-3">
+        <label class="small text-uppercase fw-bold text-muted d-block mb-2">Social Copy & Tags</label>
+        <div id="batchCaptionContainer"></div>
+        <div id="batchTagContainer" class="mt-2 text-primary fw-medium small"></div>
+    </div>
+    <div class="small text-muted">
+        <div><strong>Environment:</strong> <span id="batchEnvironmentText"></span></div>
+        <div><strong>Tone:</strong> <span id="batchToneText"></span></div>
+    </div>
+</div>
+<div id="batchPromptReviewContainer" class="card border-0 shadow-sm p-3 p-md-4 bg-white d-none">
+    <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+        <h6 class="fw-bold mb-0 text-primary">🎬 Review Each Product's Shot Concept</h6>
+        <span class="badge bg-secondary" id="batchPromptCountBadge">0 Products</span>
+    </div>
+    <p class="text-muted small mb-3">Edit any product's scene description before spending on the full render.</p>
+    <div id="batchDynamicPromptList" class="d-flex flex-column gap-3 mb-4"></div>
+    <div class="mb-2">
+        <label class="form-label small fw-semibold mb-1" for="globalBatchImageModelSelect">Image model <span class="text-muted fw-normal">(applies to every product unless a card above overrides it)</span></label>
+        <div class="d-flex gap-1">
+            <select class="form-select form-select-sm" id="globalBatchImageModelSelect" data-model-custom-target="globalBatchImageModelCustom">
+                <option value="">Auto (AI picks pro/fast)</option>
+            </select>
+            <button type="button" class="btn btn-sm btn-outline-secondary flex-shrink-0" data-model-guide-btn="globalBatchImageModelSelect" title="What is this model?">ℹ️</button>
+        </div>
+        <input type="text" class="form-control form-control-sm mt-1 d-none" id="globalBatchImageModelCustom" placeholder="e.g. fal-ai/some-model/edit">
+    </div>
+    <div class="mb-2">
+        <label class="form-label small fw-semibold mb-1" for="globalBatchImageResolutionSelect">Image resolution</label>
+        <select class="form-select form-select-sm" id="globalBatchImageResolutionSelect"></select>
+        <small class="text-muted d-block mt-1">1K is plenty for Instagram/social feeds and costs the least; 2K/4K cost roughly 1.5x/2x more per image.</small>
+    </div>
+   <button type="button" id="batchApproveBtn" class="btn btn-success w-100 fw-bold py-2">✅ Approve & Launch Batch Photoshoot</button>
+</div>
+            </form>
+        </div>
+    </div>
+    <div class="col-12 col-lg-7">
+        <div id="batchOutputContainer" class="d-flex flex-column gap-4">
+            <div class="card border-0 shadow-sm p-4 p-md-5 text-center bg-white text-muted" id="batchPlaceholderView">
+                <div class="fs-1 mb-2">📦</div>
+                <h5>Your Batch is Empty</h5>
+                <p class="small mb-0">Add a few product photos on the left to get started.</p>
+            </div>
+        </div>
+    </div>
+    <div id="batchResultsSection" class="col-12 mt-2 d-none">
+        <hr class="my-4">
+        <h4 class="fw-bold text-dark mb-3">📦 Batch Results</h4>
+        <div id="batchDiagnosticsNote" class="mb-3"></div>
+        <div id="batchResultsContainer" class="d-flex flex-column gap-4"></div>
+    </div>
+</div>
+<div class="row g-4 d-none" id="wizardModeRow">
+    <div class="col-12 col-lg-5">
+        <div class="card border-0 shadow-sm p-3 p-md-4">
+            <h4 class="fw-bold text-dark mb-1">✨ Smart Wizard</h4>
+            <p class="text-muted small mb-4">Answer a few quick questions instead of filling out a form — aims to get it right in one real generation instead of several guesses.</p>
+            <div id="wizardStep1">
+                <label class="form-label fw-semibold small">What do you want to create?</label>
+                <div class="btn-group w-100 mb-3" role="group">
+                    <input type="radio" class="btn-check" name="wizardCreationType" id="wizardTypeProduct" value="product" checked>
+                    <label class="btn btn-outline-dark" for="wizardTypeProduct">💡 Product Creation</label>
+                    <input type="radio" class="btn-check" name="wizardCreationType" id="wizardTypeLogo" value="logo">
+                    <label class="btn btn-outline-dark" for="wizardTypeLogo">🎨 Logo Design</label>
+                </div>
+                <div id="wizardReferenceUpload" class="mb-3">
+                    <label class="form-label fw-semibold small" id="wizardUploadLabel">Product Photo <span class="text-muted fw-normal">(optional — skip this and just describe it below instead)</span></label>
+                    <input type="file" id="wizardImageInput" accept="image/*" class="form-control form-control-sm">
+                    <div class="form-check form-switch mt-2 d-none" id="wizardUseAsIsRow">
+                        <input class="form-check-input" type="checkbox" id="wizardUseReferenceAsIs">
+                        <label class="form-check-label small" for="wizardUseReferenceAsIs">Use this exact photo as the product <span class="text-muted fw-normal">(unchecked = invent a new design inspired by it instead — good for exploring ideas; check this if you want THIS specific item photographed, not a new one imagined)</span></label>
+                    </div>
+                </div>
+                <div id="wizardDescribeInput" class="mb-3">
+                    <label class="form-label fw-semibold small" id="wizardDescribeLabel">Describe the product <span class="text-muted fw-normal">(optional if you uploaded a photo above, required if you didn't)</span></label>
+                    <textarea id="wizardProductDescription" class="form-control" rows="3" placeholder="e.g. a deep purple Kanjeevaram silk saree with a gold zari border and peacock motif pallu"></textarea>
+                    <small class="text-muted d-block mt-1" id="wizardDescribeHint"></small>
+                </div>
+                <div class="form-check form-switch mb-2">
+                    <input class="form-check-input" type="checkbox" id="wizardWantsVariants">
+                    <label class="form-check-label small" id="wizardVariantsLabel" for="wizardWantsVariants">I want to explore multiple color/style variations of this product</label>
+                </div>
+                <div id="wizardVariantsControls" class="d-none mb-3 ps-3 border-start border-2">
+                    <label class="form-label xx-small fw-semibold mb-1">How many? <span class="text-muted fw-normal">(2-6)</span></label>
+                    <input type="number" id="wizardVariantCount" class="form-control form-control-sm mb-2" value="3" min="2" max="6" style="max-width: 100px;">
+                    <label class="form-label xx-small fw-semibold mb-1">What should differ between them? <span class="text-muted fw-normal">(optional — "same same but different" works too, just tell it what stays the same)</span></label>
+                    <input type="text" id="wizardVariantTheme" class="form-control form-control-sm" placeholder="e.g. same silhouette, different color palettes — or leave blank and let the AI decide">
+                </div>
+                <button type="button" id="wizardStartBtn" class="btn btn-primary w-100 py-2 fw-bold">✨ Start — Ask Me Questions</button>
+            </div>
+            <div id="wizardStep2" class="d-none">
+                <div id="wizardQuestionsList" class="d-flex flex-column gap-3 mb-3"></div>
+                <div class="mb-3">
+                    <label class="form-label small fw-semibold mb-1" for="wizardImageModelSelect">Image model <span class="text-muted fw-normal">(used to create the product/logo itself)</span></label>
+                    <div class="d-flex gap-1">
+                        <select class="form-select form-select-sm" id="wizardImageModelSelect" data-model-custom-target="wizardImageModelCustom">
+                            <option value="">Auto (AI picks pro/fast)</option>
+                        </select>
+                        <button type="button" class="btn btn-sm btn-outline-secondary flex-shrink-0" data-model-guide-btn="wizardImageModelSelect" title="What is this model?">ℹ️</button>
+                    </div>
+                    <input type="text" class="form-control form-control-sm mt-1 d-none" id="wizardImageModelCustom" placeholder="e.g. fal-ai/some-model/edit">
+                    <p class="xx-small text-muted mb-0 mt-1" id="wizardImageModelHint"></p>
+                </div>
+                <button type="button" id="wizardAnswersSubmitBtn" class="btn btn-primary w-100 py-2 fw-bold">Continue →</button>
+                <button type="button" id="wizardBackBtn" class="btn btn-link btn-sm w-100 mt-1">← Start over</button>
+            </div>
+            <div id="wizardStep3" class="d-none text-center py-4">
+                <div class="spinner-border text-primary mb-3"></div>
+                <p class="text-muted small" id="wizardStep3Status">Building your refined brief...</p>
+            </div>
+            <div id="wizardLogoResult" class="d-none text-start"></div>
+        </div>
+    </div>
+    <div class="col-12 col-lg-7">
+        <div id="wizardPlaceholderView" class="card border-0 shadow-sm p-4 p-md-5 text-center bg-white text-muted">
+            <div class="fs-1 mb-2">✨</div>
+            <h5>Answer a few questions to get started</h5>
+            <p class="small mb-0">This is its own independent creation space — separate from Single and Batch mode, results appear right here.</p>
+        </div>
+        <div id="wizardPhotoshootResultsSection" class="d-none">
+            <h4 class="fw-bold text-dark mb-3">✨ Your Creation</h4>
+            <div id="wizardFinalImageGrid" class="row g-3"></div>
+        </div>
+    </div>
+</div>
+<!-- Video results are shared by both Single and Batch mode (a video can be
+     generated from either mode's output), so this row deliberately sits
+     OUTSIDE both #singleProductRow and #batchModeRow — if it were nested
+     inside either one, switching modes would hide a video that already
+     finished rendering, even though it rendered successfully. -->
+<div class="row g-4">
+    <div id="videoResultsSection" class="col-12 mt-2 d-none">
+        <hr class="my-4">
+        <h4 class="fw-bold text-dark mb-3">🎬 Generated Videos</h4>
+        <div id="videoResultsErrors" class="mb-3"></div>
+        <div id="videoResultsContainer" class="row g-3"></div>
+    </div>
+</div>
+    </div>
+    <div class="modal fade" id="brandProfileModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title fw-bold">🧑‍💼 Brand Profile</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <form id="brandProfileForm">
+                        <div class="mb-3">
+                            <label for="bpBrandName" class="form-label fw-semibold small">Brand / Business Name</label>
+                            <input type="text" class="form-control form-control-sm" id="bpBrandName">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold small d-block">Where do you sell?</label>
+                            <div class="d-flex flex-wrap gap-3">
+                                <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="Instagram" id="bpSellInstagram"><label class="form-check-label small" for="bpSellInstagram">Instagram</label></div>
+                                <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="Amazon" id="bpSellAmazon"><label class="form-check-label small" for="bpSellAmazon">Amazon</label></div>
+                                <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="Flipkart" id="bpSellFlipkart"><label class="form-check-label small" for="bpSellFlipkart">Flipkart</label></div>
+                                <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="Etsy" id="bpSellEtsy"><label class="form-check-label small" for="bpSellEtsy">Etsy</label></div>
+                                <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="WhatsApp Catalog" id="bpSellWhatsapp"><label class="form-check-label small" for="bpSellWhatsapp">WhatsApp</label></div>
+                                <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="Own Website" id="bpSellWebsite"><label class="form-check-label small" for="bpSellWebsite">Own Website</label></div>
+                                <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="Physical Store" id="bpSellPhysical"><label class="form-check-label small" for="bpSellPhysical">Physical Store</label></div>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label for="bpTargetAudience" class="form-label fw-semibold small">Who's your typical customer?</label>
+                            <textarea class="form-control form-control-sm" id="bpTargetAudience" rows="2"></textarea>
+                        </div>
+                        <div class="mb-3">
+                            <label for="bpRegion" class="form-label fw-semibold small">Business location / primary market</label>
+                            <input type="text" class="form-control form-control-sm" id="bpRegion">
+                        </div>
+                        <div class="mb-3">
+                            <label for="bpAesthetic" class="form-label fw-semibold small">Brand aesthetic / style</label>
+                            <textarea class="form-control form-control-sm" id="bpAesthetic" rows="2"></textarea>
+                        </div>
+                        <div class="mb-3">
+                            <label for="bpBirthYear" class="form-label fw-semibold small">Founder / brand birth year <span class="text-muted fw-normal">(optional)</span></label>
+                            <input type="number" class="form-control form-control-sm" id="bpBirthYear" min="1930" max="2015" style="max-width: 160px;">
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer bg-light">
+                    <button type="button" class="btn btn-secondary text-sm" data-bs-dismiss="modal">Skip for now</button>
+                    <button type="button" class="btn btn-success fw-bold text-sm" id="saveBrandProfileBtn">Save Brand Profile</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="modal fade" id="settingsModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title fw-bold">⚙️ Setup API Credentials</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <div class="mb-3">
+                        <label for="geminiKeyInput" class="form-label fw-bold small">Fal API Key</label>
+                        <input type="password" class="form-control" id="geminiKeyInput" placeholder="fal-...">
+                        <small class="text-muted d-block mt-1">From <a href="https://fal.ai/dashboard/keys" target="_blank" rel="noopener">fal.ai/dashboard/keys</a>. Used for image, video, and reasoning calls.</small>
+                    </div>
+                    <div class="mb-3">
+                        <label for="falAdminKeyInput" class="form-label fw-bold small">Fal Admin API Key <span class="text-muted fw-normal">(optional)</span></label>
+                        <input type="password" class="form-control" id="falAdminKeyInput" placeholder="fal-...">
+                        <small class="text-muted d-block mt-1"><strong>Different key from above</strong> — only needed to show your real balance and usage history in the Credits modal. Generate one with admin scope at <a href="https://fal.ai/dashboard/keys" target="_blank" rel="noopener">fal.ai/dashboard/keys</a>. Without this, the app still works normally using its own cost estimates.</small>
+                    </div>
+                    <div class="mb-3">
+                        <label for="falTextModelInput" class="form-label fw-bold small">Reasoning Model <span class="text-muted fw-normal">(optional override)</span></label>
+                        <input type="text" class="form-control form-control-sm" id="falTextModelInput" placeholder="anthropic/claude-sonnet-4.5">
+                        <small class="text-muted d-block mt-1">Powers the creative-director/moderation logic via fal-ai/any-llm. Leave blank to use the server default.</small>
+                    </div>
+                    <div class="mb-3">
+                        <label for="falVisionModelInput" class="form-label fw-bold small">Vision Model <span class="text-muted fw-normal">(optional override)</span></label>
+                        <input type="text" class="form-control form-control-sm" id="falVisionModelInput" placeholder="openai/gpt-4o">
+                        <small class="text-muted d-block mt-1">Powers reference-photo analysis via fal-ai/any-llm/vision.</small>
+                    </div>
+                    <hr>
+                    <div class="mb-1">
+                        <label class="form-label fw-bold small mb-1">Model Catalog</label>
+                        <div class="d-flex align-items-center justify-content-between mb-2">
+                            <small class="text-muted" id="modelCatalogStatus">Checks the image/video model list against Fal's live catalog in the background — anything Fal reports as deprecated is automatically removed from the dropdowns.</small>
+                            <button type="button" class="btn btn-sm btn-outline-secondary flex-shrink-0 ms-2" id="refreshModelsBtn">🔄 Check now</button>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-outline-primary w-100" id="browseModelsBtn">🔍 Browse all image &amp; video models</button>
+                    </div>
+                </div>
+                <div class="modal-footer bg-light">
+                    <button type="button" class="btn btn-secondary text-sm" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-success fw-bold text-sm" id="saveKeysBtn">Save Configuration</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="modal fade" id="campaignsModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title fw-bold">📂 Past Campaigns</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <div id="campaignsList" style="max-height: 360px; overflow-y: auto;">
+                        <div class="text-muted small">Loading...</div>
+                    </div>
+                    <div class="d-flex justify-content-between align-items-center mt-3">
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="campaignsPrevBtn">← Previous</button>
+                        <span class="small text-muted" id="campaignsPageInfo"></span>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="campaignsNextBtn">Next →</button>
+                    </div>
+                </div>
+                <div class="modal-footer bg-light">
+                    <button type="button" class="btn btn-secondary text-sm" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="modal fade" id="creditsModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title fw-bold">💳 Credits & Cost Ledger</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <div class="border rounded p-3 mb-3 bg-light" id="falRealBalanceBox">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div>
+                                <div class="small text-muted">Real Fal.ai Balance <span class="badge bg-secondary">live</span></div>
+                                <div class="fw-bold fs-4" id="falRealBalanceAmount">—</div>
+                                <div class="xx-small text-muted" id="falRealBalanceNote">Checking...</div>
+                            </div>
+                            <a href="https://fal.ai/dashboard/billing" target="_blank" rel="noopener" class="btn btn-success fw-bold">💳 Add Funds on Fal.ai ↗</a>
+                        </div>
+                    </div>
+                    <div class="row g-3 mb-3 text-center">
+                        <div class="col-4">
+                            <div class="border rounded p-2 bg-light">
+                                <div class="small text-muted">Total Spent <span class="xx-small">(our estimate)</span></div>
+                                <div class="fw-bold fs-5" id="creditsTotalSpent">$0.00</div>
+                                <div class="small text-muted" id="creditsTotalSpentInr">₹0.00</div>
+                            </div>
+                        </div>
+                        <div class="col-4">
+                            <div class="border rounded p-2 bg-light">
+                                <div class="small text-muted">Calls Made</div>
+                                <div class="fw-bold fs-5" id="creditsCallCount">0</div>
+                            </div>
+                        </div>
+                        <div class="col-4">
+                            <div class="border rounded p-2 bg-light">
+                                <div class="small text-muted">Remaining Budget</div>
+                                <div class="fw-bold fs-5" id="creditsRemaining">—</div>
+                                <div class="small text-muted" id="creditsRemainingInr"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="d-flex gap-2 align-items-center mb-3">
+                        <input type="number" id="budgetInput" class="form-control form-control-sm w-auto" placeholder="Set a budget ($)" min="0" step="0.01">
+                        <button class="btn btn-sm btn-outline-dark" id="saveBudgetBtn">Set Budget</button>
+                    </div>
+                    <ul class="nav nav-tabs small" id="creditsLedgerTabs">
+                        <li class="nav-item"><button class="nav-link active" data-ledger-tab="estimate" type="button">Our Estimate Ledger</button></li>
+                        <li class="nav-item"><button class="nav-link" data-ledger-tab="real" type="button">Fal's Real Usage History</button></li>
+                    </ul>
+                    <div id="creditsEstimateTab" class="mt-2">
+                        <div style="max-height: 260px; overflow-y: auto;">
+                            <table class="table table-sm">
+                                <thead><tr><th>Time</th><th>Endpoint</th><th>Model</th><th>Status</th><th class="text-end">Est. Cost</th></tr></thead>
+                                <tbody id="creditsTransactionBody"></tbody>
+                            </table>
+                        </div>
+                        <div class="d-flex justify-content-between align-items-center mt-2">
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="creditsPrevBtn">← Previous</button>
+                            <span class="small text-muted" id="creditsPageInfo"></span>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="creditsNextBtn">Next →</button>
+                        </div>
+                    </div>
+                    <div id="creditsRealTab" class="mt-2 d-none">
+                        <div id="realUsageBody" style="max-height: 300px; overflow-y: auto;">
+                            <div class="text-muted small p-2">Loading...</div>
+                        </div>
+                        <div class="d-flex justify-content-between align-items-center mt-2">
+                            <span></span>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="realUsageNextBtn">Load more →</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer bg-light">
+                    <button type="button" class="btn btn-secondary text-sm" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="modal fade" id="videoBriefModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title fw-bold">🎬 Video Brief</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <div class="btn-group btn-group-sm mb-3" role="group">
+                        <input type="radio" class="btn-check" name="videoBriefMode" id="videoBriefModeSeparate" value="separate" checked>
+                        <label class="btn btn-outline-primary" for="videoBriefModeSeparate">Separate video per shot</label>
+                        <input type="radio" class="btn-check" name="videoBriefMode" id="videoBriefModeCombined" value="combined">
+                        <label class="btn btn-outline-primary" for="videoBriefModeCombined">One combined video</label>
+                    </div>
+                    <div id="videoBriefCombinedNote" class="alert alert-info py-2 px-3 small d-none">
+                        i️ Combined mode anchors the video on multiple selected shots at once — how many depends on the video model chosen below (Veo 3.1: up to 3, Seedance 2.0: up to 9). Any shot beyond that model's limit still informs the mood/story via the prompt text. Models that can't combine at all (like Kling) are hidden from the list below while 2+ shots are selected.
+                    </div>
+                    <div class="row g-2 mb-3">
+                        <div class="col-6 col-md-4">
+                            <label class="small fw-semibold mb-1">Aspect Ratio</label>
+                            <select id="videoBriefAspectRatio" class="form-select form-select-sm">
+                                <option value="16:9" selected>Landscape - 16:9</option>
+                                <option value="9:16">Vertical - 9:16</option>
+                            </select>
+                        </div>
+                        <div class="col-6 col-md-4">
+                            <label class="small fw-semibold mb-1">Duration</label>
+                            <select id="videoBriefDuration" class="form-select form-select-sm">
+                                <option value="4" selected>4s</option>
+                                <option value="6">6s</option>
+                                <option value="8">8s</option>
+                            </select>
+                        </div>
+                        <div class="col-12 col-md-4 d-flex align-items-end">
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" id="videoBriefForceQuality">
+                                <label class="form-check-label small" for="videoBriefForceQuality">Always use the stronger model</label>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="row g-2 mb-1">
+                        <div class="col-12">
+                            <small class="text-muted">4s/6s/8s are the only lengths Veo 3.1 supports — not a Fal limit, Google's own constraint on the model. Other durations aren't offered here since they'd just fail.</small>
+                        </div>
+                    </div>
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" id="videoBriefGenerateAudio" checked>
+                        <label class="form-check-label small" for="videoBriefGenerateAudio">Generate audio <span class="text-muted fw-normal">(ambient/foley sound — some models charge less with this off; confirmed on Kling: ~33% cheaper per second without audio)</span></label>
+                    </div>
+                    <div class="mb-3">
+                        <label for="videoBriefNegativePrompt" class="form-label small fw-semibold mb-1">Negative Directives <span class="text-muted fw-normal">(optional — only used by models that support it, e.g. Kling; silently ignored otherwise)</span></label>
+                        <input type="text" class="form-control form-control-sm border-danger-subtle" id="videoBriefNegativePrompt" placeholder="e.g., no motion blur, no text overlays, no extra people">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small fw-semibold mb-1" for="globalVideoModelSelect">Video model <span class="text-muted fw-normal">(applies to every shot unless a card below overrides it)</span></label>
+                        <div class="d-flex gap-1">
+                            <select class="form-select form-select-sm" id="globalVideoModelSelect" data-model-custom-target="globalVideoModelCustom">
+                                <option value="">Default (Veo 3.1 Fast)</option>
+                            </select>
+                            <button type="button" class="btn btn-sm btn-outline-secondary flex-shrink-0" data-model-guide-btn="globalVideoModelSelect" title="What is this model?">ℹ️</button>
+                        </div>
+                        <input type="text" class="form-control form-control-sm mt-1 d-none" id="globalVideoModelCustom" placeholder="e.g. fal-ai/kling-video/v3-pro/image-to-video">
+                        <p class="xx-small text-muted mb-0 mt-1" id="videoModelHint"></p>
+                    </div>
+                    <div id="videoBriefList" class="d-flex flex-column gap-3"></div>
+                </div>
+                <div class="modal-footer bg-light">
+                    <button type="button" class="btn btn-secondary text-sm" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-success fw-bold text-sm" id="videoBriefGenerateBtn">✅ Generate Video(s)</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="modal fade" id="modelExplorerModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title fw-bold">🔍 Model Explorer</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <p class="small text-muted">Every image and video model available in this app — browse freely, nothing here commits you to anything. Click a model to see its full description and a copyable code example.</p>
+                    <h6 class="fw-bold small mt-3">🖼️ Image Models</h6>
+                    <div id="modelExplorerImageList" class="list-group mb-3"></div>
+                    <h6 class="fw-bold small mt-3">🎬 Video Models</h6>
+                    <div id="modelExplorerVideoList" class="list-group mb-4"></div>
+                    <hr>
+                    <div class="d-flex justify-content-between align-items-center">
+                        <h6 class="fw-bold small mt-3 mb-1">🌐 Browse Fal's Full Catalog</h6>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="modelBrowseRefreshBtn">🔄 Refresh now</button>
+                    </div>
+                    <p class="xx-small text-muted mb-1">Everything available on Fal, not just the curated list above — loaded automatically, not something you need to know the right search term for. Pick a result and it's set as a "Custom model ID" for you.</p>
+                    <p class="xx-small text-muted mb-2" id="modelBrowseCacheStatus">Loading catalog status...</p>
+                    <div class="d-flex gap-2 mb-2">
+                        <input type="text" class="form-control form-control-sm" id="modelSearchQuery" placeholder="Filter by name/description (optional — everything shows by default)">
+                        <select class="form-select form-select-sm" style="max-width: 160px;" id="modelSearchCategory">
+                            <option value="">Any category</option>
+                            <option value="image-to-image">Image editing</option>
+                            <option value="text-to-image">Image generation</option>
+                            <option value="image-to-video">Video generation</option>
+                            <option value="text-to-video">Video generation (text)</option>
+                        </select>
+                        <button type="button" class="btn btn-sm btn-primary flex-shrink-0" id="modelSearchBtn">Filter</button>
+                    </div>
+                    <div id="modelSearchResults" class="list-group"></div>
+                </div>
+                <div class="modal-footer bg-light">
+                    <button type="button" class="btn btn-secondary text-sm" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="modal fade" id="batchPreflightModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title fw-bold">🔍 Before You Launch</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-4" id="preflightBody">
+                    <div class="text-muted small">Loading...</div>
+                </div>
+                <div class="modal-footer bg-light">
+                    <button type="button" class="btn btn-secondary text-sm" data-bs-dismiss="modal">Go back and adjust</button>
+                    <button type="button" class="btn btn-success fw-bold text-sm" id="preflightConfirmBtn">✅ Confirm & Launch</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="modal fade" id="imageToolsModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title fw-bold">🛠️ Image Tools</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <p class="text-muted small">Single-image utilities, separate from the photoshoot pipeline — good for cleaning up an existing photo before or after using it elsewhere.</p>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold small">Tool</label>
+                        <select class="form-select form-select-sm" id="imageToolSelect">
+                            <option value="upscale">📈 Upscale — increase resolution and sharpen detail</option>
+                            <option value="extend">🖼️ Extend — expand the image beyond its original edges</option>
+                            <option value="restore">🎨 Restore &amp; Colorize — fix damage, scratches, and add color to black-and-white photos</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small fw-semibold mb-1" for="imageToolModelSelect">Model</label>
+                        <select class="form-select form-select-sm" id="imageToolModelSelect"></select>
+                        <p class="xx-small text-muted mb-0 mt-1" id="imageToolModelHint"></p>
+                    </div>
+                    <div class="mb-3" id="imageToolExtraParams"></div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold small" id="imageToolsInputLabel">Image</label>
+                        <input type="file" id="imageToolsInput" accept="image/*" class="form-control form-control-sm">
+                        <small class="text-muted d-block mt-1" id="imageToolsChainHint"></small>
+                        <div class="alert alert-info py-2 px-3 small mt-2 d-none" id="imageToolsSuggestion"></div>
+                    </div>
+                    <div class="mb-3 d-none" id="imageToolExtendOptions">
+                        <label class="form-label fw-semibold small">Direction to expand</label>
+                        <select class="form-select form-select-sm" id="imageToolExtendDirection">
+                            <option value="center">All sides (uniform)</option>
+                            <option value="left">Left</option>
+                            <option value="right">Right</option>
+                            <option value="top">Top</option>
+                        </select>
+                    </div>
+                    <div class="mb-3 d-none" id="imageToolUpscaleOptions">
+                        <label class="form-label fw-semibold small">Scale</label>
+                        <select class="form-select form-select-sm" id="imageToolUpscaleScale">
+                            <option value="2">2x</option>
+                            <option value="4">4x</option>
+                        </select>
+                    </div>
+                    <div class="d-flex gap-2">
+                        <button type="button" class="btn btn-primary flex-grow-1 py-2 fw-bold" id="imageToolsRunBtn">Run</button>
+                        <button type="button" class="btn btn-outline-secondary d-none" id="imageToolsResetBtn" title="Start over with a fresh image">🔄 Start over</button>
+                    </div>
+                    <div class="mt-3" id="imageToolsResult"></div>
+                </div>
+                <div class="modal-footer bg-light">
+                    <button type="button" class="btn btn-secondary text-sm" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="modal fade" id="voiceStudioModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title fw-bold">🎙️ Voice Studio</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <p class="text-muted small">Turn a script or line of dialogue into real speech — the first piece of the movie pipeline. Generated audio can later feed a talking avatar.</p>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold small" for="voiceStudioText">Text to speak</label>
+                        <textarea class="form-control" id="voiceStudioText" rows="4" placeholder="Type the line, script, or narration you want spoken aloud... English, native script, or even romanized (e.g. 'nenu bagunnanu') all work."></textarea>
+                        <small class="text-muted d-block mt-1">Use <code>*text*</code> for stage directions — <code>*pause*</code> or <code>*2 second pause*</code> inserts real timed silence; <code>*laughs*</code>, <code>*sighs*</code>, etc. become spoken interjections instead of being read aloud literally.</small>
+                        <small class="text-muted d-block mt-1" id="voiceStudioCostEstimate"></small>
+                        <div class="alert alert-warning py-2 px-3 small mt-2 d-none" id="voiceStudioLanguageSuggestion"></div>
+                    </div>
+                    <div class="form-check form-switch mb-2">
+                        <input class="form-check-input" type="checkbox" id="voiceStudioTranslateToggle">
+                        <label class="form-check-label small" for="voiceStudioTranslateToggle">Prepare for another language <span class="text-muted fw-normal">(understands plain English, romanized text like "nenu ardam avutundi", or natural English+native mixing — converts it, shows you the result, and lets you edit it before anything is spoken)</span></label>
+                    </div>
+                    <div class="mb-3 d-none" id="voiceStudioTranslateRow">
+                        <label class="form-label xx-small fw-semibold mb-1">Target language</label>
+                        <select class="form-select form-select-sm mb-2" id="voiceStudioTranslateTarget">
+                            <optgroup label="Indian languages">
+                                <option value="Hindi">Hindi</option>
+                                <option value="Telugu" selected>Telugu</option>
+                                <option value="Tamil">Tamil</option>
+                                <option value="Kannada">Kannada</option>
+                                <option value="Malayalam">Malayalam</option>
+                                <option value="Marathi">Marathi</option>
+                                <option value="Bengali">Bengali</option>
+                                <option value="Gujarati">Gujarati</option>
+                                <option value="Punjabi">Punjabi</option>
+                                <option value="Odia">Odia</option>
+                                <option value="Urdu">Urdu</option>
+                            </optgroup>
+                            <optgroup label="Other languages">
+                                <option value="Spanish">Spanish</option>
+                                <option value="French">French</option>
+                                <option value="Arabic">Arabic</option>
+                                <option value="Chinese">Chinese</option>
+                                <option value="Japanese">Japanese</option>
+                            </optgroup>
+                        </select>
+                        <button type="button" class="btn btn-sm btn-outline-dark w-100" id="voiceStudioPrepareBtn">🔤 Prepare & Preview Text</button>
+                        <div class="d-none mt-2" id="voiceStudioPreparedRow">
+                            <label class="form-label xx-small fw-semibold mb-1">Prepared text <span class="text-muted fw-normal">(edit freely — this is exactly what gets spoken)</span></label>
+                            <textarea class="form-control form-control-sm" id="voiceStudioPreparedText" rows="4"></textarea>
+                            <button type="button" class="btn btn-sm btn-link p-0 mt-1" id="voiceStudioReprepareBtn">🔄 Re-run preparation from the original text</button>
+                        </div>
+                        <p class="xx-small text-muted mb-0 mt-2">Uses this app's text-reasoning model — a general language capability, not a claim about any specific voice model's own training. For guaranteed native pronunciation quality in Indian languages, ElevenLabs Eleven v3 below is the voice model with confirmed real language support.</p>
+                    </div>
+                    <div class="form-check form-switch mb-2">
+                        <input class="form-check-input" type="checkbox" id="voiceStudioMultilingualToggle">
+                        <label class="form-check-label small" for="voiceStudioMultilingualToggle">Multiple languages in ONE script <span class="text-muted fw-normal">(mix languages within a single narration — e.g. English narration with certain lines spoken in Telugu, all as one continuous audio)</span></label>
+                    </div>
+                    <div class="mb-3 d-none" id="voiceStudioMultilingualSection">
+                        <p class="xx-small text-muted mb-1">Wrap the parts that should be in another language with tags like <code>[Telugu]...[/Telugu]</code> — everything else stays in the base language below. Each tagged part gets translated for real, generated, and merged into one continuous file.</p>
+                        <textarea class="form-control form-control-sm mb-2" id="voiceStudioMultilingualScript" rows="6" placeholder="Type or paste your script, then wrap the non-English parts, e.g.:&#10;There are journeys...&#10;[Telugu]Not everyone reaches the sacred Himalayas.[/Telugu]&#10;And then there are callings."></textarea>
+                        <label class="form-label xx-small fw-semibold mb-1">Base language <span class="text-muted fw-normal">(for the untagged parts)</span></label>
+                        <select class="form-select form-select-sm mb-2" id="voiceStudioMultilingualBase">
+                            <option value="english" selected>English</option>
+                            <option value="Hindi">Hindi</option>
+                            <option value="Telugu">Telugu</option>
+                            <option value="Tamil">Tamil</option>
+                            <option value="Kannada">Kannada</option>
+                            <option value="Malayalam">Malayalam</option>
+                        </select>
+                        <label class="form-label xx-small fw-semibold mb-1">Or describe it in plain words and let it tag the script for you</label>
+                        <div class="d-flex gap-1 mb-2">
+                            <input type="text" class="form-control form-control-sm" id="voiceStudioAutoTagInstruction" placeholder="e.g. make the devotional/sacred lines Telugu, keep the rest English">
+                            <button type="button" class="btn btn-sm btn-outline-dark flex-shrink-0" id="voiceStudioAutoTagBtn">✨ Auto-tag</button>
+                        </div>
+                        <p class="xx-small text-muted mb-2" id="voiceStudioAutoTagStatus"></p>
+                        <button type="button" class="btn btn-sm btn-dark w-100" id="voiceStudioGenerateMultilingualBtn">🌐 Generate Multi-language Audio</button>
+                        <p class="xx-small text-muted mt-1 mb-0" id="voiceStudioMultilingualStatus"></p>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small fw-semibold mb-1" for="voiceStudioModelSelect">Voice model</label>
+                        <div class="d-flex gap-1">
+                            <select class="form-select form-select-sm" id="voiceStudioModelSelect" data-model-custom-target="voiceStudioModelCustom"></select>
+                        </div>
+                        <input type="text" class="form-control form-control-sm mt-1 d-none" id="voiceStudioModelCustom" placeholder="e.g. fal-ai/inworld-tts or fal-ai/chatterbox/text-to-speech">
+                        <p class="xx-small text-muted mb-0 mt-1" id="voiceStudioModelHint"></p>
+                    </div>
+                    <div class="row g-2 mb-3">
+                        <div class="col-12">
+                            <label class="form-label xx-small fw-semibold mb-1">Voice</label>
+                            <div class="d-flex gap-1">
+                                <select class="form-select form-select-sm" id="voiceStudioVoiceId"></select>
+                                <input type="text" class="form-control form-control-sm d-none" id="voiceStudioVoiceIdFreeform" placeholder="Sarah">
+                                <button type="button" class="btn btn-sm btn-outline-primary flex-shrink-0" id="voiceStudioPreviewBtn" title="Hear a short real sample of this voice">▶️ Preview</button>
+                            </div>
+                            <p class="xx-small text-muted mb-0 mt-1" id="voiceStudioVoiceDescription"></p>
+                            <div class="alert alert-warning py-2 px-3 xx-small mt-2 d-none" id="voiceStudioCategoryNote"></div>
+                            <div class="alert alert-warning py-2 px-3 xx-small mt-2 d-none" id="voiceStudioMissingCustomVoiceHint"></div>
+                            <audio class="w-100 mt-1 d-none" id="voiceStudioPreviewPlayer" controls></audio>
+                            <button type="button" class="btn btn-sm btn-outline-secondary w-100 mt-2" id="voiceStudioRecheckBtn">🔄 Re-check which voices actually work</button>
+                            <p class="xx-small text-muted mb-0 mt-1" id="voiceStudioRecheckStatus"></p>
+                        </div>
+                        <div class="col-12" id="voiceStudioLanguageRow">
+                            <label class="form-label xx-small fw-semibold mb-1">Language boost <span class="text-muted fw-normal" id="voiceStudioLanguageHint"></span></label>
+                            <select class="form-select form-select-sm" id="voiceStudioLanguage"></select>
+                        </div>
+                    </div>
+                    <div class="row g-2 mb-3" id="voiceStudioEmotionPitchRow">
+                        <div class="col-6">
+                            <label class="form-label xx-small fw-semibold mb-1">Speed <span class="text-muted" data-range-value="voiceStudioSpeed">1.0</span></label>
+                            <input type="range" class="form-range" id="voiceStudioSpeed" min="0.5" max="2.0" step="0.1" value="1.0">
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label xx-small fw-semibold mb-1">Pitch <span class="text-muted" data-range-value="voiceStudioPitch">0</span></label>
+                            <input type="range" class="form-range" id="voiceStudioPitch" min="-12" max="12" step="1" value="0">
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label xx-small fw-semibold mb-1">Emotion</label>
+                            <select class="form-select form-select-sm" id="voiceStudioEmotion">
+                                <option value="neutral" selected>Neutral</option>
+                                <option value="happy">Happy</option>
+                                <option value="sad">Sad</option>
+                                <option value="angry">Angry</option>
+                                <option value="fearful">Fearful</option>
+                                <option value="disgusted">Disgusted</option>
+                                <option value="surprised">Surprised</option>
+                            </select>
+                        </div>
+                    </div>
+                    <button type="button" class="btn btn-primary w-100 py-2 fw-bold" id="voiceStudioRunBtn">Generate Speech</button>
+                    <div class="mt-3" id="voiceStudioResult"></div>
+                    <hr class="my-4">
+                    <button type="button" class="btn btn-outline-dark w-100 text-start d-flex justify-content-between align-items-center" data-bs-toggle="collapse" data-bs-target="#voiceCloneSection">
+                        <span>🎤 Or, create a real custom voice from a recording</span>
+                        <span>▾</span>
+                    </button>
+                    <div class="collapse mt-3" id="voiceCloneSection">
+                        <div class="alert alert-info py-2 px-3 small mb-3">
+                            🗣️ You can record yourself speaking <strong>any language</strong> — the clone captures your voice's actual tone and timbre either way. But once cloned, this voice speaks back through MiniMax, which only <em>confirms</em> reliable results in Hindi and English. Telugu/Tamil/Kannada/etc. may still come out understandable — worth testing with the Preview button above after cloning — but isn't guaranteed the way it is with ElevenLabs' own preset voices (no cloning, but confirmed native pronunciation for these languages).
+                        </div>
+                        <p class="text-muted small">Read a short passage aloud (10+ seconds), or upload an existing recording. This becomes a real, reusable voice you can pick from the list above.</p>
+                        <p class="xx-small text-muted mb-2">Cloning itself doesn't care what language you speak while recording — it's capturing how your voice sounds, not the words. The language limitation only shows up later, when you use this cloned voice to generate <em>new</em> speech: since cloning only works through MiniMax, Telugu/Tamil/etc. aren't confirmed for the generated speech itself, even though the clone captured your voice fine.</p>
+                        <div class="mb-2">
+                            <label class="form-label xx-small fw-semibold mb-1">Your name (labels this voice)</label>
+                            <input type="text" class="form-control form-control-sm" id="voiceCloneName" placeholder="e.g. Priya">
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label xx-small fw-semibold mb-1">Language <span class="text-muted fw-normal">(optional label only)</span></label>
+                            <input type="text" class="form-control form-control-sm" id="voiceCloneLanguage" placeholder="e.g. Telugu">
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label xx-small fw-semibold mb-1">Read this aloud <span class="text-muted fw-normal">(or replace with your own text, any language)</span></label>
+                            <textarea class="form-control form-control-sm" id="voiceCloneText" rows="3">The quick brown fox jumps over the lazy dog. Numbers like one, two, three, and sounds like "sh" and "th" help capture a fuller range of your voice. Speak naturally, as if talking to a friend.</textarea>
+                        </div>
+                        <div class="d-flex gap-2 mb-2">
+                            <button type="button" class="btn btn-sm btn-outline-danger flex-grow-1" id="voiceCloneRecordBtn">🔴 Record</button>
+                            <label class="btn btn-sm btn-outline-secondary flex-grow-1 mb-0" for="voiceCloneUpload">📁 Upload instead</label>
+                            <input type="file" accept="audio/*" id="voiceCloneUpload" class="d-none">
+                        </div>
+                        <p class="xx-small text-muted mb-1" id="voiceCloneStatus"></p>
+                        <audio class="w-100 mb-2 d-none" id="voiceCloneRecordedPlayer" controls></audio>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="voiceCloneEmotionsToggle" checked>
+                            <label class="form-check-label small" for="voiceCloneEmotionsToggle">Also generate the full emotional range <span class="text-muted fw-normal">(angry, happy, sad, fearful, disgusted, surprised, neutral — 7 short samples in this voice, so you can hear the whole range right after cloning)</span></label>
+                        </div>
+                        <button type="button" class="btn btn-primary w-100 fw-bold" id="voiceCloneSubmitBtn" disabled>Clone This Voice</button>
+                        <p class="xx-small text-muted mt-2 mb-0">⚠️ MiniMax automatically deletes a cloned voice if it isn't used again within 7 days of creation — using it here to generate speech resets that clock. This confirmed emotion-range feature is specific to the MiniMax clone below — real ElevenLabs voice cloning isn't available through this app's current Fal-based setup (checked directly: Fal doesn't expose that endpoint, only ElevenLabs' own separate paid API does), so for genuine Telugu/Tamil/Kannada speech, use the Translate toggle above together with this cloned voice, or ElevenLabs' preset voices for guaranteed native-quality pronunciation.</p>
+                        <div class="mt-2" id="voiceCloneResult"></div>
+                        <div class="mt-3" id="voiceCloneSavedList"></div>
+                    </div>
+                </div>
+                <div class="modal-footer bg-light">
+                    <button type="button" class="btn btn-secondary text-sm" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="modal fade" id="songStudioModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title fw-bold">🎵 Song Studio</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <p class="text-muted small">Full songs with real sung vocals — give it a mood/style and lyrics, or describe your story and let it write the lyrics for you.</p>
+                    <button type="button" class="btn btn-outline-dark w-100 text-start d-flex justify-content-between align-items-center mb-3" data-bs-toggle="collapse" data-bs-target="#songWriterSection">
+                        <span>✨ Turn a story/idea into lyrics for me</span>
+                        <span>▾</span>
+                    </button>
+                    <div class="collapse mb-3" id="songWriterSection">
+                        <label class="form-label xx-small fw-semibold mb-1">Your story / what the song is about</label>
+                        <textarea class="form-control form-control-sm mb-2" id="songStoryPrompt" rows="6" placeholder="Tell it what the song should be about — real details, names, feelings. The more specific, the better the lyrics."></textarea>
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <label class="form-label xx-small fw-semibold mb-1">How should it feel?</label>
+                                <input type="text" class="form-control form-control-sm" id="songEmotionalFeel" placeholder="e.g. bittersweet, defiant, joyful, aching">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label xx-small fw-semibold mb-1">Vocal delivery</label>
+                                <input type="text" class="form-control form-control-sm" id="songVocalStyle" placeholder="e.g. soulful and raw, whispered, belted, playful">
+                            </div>
+                        </div>
+                        <label class="form-label xx-small fw-semibold mb-1">Lyrical style</label>
+                        <select class="form-select form-select-sm mb-2" id="songLyricalGenre">
+                            <option value="" selected>No strong preference — let it decide</option>
+                            <option value="rap">Rap — real rhyme scheme, punchlines, rhythmic flow for a beat</option>
+                            <option value="classic">Classic ballad — clear verse/chorus, singable and timeless</option>
+                            <option value="poetic">Poetic — rich imagery and metaphor over plain statement</option>
+                            <option value="folk">Folk/storytelling — narrative, conversational, grounded</option>
+                        </select>
+                        <label class="form-label xx-small fw-semibold mb-1">Reference songs/style <span class="text-muted fw-normal">(optional — for tone/feel only, nothing gets copied)</span></label>
+                        <input type="text" class="form-control form-control-sm mb-2" id="songReferenceNotes" placeholder="e.g. saxophone, upbeat energy, style like [song] by [artist]">
+                        <label class="form-label xx-small fw-semibold mb-1">Language style for the lyrics</label>
+                        <select class="form-select form-select-sm mb-2" id="songLyricLanguageStyle">
+                            <option value="match" selected>Match how I wrote my story (keeps any Telugu/Hindi/etc. mixing you naturally used)</option>
+                            <option value="english">English only, but with Indian-English feel — not generic Western pop phrasing</option>
+                            <option value="Telugu">Primarily Telugu, with natural English mixing</option>
+                            <option value="Hindi">Primarily Hindi, with natural English mixing</option>
+                            <option value="Tamil">Primarily Tamil, with natural English mixing</option>
+                            <option value="Kannada">Primarily Kannada, with natural English mixing</option>
+                            <option value="Malayalam">Primarily Malayalam, with natural English mixing</option>
+                        </select>
+                        <div class="alert alert-warning py-2 px-3 xx-small mb-2">Honest limit: none of the real, verified music models here have confirmed non-English <em>vocal singing</em> — this language setting shapes the written lyrics text, but the model singing it may not pronounce non-English words correctly. Real Telugu/Hindi/etc. speech is solid elsewhere in this app (Voice Studio); sung vocals in those languages aren't yet confirmed anywhere.</div>
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" id="songWantsVocals" checked>
+                                    <label class="form-check-label xx-small" for="songWantsVocals">Wants vocals/lyrics <span class="text-muted">(off = instrumental)</span></label>
+                                </div>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" id="songWantsOwnVoice">
+                                    <label class="form-check-label xx-small" for="songWantsOwnVoice">Use my own voice as reference</label>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label xx-small fw-semibold mb-1">Priority</label>
+                                <select class="form-select form-select-sm" id="songPriority">
+                                    <option value="" selected>Balanced</option>
+                                    <option value="quality">Highest quality</option>
+                                    <option value="budget">Lowest cost</option>
+                                    <option value="speed">Fastest</option>
+                                </select>
+                            </div>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-dark w-100" id="songWriteLyricsBtn">✨ Write Lyrics &amp; Recommend a Model</button>
+                        <p class="xx-small text-muted mt-1 mb-0" id="songWriterStatus"></p>
+                        <div class="mt-2 d-none" id="songRecommendationBox"></div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small fw-semibold mb-1" for="songLyricsModelSelect">Music model</label>
+                        <select class="form-select form-select-sm" id="songLyricsModelSelect" data-model-custom-target="songLyricsModelCustom"></select>
+                        <input type="text" class="form-control form-control-sm mt-1 d-none" id="songLyricsModelCustom" placeholder="e.g. any other Fal music model ID">
+                        <p class="xx-small text-muted mb-0 mt-1" id="songLyricsModelHint"></p>
+                    </div>
+                    <div class="mb-3 d-none" id="songDurationSection">
+                        <label class="form-label small fw-semibold mb-1">Length required <span class="text-muted fw-normal">(real, confirmed control for this model)</span></label>
+                        <div class="d-flex align-items-center gap-2">
+                            <input type="range" class="form-range" id="songDurationSlider" min="10" max="180" value="60" style="flex:1;">
+                            <span class="small fw-semibold" id="songDurationValue" style="min-width:48px;">60s</span>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small fw-semibold mb-1" for="songStylePrompt">Style / mood / genre <span class="text-muted fw-normal">(10-300 characters)</span></label>
+                        <input type="text" class="form-control form-control-sm" id="songStylePrompt" placeholder="e.g. Upbeat pop, saxophone, energetic, romantic, 110 BPM" maxlength="300">
+                        <small class="text-muted" id="songStyleCount">0 / 300</small>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small fw-semibold mb-1" for="songLyricsPrompt">Lyrics <span class="text-muted fw-normal">(use [Verse], [Chorus], [Bridge], [Intro], [Outro] tags)</span></label>
+                        <textarea class="form-control" id="songLyricsPrompt" rows="10" placeholder="[Verse]&#10;...&#10;[Chorus]&#10;..." maxlength="3000"></textarea>
+                        <small class="text-muted" id="songLyricsCount">0 / 3000</small>
+                    </div>
+                    <hr class="my-4">
+                    <button type="button" class="btn btn-outline-dark w-100 text-start d-flex justify-content-between align-items-center mb-3" data-bs-toggle="collapse" data-bs-target="#songReferenceVoiceSection">
+                        <span>🎤 Or, use your own voice as a reference</span>
+                        <span>▾</span>
+                    </button>
+                    <div class="collapse mb-3" id="songReferenceVoiceSection">
+                        <div class="alert alert-info py-2 px-3 xx-small mb-2">
+                            Uses a different real model (Seed Audio 1.0 by ByteDance) built specifically for this — record or upload a clip of your voice, and it generates audio referencing that clip. Confirmed real: your voice combined with background music in one generation. NOT confirmed: true melodic singing following a tune the way the lyrics-based option above does — this is closer to your voice speaking/narrating over music. English and Chinese only for now.
+                        </div>
+                        <label class="form-label xx-small fw-semibold mb-1">Your voice clip <span class="text-muted fw-normal">(up to 30 seconds)</span></label>
+                        <div class="d-flex gap-2 mb-2">
+                            <button type="button" class="btn btn-sm btn-outline-danger flex-grow-1" id="songRefRecordBtn">🔴 Record</button>
+                            <label class="btn btn-sm btn-outline-secondary flex-grow-1 mb-0" for="songRefUpload">📁 Upload instead</label>
+                            <input type="file" accept="audio/*" id="songRefUpload" class="d-none">
+                        </div>
+                        <p class="xx-small text-muted mb-1" id="songRefStatus"></p>
+                        <audio class="w-100 mb-2 d-none" id="songRefPlayer" controls></audio>
+                        <label class="form-label xx-small fw-semibold mb-1">Model</label>
+                        <select class="form-select form-select-sm mb-2" id="songRefModelSelect" data-model-custom-target="songRefModelCustom"></select>
+                        <input type="text" class="form-control form-control-sm mb-2 d-none" id="songRefModelCustom" placeholder="e.g. another reference-voice model ID">
+                        <label class="form-label xx-small fw-semibold mb-1">What should happen <span class="text-muted fw-normal">(mention @Audio1 to reference your voice clip)</span></label>
+                        <textarea class="form-control form-control-sm" id="songRefPrompt" rows="3" placeholder="e.g. Upbeat radio-style intro music, then @Audio1 says: welcome to our summer sale..."></textarea>
+                        <button type="button" class="btn btn-primary w-100 fw-bold mt-2" id="songRefGenerateBtn">🎤 Generate with My Voice</button>
+                        <div class="mt-3" id="songRefResult"></div>
+                    </div>
+                    <button type="button" class="btn btn-primary w-100 py-2 fw-bold" id="songGenerateBtn">🎵 Generate Song</button>
+                    <p class="xx-small text-muted mt-2 mb-0">Generation takes a minute or two — full songs are more involved than short voice clips.</p>
+                    <div class="mt-3" id="songStudioResult"></div>
+                    <hr>
+                    <h6 class="fw-bold">🔊 Sound Effects / Sonic Logo <span class="text-muted fw-normal small">(short sound design, not a song — e.g. a "Netflix intro" style sting)</span></h6>
+                    <textarea class="form-control form-control-sm mb-2" id="sfxPrompt" rows="2" placeholder="e.g. a short cinematic whoosh into a deep bass hit, like a streaming service intro sting"></textarea>
+                    <div class="d-flex align-items-center gap-2 mb-2">
+                        <label class="xx-small text-muted mb-0">Duration:</label>
+                        <input type="range" class="form-range" id="sfxDurationSlider" min="1" max="30" value="3" style="flex:1;">
+                        <span class="small fw-semibold" id="sfxDurationValue" style="min-width:32px;">3s</span>
+                    </div>
+                    <button type="button" class="btn btn-outline-dark w-100 fw-bold" id="sfxGenerateBtn">🔊 Generate Sound Effect</button>
+                    <div class="mt-2" id="sfxResult"></div>
+                </div>
+                <div class="modal-footer bg-light">
+                    <button type="button" class="btn btn-secondary text-sm" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="row g-4 d-none" id="flowModeRow">
+        <div class="col-12">
+            <div class="card border-0 shadow-sm">
+                <div class="card-body p-4">
+                    <h4 class="fw-bold text-dark mb-1">🎬 Flow Studio</h4>
+                    <p class="text-muted small">Describe what you want, add references, and it plans the shot and picks a model for you — reviewable before anything generates. Uses the same real fallback system as the rest of this app, so a model hiccup doesn't mean a dead end.</p>
+
+                    <label class="form-label small fw-semibold mb-1">Overall language for this video</label>
+                    <select class="form-select form-select-sm mb-1" id="flowOverallLanguage">
+                        <option value="english" selected>English</option>
+                        <option value="Hindi">Hindi</option>
+                        <option value="Telugu">Telugu</option>
+                        <option value="Tamil">Tamil</option>
+                        <option value="Kannada">Kannada</option>
+                        <option value="Malayalam">Malayalam</option>
+                        <option value="Marathi">Marathi</option>
+                        <option value="Bengali">Bengali</option>
+                    </select>
+                    <p class="xx-small text-muted mb-3">Sets the real default for narration and every character's dialogue below — each can still override it individually. Type romanized text anywhere (e.g. "nenu bagunnanu") and it converts to native script.</p>
+
+                    <label class="form-label small fw-semibold mb-1">What kind of video is this?</label>
+                    <select class="form-select form-select-sm mb-3" id="flowScenario">
+                        <option value="cinematic" selected>Cinematic scene</option>
+                        <option value="talking">Talking / dialogue video (a person speaking)</option>
+                        <option value="product">Product highlight</option>
+                        <option value="fan">Fan / tribute style</option>
+                        <option value="replicate">Replicate a video's style/feel</option>
+                    </select>
+
+                    <div id="flowStandardFields">
+                        <label class="form-label small fw-semibold mb-1">What do you want this video to be/achieve?</label>
+                        <textarea class="form-control form-control-sm mb-3" id="flowIntent" rows="4" placeholder="e.g. A warm, cinematic product reveal that feels like a boutique ad — slow push-in, soft morning light, confident and calm mood."></textarea>
+
+                        <div class="accordion" id="flowAccordion">
+                        <div class="accordion-item">
+                            <h2 class="accordion-header">
+                                <button class="accordion-button" type="button" data-bs-toggle="collapse" data-bs-target="#flowPeopleCollapse">👥&nbsp; People &amp; Products <span class="text-muted fw-normal ms-2 small">optional</span></button>
+                            </h2>
+                            <div id="flowPeopleCollapse" class="accordion-collapse collapse show" data-bs-parent="#flowAccordion">
+                            <div class="accordion-body">
+                        <label class="form-label small fw-semibold mb-1">People / characters <span class="text-muted fw-normal">(optional — add as many as you need)</span></label>
+                        <p class="xx-small text-muted mb-1">Each person is their own card: image upload, an image URL, or just a description — any combination. Use the same name on multiple cards for alternate versions of the same person (e.g. a real photo AND an AI/animated version).</p>
+                        <div id="flowPersonCards" class="mb-2"></div>
+                        <button type="button" class="btn btn-sm btn-outline-secondary w-100 mb-3" id="flowAddPersonBtn">➕ Add Person</button>
+
+                        <label class="form-label small fw-semibold mb-1">Products <span class="text-muted fw-normal">(optional — add as many as you need)</span></label>
+                        <div id="flowProductCards" class="mb-2"></div>
+                        <button type="button" class="btn btn-sm btn-outline-secondary w-100" id="flowAddProductBtn">➕ Add Product</button>
+                            </div>
+                            </div>
+                        </div>
+                        <div class="accordion-item">
+                            <h2 class="accordion-header">
+                                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#flowShotDetailsCollapse">🎬&nbsp; Shot Details <span class="text-muted fw-normal ms-2 small">optional</span></button>
+                            </h2>
+                            <div id="flowShotDetailsCollapse" class="accordion-collapse collapse" data-bs-parent="#flowAccordion">
+                            <div class="accordion-body">
+                        <label class="form-label xx-small fw-semibold mb-1">Genre / niche <span class="text-muted fw-normal">(optional)</span></label>
+                        <input type="text" class="form-control form-control-sm mb-2" id="flowNiche" placeholder="e.g. luxury fashion, travel vlog, sports highlight">
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <label class="form-label xx-small fw-semibold mb-1">How it starts <span class="text-muted fw-normal">(optional)</span></label>
+                                <input type="text" class="form-control form-control-sm" id="flowStoryStart">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label xx-small fw-semibold mb-1">How it ends <span class="text-muted fw-normal">(optional)</span></label>
+                                <input type="text" class="form-control form-control-sm" id="flowStoryEnd">
+                            </div>
+                        </div>
+                        <label class="form-label small fw-semibold mb-1">Start frame image <span class="text-muted fw-normal">(optional — overrides using your first person/product card as the opening frame. Use this for a specific, dedicated opening shot.)</span></label>
+                        <input type="file" accept="image/*" class="form-control form-control-sm mb-2" id="flowStartFrameUpload">
+                        <img class="d-none mb-2 rounded" id="flowStartFramePreview" style="max-width:100px;">
+                        <label class="form-label small fw-semibold mb-1">End frame image <span class="text-muted fw-normal">(optional — the video will animate from the start frame above TO this one. Real, confirmed capability, only on Kling-based models — picked automatically when you provide this)</span></label>
+                        <input type="file" accept="image/*" class="form-control form-control-sm mb-2" id="flowEndFrameUpload">
+                        <img class="d-none mb-2 rounded" id="flowEndFramePreview" style="max-width:100px;">
+                            </div>
+                            </div>
+                        </div>
+                        <div class="accordion-item">
+                            <h2 class="accordion-header">
+                                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#flowReferencesCollapse">🔗&nbsp; References &amp; Context <span class="text-muted fw-normal ms-2 small">optional</span></button>
+                            </h2>
+                            <div id="flowReferencesCollapse" class="accordion-collapse collapse" data-bs-parent="#flowAccordion">
+                            <div class="accordion-body">
+                        <label class="form-label small fw-semibold mb-1">Reference video(s) <span class="text-muted fw-normal">(optional — add as many as you need)</span></label>
+                        <p class="xx-small text-muted mb-1">Links to Reels/YouTube/TikTok/etc. work as context, but honestly: only whatever text the page itself publicly exposes (title, description) gets used — this app doesn't download or watch the actual video content. Add a description for each so it genuinely shapes the plan.</p>
+                        <div id="flowVideoRefList" class="mb-2"></div>
+                        <button type="button" class="btn btn-sm btn-outline-secondary w-100 mb-3" id="flowAddVideoRefBtn">➕ Add Reference Video</button>
+                        <label class="form-label small fw-semibold mb-1">Story / context / link <span class="text-muted fw-normal">(optional — paste a URL and it'll pull context from the page)</span></label>
+                        <textarea class="form-control form-control-sm" id="flowStoryContext" rows="2" placeholder="e.g. https://... or freeform background/story detail"></textarea>
+                            </div>
+                            </div>
+                        </div>
+                        <div class="accordion-item">
+                            <h2 class="accordion-header">
+                                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#flowAudioCollapse">🎵&nbsp; Audio <span class="text-muted fw-normal ms-2 small">optional — applied automatically once the video is generated</span></button>
+                            </h2>
+                            <div id="flowAudioCollapse" class="accordion-collapse collapse" data-bs-parent="#flowAccordion">
+                            <div class="accordion-body">
+                        <label class="form-label xx-small fw-semibold mb-1">What should be said <span class="text-muted fw-normal">(rough idea — or write the final script directly below)</span></label>
+                        <textarea class="form-control form-control-sm mb-1" id="flowNarrationIdea" rows="2" placeholder="e.g. welcome viewers, introduce the product, invite them to visit our store"></textarea>
+                        <label class="form-label xx-small fw-semibold mb-1">Language <span class="text-muted fw-normal">(type romanized if that's easier — e.g. "nenu bagunnanu" — it'll convert to native script)</span></label>
+                        <select class="form-select form-select-sm mb-2" id="flowNarrationLanguage">
+                            <option value="english" selected>English</option>
+                            <option value="Hindi">Hindi</option>
+                            <option value="Telugu">Telugu</option>
+                            <option value="Tamil">Tamil</option>
+                            <option value="Kannada">Kannada</option>
+                            <option value="Malayalam">Malayalam</option>
+                            <option value="Marathi">Marathi</option>
+                            <option value="Bengali">Bengali</option>
+                        </select>
+                        <button type="button" class="btn btn-sm btn-dark w-100 mb-2" id="flowWriteNarrationBtn">✨ Write &amp; Prepare Script</button>
+                        <p class="xx-small text-muted mb-1" id="flowNarrationWriteStatus"></p>
+                        <label class="form-label xx-small fw-semibold mb-1">Final narration / dialogue script <span class="text-muted fw-normal">(edit freely — this is exactly what gets spoken)</span></label>
+                        <textarea class="form-control form-control-sm mb-1" id="flowNarrationScript" rows="3" placeholder="What should be spoken/narrated..."></textarea>
+                        <div class="row g-2 mb-1">
+                            <div class="col-6"><select class="form-select form-select-sm" id="flowNarrationVoiceSelect"></select></div>
+                            <div class="col-6">
+                                <label class="btn btn-sm btn-outline-secondary w-100 mb-0" for="flowVoiceRefUpload">🎤 Clone a voice from a reference clip instead</label>
+                                <input type="file" accept="audio/*" id="flowVoiceRefUpload" class="d-none">
+                            </div>
+                        </div>
+                        <p class="xx-small text-muted mb-2" id="flowVoiceRefStatus"></p>
+                        <label class="btn btn-sm btn-outline-secondary w-100 mb-2" for="flowNarrationUpload">📁 Or just upload a finished narration clip</label>
+                        <input type="file" accept="audio/*" id="flowNarrationUpload" class="d-none">
+                        <p class="xx-small text-muted mb-2" id="flowNarrationUploadStatus"></p>
+                        <button type="button" class="btn btn-sm btn-outline-primary w-100 mb-1" id="flowPreviewNarrationBtn">▶️ Generate &amp; Listen</button>
+                        <audio class="w-100 mb-2 d-none" id="flowNarrationPreviewPlayer" controls></audio>
+                        <label class="form-label xx-small fw-semibold mb-1">Background music</label>
+                        <input type="text" class="form-control form-control-sm mb-1" id="flowBgmPrompt" placeholder="e.g. soft acoustic guitar, warm and hopeful">
+                        <div class="row g-2 mb-1">
+                            <div class="col-6"><select class="form-select form-select-sm" id="flowBgmModelSelect"></select></div>
+                            <div class="col-6">
+                                <label class="btn btn-sm btn-outline-secondary w-100 mb-0" for="flowBgmRefUpload">🎵 Match a reference track's style instead</label>
+                                <input type="file" accept="audio/*" id="flowBgmRefUpload" class="d-none">
+                            </div>
+                        </div>
+                        <p class="xx-small text-muted mb-2" id="flowBgmRefStatus"></p>
+                        <label class="btn btn-sm btn-outline-secondary w-100 mb-2" for="flowBgmUpload">📁 Or just upload a finished BGM clip</label>
+                        <input type="file" accept="audio/*" id="flowBgmUpload" class="d-none">
+                        <p class="xx-small text-muted mb-2" id="flowBgmUploadStatus"></p>
+                        <button type="button" class="btn btn-sm btn-outline-primary w-100 mb-1" id="flowPreviewBgmBtn">▶️ Generate &amp; Listen</button>
+                        <audio class="w-100 mb-2 d-none" id="flowBgmPreviewPlayer" controls></audio>
+                            </div>
+                            </div>
+                        </div>
+                        </div>
+
+                        <div class="row g-2 mb-3 mt-3">
+                            <div class="col-6">
+                                <label class="form-label xx-small fw-semibold mb-1">Priority</label>
+                                <select class="form-select form-select-sm" id="flowPriority">
+                                    <option value="" selected>Balanced</option>
+                                    <option value="quality">Highest quality</option>
+                                    <option value="budget">Lowest cost</option>
+                                </select>
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label xx-small fw-semibold mb-1">Duration</label>
+                                <select class="form-select form-select-sm" id="flowDuration">
+                                    <option value="4">4s</option>
+                                    <option value="6" selected>6s</option>
+                                    <option value="8">8s</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="flowLongVideoToggle">
+                            <label class="form-check-label small fw-semibold" for="flowLongVideoToggle">Long video (multiple minutes) — built from several scenes, merged into one file</label>
+                        </div>
+                        <div class="d-none" id="flowLongVideoSection">
+                            <p class="xx-small text-muted mb-2" id="flowFfmpegWarning"></p>
+                            <div class="alert alert-success py-2 px-3 xx-small mb-2 d-none" id="flowLongVideoRecommendation"></div>
+                            <label class="form-label xx-small fw-semibold mb-1">Model for scenes <span class="text-muted fw-normal">(sets the real max length per scene — different models genuinely support different lengths)</span></label>
+                            <select class="form-select form-select-sm mb-2" id="flowLongVideoModelSelect"></select>
+                            <p class="xx-small text-muted mb-2" id="flowSceneDurationNote"></p>
+                            <label class="form-label xx-small fw-semibold mb-1">Total length (minutes) <span class="text-muted fw-normal">— up to 15 by default, most videos fit here</span></label>
+                            <input type="number" class="form-control form-control-sm mb-2" id="flowTotalMinutes" min="1" max="15" value="2">
+                            <div class="form-check form-switch mb-2">
+                                <input class="form-check-input" type="checkbox" id="flowForceExtendedToggle">
+                                <label class="form-check-label xx-small" for="flowForceExtendedToggle">Need longer than 15 minutes? Allow up to 30 (real cost/time go up a lot — see the estimate before committing)</label>
+                            </div>
+                            <button type="button" class="btn btn-sm btn-outline-dark w-100 mb-2" id="flowPlanScenesBtn">🧠 Draft Scenes</button>
+                            <div class="d-none" id="flowSceneListSection">
+                                <div id="flowSceneList" class="mb-2"></div>
+                                <button type="button" class="btn btn-sm btn-outline-secondary w-100 mb-2" id="flowAddSceneBtn">➕ Add Scene</button>
+                                <button type="button" class="btn btn-outline-dark w-100 mb-2" id="flowEstimateCostBtn">💰 Estimate Cost</button>
+                                <div class="d-none" id="flowCostEstimateBox"></div>
+                                <button type="button" class="btn btn-primary w-100 fw-bold d-none" id="flowGenerateLongBtn">🎬 Generate Full Video</button>
+                            </div>
+                        </div>
+                        <button type="button" class="btn btn-dark w-100 fw-bold" id="flowPlanBtn">🧠 Plan This Video</button>
+                        <p class="xx-small text-muted mt-1 mb-0" id="flowPlanStatus"></p>
+                        <div class="mt-3 d-none" id="flowPlanBox"></div>
+                    </div>
+
+                    <div class="d-none" id="flowTalkingFields">
+                        <div class="alert alert-info py-2 px-3 small mb-3" id="flowTalkingGuidance"></div>
+                        <label class="form-label small fw-semibold mb-1">Portrait reference image</label>
+                        <input type="file" accept="image/*" class="form-control form-control-sm mb-2" id="flowTalkingImageUpload">
+                        <img class="d-none mb-2 rounded" id="flowTalkingImagePreview" style="max-width:120px;">
+
+                        <label class="form-label small fw-semibold mb-1">How should this character speak?</label>
+                        <select class="form-select form-select-sm mb-2" id="flowTalkingAudioMode">
+                            <option value="generate" selected>Generate speech from text (with real translation if needed)</option>
+                            <option value="finished">I have a finished audio clip already</option>
+                        </select>
+
+                        <div id="flowTalkingFinishedAudioSection">
+                            <label class="btn btn-sm btn-outline-secondary w-100 mb-2" for="flowTalkingAudioUpload">📁 Upload the clip</label>
+                            <input type="file" accept="audio/*" id="flowTalkingAudioUpload" class="d-none">
+                            <audio class="w-100 mb-2 d-none" id="flowTalkingAudioPreview" controls></audio>
+                        </div>
+
+                        <div id="flowTalkingGenerateSpeechSection">
+                            <label class="form-label xx-small fw-semibold mb-1">What should be said <span class="text-muted fw-normal">(type in your own language — it translates for real if the target below differs)</span></label>
+                            <textarea class="form-control form-control-sm mb-1" rows="2" id="flowTalkingText" placeholder="e.g. Welcome everyone, glad you could join us today"></textarea>
+                            <label class="form-label xx-small fw-semibold mb-1">Speak it in</label>
+                            <select class="form-select form-select-sm mb-2" id="flowTalkingTargetLanguage">
+                                <option value="english">English</option>
+                                <option value="Hindi">Hindi</option>
+                                <option value="Telugu">Telugu</option>
+                                <option value="Tamil">Tamil</option>
+                                <option value="Kannada">Kannada</option>
+                                <option value="Malayalam">Malayalam</option>
+                                <option value="Marathi">Marathi</option>
+                                <option value="Bengali">Bengali</option>
+                            </select>
+                            <label class="form-label xx-small fw-semibold mb-1">Voice</label>
+                            <select class="form-select form-select-sm mb-2" id="flowTalkingVoiceMode">
+                                <option value="standard" selected>Standard voice (confirmed reliable for Indian languages)</option>
+                                <option value="clone">Clone a voice from a reference clip <span class="text-muted">(this app's own cloning — confirmed reliable for Indian languages; not HeyGen's website cloning, which the API here doesn't expose)</span></option>
+                                <option value="heygen-native">Use one of HeyGen's own preset voices <span class="text-muted">(fixed voice list, not a clone — HeyGen's own docs claim broad language support, not independently verified in this app)</span></option>
+                            </select>
+                            <select class="form-select form-select-sm mb-2" id="flowTalkingStandardVoiceSelect"></select>
+                            <div id="flowTalkingCloneSection" class="d-none">
+                                <label class="btn btn-sm btn-outline-secondary w-100 mb-1" for="flowTalkingCloneUpload">🎤 Upload a reference clip to clone</label>
+                                <input type="file" accept="audio/*" id="flowTalkingCloneUpload" class="d-none">
+                                <p class="xx-small text-muted mb-2" id="flowTalkingCloneStatus"></p>
+                            </div>
+                            <div id="flowTalkingHeygenVoiceSection" class="d-none">
+                                <input type="text" class="form-control form-control-sm mb-2" id="flowTalkingHeygenVoiceName" placeholder="HeyGen voice name (e.g. Ivy) — leave blank for default">
+                            </div>
+                        </div>
+
+                        <label class="form-label xx-small fw-semibold mb-1">Model</label>
+                        <select class="form-select form-select-sm mb-2" id="flowTalkingModelSelect"></select>
+
+                        <div id="flowTalkingBackgroundSection" class="d-none">
+                            <label class="form-label xx-small fw-semibold mb-1">Background <span class="text-muted fw-normal">(real HeyGen capability — solid color, an image, or a video)</span></label>
+                            <select class="form-select form-select-sm mb-1" id="flowTalkingBackgroundType">
+                                <option value="color" selected>Solid color</option>
+                                <option value="image">Image</option>
+                                <option value="video">Video</option>
+                            </select>
+                            <input type="color" class="form-control form-control-sm form-control-color mb-2" id="flowTalkingBackgroundColor" value="#ffffff">
+                            <input type="text" class="form-control form-control-sm mb-2 d-none" id="flowTalkingBackgroundUrl" placeholder="Image or video URL">
+                        </div>
+
+                        <button type="button" class="btn btn-primary w-100 fw-bold" id="flowTalkingGenerateBtn">🎬 Generate Talking Video</button>
+                    </div>
+
+                    <div class="mt-3" id="flowStudioResult"></div>
+                    <div class="mt-3 d-none" id="flowAudioSection">
+                        <hr>
+                        <h6 class="fw-bold">🎵 Add Audio</h6>
+                        <p class="xx-small text-muted">Applies whatever narration/BGM you set up above onto the video generated above.</p>
+                        <button type="button" class="btn btn-outline-dark w-100 fw-bold" id="flowAddAudioBtn">🎵 Add Audio to Video</button>
+                    </div>
+                    <div class="mt-3 d-none" id="flowEditSection">
+                        <hr>
+                        <label class="form-label small fw-semibold mb-1">Not quite right? Describe a change and regenerate</label>
+                        <textarea class="form-control form-control-sm mb-2" id="flowEditInstruction" rows="2" placeholder="e.g. slower camera movement, warmer lighting, different framing"></textarea>
+                        <button type="button" class="btn btn-outline-dark w-100" id="flowEditBtn">✏️ Regenerate With This Change</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="modal fade" id="modelGuideModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title fw-bold" id="modelGuideTitle">Model Guide</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <div id="modelGuideBody">
+                        <div class="text-muted small">Loading...</div>
+                    </div>
+                </div>
+                <div class="modal-footer bg-light">
+                    <button type="button" class="btn btn-secondary text-sm" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="offcanvas offcanvas-end" tabindex="-1" id="trustSummaryOffcanvas" style="width: 440px;">
+        <div class="offcanvas-header bg-dark text-white">
+            <h5 class="offcanvas-title fw-bold">🧠 Model Trust</h5>
+            <button type="button" class="btn-close btn-close-white" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+        </div>
+        <div class="offcanvas-body d-flex flex-column p-0">
+            <div class="p-2 border-bottom bg-light">
+                <small class="text-muted">Real track record, not a guess — what the app has actually learned from vision-checking outputs and from real generation failures. This is the literal data driving model filtering and verification sampling elsewhere in the app.</small>
+            </div>
+            <div id="trustSummaryList" class="flex-grow-1 overflow-auto p-2" style="font-size: 0.82rem;">
+                <div class="text-muted small p-2">Loading...</div>
+            </div>
+        </div>
+    </div>
+    <div class="offcanvas offcanvas-end" tabindex="-1" id="activityLogOffcanvas" style="width: 420px;">
+        <div class="offcanvas-header bg-dark text-white">
+            <h5 class="offcanvas-title fw-bold">📋 Activity Log</h5>
+            <button type="button" class="btn-close btn-close-white" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+        </div>
+        <div class="offcanvas-body d-flex flex-column p-0">
+            <div class="p-2 border-bottom bg-light d-flex justify-content-between align-items-center">
+                <small class="text-muted">Every step, warning, and error from this session — nothing here auto-clears.</small>
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="clearActivityLogBtn">Clear</button>
+            </div>
+            <div id="activityLogList" class="flex-grow-1 overflow-auto p-2" style="font-size: 0.8rem;"></div>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    <script type="module" src="/public/js/transformers.js"></script>
+    <script type="module" src="/public/js/app.js"></script>
+</body>
+</html>
