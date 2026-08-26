@@ -5618,6 +5618,49 @@ app.post("/api/music/generate", async (req, res) => {
   }
 });
 
+// ============================================================
+// SFX PROMPT REFINEMENT — the real model here (CassetteAI) takes one
+// flat text prompt for one continuous clip, up to 30 seconds, no
+// separate intro/outro fields, no vocals, no music structure. Most
+// people describing a sound don't think in those terms ("Netflix-like",
+// "upbeat excitement and curiosity") — this translates a casual brief
+// into a specific, professional sound-design prompt the model will
+// actually respond well to, structured as ONE cohesive sound that
+// naturally opens, builds, and resolves (a real sonic-logo brief, not a
+// promise of separate generated segments this model can't produce).
+// Asks clarifying questions only when something essential is genuinely
+// missing, not as a default step.
+// ============================================================
+app.post("/api/sfx/refine-prompt", async (req, res) => {
+  try {
+    const { description, previousQuestions, answers, userApiKey } = req.body;
+    const apiKey = userApiKey || process.env.FAL_KEY;
+    if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
+    if (!description?.trim()) return res.status(400).json({ error: "Describe the sound you want first." });
+    const context = previousQuestions?.length && answers?.length
+      ? `\n\nFOLLOW-UP: they were asked "${previousQuestions.join('" and "')}" and answered: "${answers.join('", "')}"`
+      : "";
+    const prompt = `You are a professional sound designer helping someone brief an AI sound-effect generator. They likely don't know audio production terminology — your job is to translate their casual description into precise sound-design language, not to expect them to already speak it.
+
+THEIR DESCRIPTION: "${description.trim()}"${context}
+
+REAL CONSTRAINT on the actual generator this goes to: it produces ONE continuous sound clip, up to 30 seconds, from a single text prompt — no separate intro/outro generation steps, no vocals, no musical composition. If they want something with a beginning and an end (like "intro and outro"), write ONE prompt describing a sound that naturally opens (a rise/swell/build), has a clear core moment, and resolves (a tail/decay/settle) — a real sonic-logo brief, the way a professional would actually write one, not a promise of multiple separate pieces.
+
+Decide: is there enough here to write a strong, specific prompt, or is something ESSENTIAL missing (no sense of mood/energy/instrumentation/context at all)? Their example above already has real usable detail (brand context, tone, structural want, a style reference) — don't ask questions just because it's casually phrased; only ask if something truly essential is absent.
+
+If essential information is missing, return: {"needsClarification": true, "questions": ["...", "..."]} — at most 2 short, specific questions.
+Otherwise return: {"needsClarification": false, "refinedPrompt": "a specific, professional, ready-to-use sound-design prompt, one continuous description", "explanation": "one short sentence on what you translated or added and why"}
+
+Return ONLY this JSON, no markdown fences.`;
+    const response = await falTextRequest(prompt, { apiKey, temperature: 0.7, costMeta: { endpoint: "sfx-prompt-refine" } });
+    const parsed = JSON.parse(response.text.replace(/```json|```/g, "").trim());
+    res.json(parsed);
+  } catch (error) {
+    console.error("SFX prompt refinement error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post("/api/sfx/generate", async (req, res) => {
   let runId;
   try {

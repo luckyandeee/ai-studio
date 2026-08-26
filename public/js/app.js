@@ -1,4 +1,10 @@
 let state = {
+  // Real timestamp when this page/session actually started — used to
+  // filter the Audio Library to "generated this session" without
+  // needing every generator to share one consistent runId (SFX
+  // deliberately mints a fresh one per generation for cost-tracking
+  // granularity, unlike Voice/Song Studio's one-per-session pattern).
+  appSessionStartedAt: Date.now(),
   rawIsolatedProductBase64: null,
   isolatedProductBase64: null,
   originalProductImage: null,
@@ -2139,6 +2145,56 @@ document.getElementById("songDurationSlider")?.addEventListener("input", (e) => 
 document.getElementById("sfxDurationSlider")?.addEventListener("input", (e) => {
   document.getElementById("sfxDurationValue").textContent = `${e.target.value}s`;
 });
+let sfxLastQuestions = null;
+async function runSfxRefine(answers = null) {
+  const description = document.getElementById("sfxPrompt")?.value?.trim();
+  if (!description) return alert("Describe the sound you want first — plain words are fine.");
+  const btn = document.getElementById("sfxRefineBtn");
+  const questionsEl = document.getElementById("sfxRefineQuestions");
+  const explanationEl = document.getElementById("sfxRefineExplanation");
+  btn.disabled = true;
+  btn.textContent = "Thinking...";
+  try {
+    const { res, data } = await fetchJson("/api/sfx/refine-prompt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ description, previousQuestions: sfxLastQuestions, answers, userApiKey: getUserKey() }),
+    });
+    if (!res.ok) throw new Error(data.error || "Couldn't refine that.");
+    if (data.needsClarification) {
+      sfxLastQuestions = data.questions;
+      questionsEl.classList.remove("d-none");
+      explanationEl.classList.add("d-none");
+      questionsEl.innerHTML = `
+        <div class="border rounded p-2 bg-light">
+          <p class="xx-small text-muted mb-2">A couple quick things so this comes out right:</p>
+          ${data.questions.map((q, i) => `<label class="xx-small fw-semibold mb-1 d-block">${escapeHtml(q)}</label><input type="text" class="form-control form-control-sm mb-2" data-sfx-answer-index="${i}">`).join("")}
+          <button type="button" class="btn btn-sm btn-primary w-100" id="sfxAnswerSubmitBtn">Continue</button>
+        </div>`;
+      document.getElementById("sfxAnswerSubmitBtn")?.addEventListener("click", () => {
+        const answerInputs = questionsEl.querySelectorAll("[data-sfx-answer-index]");
+        const collectedAnswers = [...answerInputs].map((el) => el.value.trim());
+        runSfxRefine(collectedAnswers);
+      });
+    } else {
+      sfxLastQuestions = null;
+      questionsEl.classList.add("d-none");
+      document.getElementById("sfxPrompt").value = data.refinedPrompt;
+      if (data.explanation) {
+        explanationEl.textContent = `✨ ${data.explanation}`;
+        explanationEl.classList.remove("d-none");
+      }
+      logActivity("success", "Refined your sound description into a professional prompt.");
+    }
+  } catch (err) {
+    alert("Couldn't refine that: " + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "✨ Describe it your way — I'll turn it into a professional sound-design prompt";
+  }
+}
+document.getElementById("sfxRefineBtn")?.addEventListener("click", () => runSfxRefine());
+
 document.getElementById("sfxGenerateBtn")?.addEventListener("click", async () => {
   const prompt = document.getElementById("sfxPrompt")?.value?.trim();
   if (!prompt) return alert("Describe the sound you want first.");
@@ -2160,6 +2216,7 @@ document.getElementById("sfxGenerateBtn")?.addEventListener("click", async () =>
     });
     await refreshCreditsSummary();
     if (!res.ok) throw new Error(data.error || "Generation failed.");
+    saveToAudioLibrary({ type: "sfx", name: `SFX — ${prompt.slice(0, 40)}${prompt.length > 40 ? "..." : ""}`, audioDataUri: data.audio, modelUsed: data.modelUsed, runId, silent: true });
     resultEl.innerHTML = `
       <audio controls class="w-100 mb-2" src="${data.audio}"></audio>
       <a href="${data.audio}" data-download-url="${data.audio}" data-download-filename="sfx-${Date.now()}.wav" class="btn btn-sm btn-dark fw-bold w-100">⬇️ Download</a>
@@ -4540,7 +4597,7 @@ state.songStudioVersions = [];
 // path, not two parallel implementations.
 // ============================================================
 let audioLibraryFilter = "all";
-async function saveToAudioLibrary({ type, name, audioDataUri, modelUsed, voiceUsed, language, runId, metadata }) {
+async function saveToAudioLibrary({ type, name, audioDataUri, modelUsed, voiceUsed, language, runId, metadata, silent = false }) {
   try {
     const { res, data } = await fetchJson("/api/audio-library", {
       method: "POST",
@@ -4548,23 +4605,30 @@ async function saveToAudioLibrary({ type, name, audioDataUri, modelUsed, voiceUs
       body: JSON.stringify({ type, name, audioDataUri, modelUsed, voiceUsed, language, runId, metadata }),
     });
     if (!res.ok) throw new Error(data.error || "Failed to save.");
-    logActivity("success", `Saved "${name}" to your Audio Library.`);
+    if (!silent) logActivity("success", `Saved "${name}" to your Audio Library.`);
     return true;
   } catch (err) {
-    alert("Couldn't save to Audio Library: " + err.message);
+    if (silent) logActivity("warning", `Couldn't auto-save "${name}" to your Audio Library — ${err.message}`);
+    else alert("Couldn't save to Audio Library: " + err.message);
     return false;
   }
 }
 async function loadAudioLibrary() {
   const listEl = document.getElementById("audioLibraryList");
   if (!listEl) return;
+  const sessionOnly = document.getElementById("audioLibrarySessionOnly")?.checked;
   listEl.innerHTML = `<div class="text-muted small">Loading...</div>`;
   try {
     const { res, data } = await fetchJson(`/api/audio-library${audioLibraryFilter !== "all" ? `?type=${audioLibraryFilter}` : ""}`);
     if (!res.ok) throw new Error(data.error || "Failed to load.");
-    const items = data.items || [];
+    let items = data.items || [];
+    if (sessionOnly) {
+      items = items.filter((item) => new Date(item.createdAt.replace(" ", "T") + "Z").getTime() >= state.appSessionStartedAt);
+    }
     if (!items.length) {
-      listEl.innerHTML = `<p class="text-muted small mb-0">Nothing saved yet — use the "💾 Save to Library" button on a generated voice take, song, or sound effect.</p>`;
+      listEl.innerHTML = sessionOnly
+        ? `<p class="text-muted small mb-0">Nothing generated yet this session — everything you make in Voice Studio, Song Studio, or Sound Effects shows up here automatically.</p>`
+        : `<p class="text-muted small mb-0">Nothing here yet — everything you generate in Voice Studio, Song Studio, or Sound Effects is saved here automatically.</p>`;
       return;
     }
     const typeIcon = { voice: "🎙️", song: "🎵", sfx: "🔊" };
@@ -4586,6 +4650,7 @@ async function loadAudioLibrary() {
   }
 }
 document.getElementById("audioLibraryModal")?.addEventListener("show.bs.modal", loadAudioLibrary);
+document.getElementById("audioLibrarySessionOnly")?.addEventListener("change", loadAudioLibrary);
 document.querySelectorAll("[data-audio-library-filter]").forEach((btn) => {
   btn.addEventListener("click", () => {
     document.querySelectorAll("[data-audio-library-filter]").forEach((b) => b.classList.remove("active"));
@@ -4640,13 +4705,18 @@ document.getElementById("songGenerateVariationsBtn")?.addEventListener("click", 
         <div class="d-flex justify-content-between align-items-center">
           <span class="fw-bold small">${escapeHtml(v.label)}</span>
           <div class="d-flex gap-1">
-            ${v.audio ? `<button type="button" class="btn btn-sm btn-outline-success" data-song-variation-action="save" title="Save to Audio Library">💾</button><a href="${v.audio}" data-download-url="${v.audio}" data-download-filename="song-${v.label.replace(/[^a-z0-9]+/gi, "-")}-${Date.now()}.mp3" class="btn btn-sm btn-outline-dark">⬇️</a>` : ""}
+            ${v.audio ? `<a href="${v.audio}" data-download-url="${v.audio}" data-download-filename="song-${v.label.replace(/[^a-z0-9]+/gi, "-")}-${Date.now()}.mp3" class="btn btn-sm btn-outline-dark">⬇️</a>` : ""}
           </div>
         </div>
         ${v.reasoning ? `<div class="xx-small text-muted mb-1">${escapeHtml(v.reasoning)}</div>` : ""}
         ${v.error ? `<div class="xx-small text-danger">Failed: ${escapeHtml(v.error)}</div>` : v.audio ? `<audio controls class="w-100 mt-1" src="${v.audio}"></audio>` : ""}
       </div>`).join("") || `<p class="text-muted small">No results.</p>`;
     state.lastSongVariations = data.results || [];
+    await Promise.all(
+      (data.results || [])
+        .filter((v) => v.audio && !v.error)
+        .map((v) => saveToAudioLibrary({ type: "song", name: `Song — ${v.label}`, audioDataUri: v.audio, modelUsed: v.modelUsed, runId, metadata: { reasoning: v.reasoning, label: v.label }, silent: true })),
+    );
     logActivity("success", `Generated ${data.results?.length || 0} creative direction(s) for your song.`);
   } catch (err) {
     resultEl.innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
@@ -4654,15 +4724,6 @@ document.getElementById("songGenerateVariationsBtn")?.addEventListener("click", 
   } finally {
     btn.disabled = false;
   }
-});
-document.getElementById("songVariationsResult")?.addEventListener("click", (e) => {
-  const itemEl = e.target.closest("[data-song-variation-index]");
-  const action = e.target.closest("[data-song-variation-action]")?.getAttribute("data-song-variation-action");
-  if (!itemEl || action !== "save") return;
-  const v = state.lastSongVariations?.[parseInt(itemEl.getAttribute("data-song-variation-index"))];
-  if (!v?.audio) return;
-  const name = prompt("Name this song version:", v.label);
-  if (name) saveToAudioLibrary({ type: "song", name, audioDataUri: v.audio, modelUsed: v.modelUsed, runId: state.songStudioRunId, metadata: { reasoning: v.reasoning, label: v.label } });
 });
 document.getElementById("songGenerateBtn")?.addEventListener("click", async () => {
   const style = document.getElementById("songStylePrompt")?.value?.trim();
@@ -4690,6 +4751,7 @@ document.getElementById("songGenerateBtn")?.addEventListener("click", async () =
     await refreshCreditsSummary();
     if (!res.ok) throw new Error(data.error || "Song generation failed.");
     state.songStudioVersions.unshift({ audio: data.audio, ts: Date.now() });
+    saveToAudioLibrary({ type: "song", name: `Song — ${style.slice(0, 40)}${style.length > 40 ? "..." : ""}`, audioDataUri: data.audio, modelUsed: data.modelUsed, runId, silent: true });
     resultEl.innerHTML = state.songStudioVersions.map((v, i) => `
       <div class="border rounded p-2 mb-2 ${i === 0 ? "border-primary" : ""}">
         ${i === 0 ? `<div class="xx-small fw-bold text-primary mb-1">Latest</div>` : `<div class="xx-small text-muted mb-1">Earlier version</div>`}
@@ -6080,7 +6142,7 @@ function renderVoiceScriptLine(line, index) {
         <div class="d-flex justify-content-between align-items-center">
           <span class="small fw-semibold">${escapeHtml(v.label)}${line.selectedVariationIndex === i ? " ✅" : ""}</span>
           <div class="d-flex gap-1">
-            ${v.audio ? `<button type="button" class="btn btn-sm btn-outline-primary" data-variation-action="use">Use this take</button><button type="button" class="btn btn-sm btn-outline-success" data-variation-action="save" title="Save to Audio Library">💾</button><button type="button" class="btn btn-sm btn-outline-secondary" data-variation-action="download">⬇️</button>` : ""}
+            ${v.audio ? `<button type="button" class="btn btn-sm btn-outline-primary" data-variation-action="use">Use this take</button><button type="button" class="btn btn-sm btn-outline-secondary" data-variation-action="download">⬇️</button>` : ""}
           </div>
         </div>
         ${v.reasoning ? `<div class="xx-small text-muted">${escapeHtml(v.reasoning)}</div>` : ""}
@@ -6208,6 +6270,18 @@ document.getElementById("voiceScriptLines")?.addEventListener("click", async (e)
       line.cappedReason = data.cappedReason || null;
       line.selectedVariationIndex = line.variations.findIndex((v) => v.audio && !v.error);
       if (line.selectedVariationIndex === -1) line.selectedVariationIndex = null;
+      // Auto-save every successful take to the Audio Library, matching
+      // how the Video Library already auto-persists everything
+      // generated — no manual "save" click required to keep it.
+      await Promise.all(
+        line.variations
+          .filter((v) => v.audio && !v.error)
+          .map((v) => saveToAudioLibrary({
+            type: "voice", name: `Line ${lineIndex + 1} — ${v.label}`, audioDataUri: v.audio,
+            modelUsed: v.modelUsed, voiceUsed: v.voiceId, runId: state.voiceScript.runId,
+            metadata: { emotion: v.emotion, label: v.label }, silent: true,
+          })),
+      );
       await refreshCreditsSummary();
     } catch (err) {
       alert("Couldn't generate takes: " + err.message);
@@ -6225,14 +6299,6 @@ document.getElementById("voiceScriptLines")?.addEventListener("click", async (e)
     if (variationAction === "use") {
       line.selectedVariationIndex = vIndex;
       renderVoiceScript();
-    } else if (variationAction === "save") {
-      const v = line.variations[vIndex];
-      if (v?.audio) {
-        const name = prompt("Name this voice take:", `Line ${lineIndex + 1} — ${v.label}`);
-        if (name) {
-          saveToAudioLibrary({ type: "voice", name, audioDataUri: v.audio, modelUsed: v.modelUsed, voiceUsed: v.voiceId, runId: state.voiceScript.runId, metadata: { emotion: v.emotion, label: v.label } });
-        }
-      }
     } else if (variationAction === "download") {
       const v = line.variations[vIndex];
       if (v?.audio) {

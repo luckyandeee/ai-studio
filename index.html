@@ -775,11 +775,15 @@
                     <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
                 </div>
                 <div class="modal-body p-4">
-                    <div class="d-flex gap-2 mb-3">
+                    <div class="d-flex gap-2 mb-2 flex-wrap">
                         <button type="button" class="btn btn-sm btn-outline-dark active" data-audio-library-filter="all">All</button>
                         <button type="button" class="btn btn-sm btn-outline-dark" data-audio-library-filter="voice">🎙️ Voice</button>
                         <button type="button" class="btn btn-sm btn-outline-dark" data-audio-library-filter="song">🎵 Song</button>
                         <button type="button" class="btn btn-sm btn-outline-dark" data-audio-library-filter="sfx">🔊 SFX</button>
+                    </div>
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" id="audioLibrarySessionOnly">
+                        <label class="form-check-label small" for="audioLibrarySessionOnly">Only show what I generated this session</label>
                     </div>
                     <div id="audioLibraryList" style="max-height: 420px; overflow-y: auto;">
                         <div class="text-muted small">Loading...</div>
@@ -1254,6 +1258,9 @@
                     <hr>
                     <h6 class="fw-bold">🔊 Sound Effects / Sonic Logo <span class="text-muted fw-normal small">(short sound design, not a song — e.g. a "Netflix intro" style sting)</span></h6>
                     <textarea class="form-control form-control-sm mb-2" id="sfxPrompt" rows="2" placeholder="e.g. a short cinematic whoosh into a deep bass hit, like a streaming service intro sting"></textarea>
+                    <button type="button" class="btn btn-sm btn-outline-primary w-100 mb-2" id="sfxRefineBtn">✨ Describe it your way — I'll turn it into a professional sound-design prompt</button>
+                    <div class="d-none mb-2" id="sfxRefineQuestions"></div>
+                    <div class="d-none alert alert-info py-2 px-3 small mb-2" id="sfxRefineExplanation"></div>
                     <div class="d-flex align-items-center gap-2 mb-2">
                         <label class="xx-small text-muted mb-0">Duration:</label>
                         <input type="range" class="form-range" id="sfxDurationSlider" min="1" max="30" value="3" style="flex:1;">

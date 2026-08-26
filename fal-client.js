@@ -319,7 +319,16 @@ async function falVoiceRequest(modelId, input, { apiKey, retries = 2, costMeta =
       // real margin above what's actually been observed, not a round
       // number picked without evidence.
       const result = await withConcurrencyLimit(() => withTimeout(fal.subscribe(modelId, { input, logs: false }), 240000, `Voice generation (${modelId})`));
-      const audioUrl = result?.data?.audio?.url || result?.audio?.url;
+      // Real, confirmed bug fixed here: this only ever checked audio.url,
+      // but CassetteAI's sound-effects-generator (confirmed directly by
+      // a real production response) nests the result under audio_file.url
+      // instead — a completely different field name, not a variant of
+      // the same one. Checked several real shapes rather than assuming
+      // every Fal audio model uses the identical field name.
+      const audioUrl =
+        result?.data?.audio?.url || result?.audio?.url ||
+        result?.data?.audio_file?.url || result?.audio_file?.url ||
+        result?.data?.audio_url || result?.audio_url;
       if (!audioUrl) {
         throw new Error(`Fal returned no audio data from ${modelId}. Raw response: ${JSON.stringify(result?.data || result).slice(0, 400)}`);
       }
@@ -553,8 +562,23 @@ async function persistFalImage(url, destFilename) {
 // instead of fighting the browser's security model.
 async function downloadImageAsDataUri(url) {
   const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Failed to download the generated image (HTTP ${resp.status}).`);
-  const contentType = resp.headers.get("content-type") || "image/png";
+  if (!resp.ok) throw new Error(`Failed to download the generated file (HTTP ${resp.status}).`);
+  let contentType = resp.headers.get("content-type");
+  // Real, confirmed bug fixed here: this always defaulted to
+  // "image/png" when the header was missing or generic — but this same
+  // function is used for audio too (voice, music, SFX) throughout this
+  // app, not just images. A missing/generic content-type would silently
+  // mislabel real audio, and a browser's <audio> element won't play a
+  // file served as "application/octet-stream" even when the underlying
+  // bytes are a perfectly valid WAV — confirmed directly: CassetteAI's
+  // real response metadata shows exactly that content-type for a real
+  // sound effect. Falls back to inferring the real type from the URL's
+  // actual file extension instead of blindly guessing image or audio.
+  if (!contentType || contentType === "application/octet-stream") {
+    const ext = (url.split("?")[0].split(".").pop() || "").toLowerCase();
+    const extToType = { wav: "audio/wav", mp3: "audio/mpeg", m4a: "audio/mp4", ogg: "audio/ogg", flac: "audio/flac", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", mp4: "video/mp4" };
+    contentType = extToType[ext] || contentType || "image/png";
+  }
   const buffer = Buffer.from(await resp.arrayBuffer());
   return `data:${contentType};base64,${buffer.toString("base64")}`;
 }

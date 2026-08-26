@@ -46,6 +46,35 @@ const CURATED_ARRAYS = {
     ...falModels.TALKING_AVATAR_MODELS,
   ],
 };
+// Real, confirmed bug fixed here: "audio" alone is too broad a bucket
+// for replacement-matching — a TTS model, a voice-CLONING model, a
+// MUSIC generator, and an SFX generator are all technically "audio,"
+// but are completely different products that produce completely
+// different, non-interchangeable output. Confirmed directly: without
+// this, a deprecated voice model would get matched to a voice-cloning
+// model, and a deprecated music model would get matched to a plain TTS
+// model — both real, wrong suggestions caught by directly testing this.
+const AUDIO_SUBTYPE_ARRAYS = {
+  voice: falModels.VOICE_MODELS,
+  voiceClone: falModels.VOICE_CLONE_MODELS,
+  music: falModels.MUSIC_MODELS,
+  sfx: falModels.SFX_MODELS,
+  talkingAvatar: falModels.TALKING_AVATAR_MODELS,
+};
+function getAudioSubType(modelId, category = "") {
+  for (const [subType, arr] of Object.entries(AUDIO_SUBTYPE_ARRAYS)) {
+    if (arr.some((m) => m.id === modelId)) return subType;
+  }
+  // Discovered (non-curated) model — infer from Fal's own real category
+  // string rather than guessing from the model id/label.
+  const cat = category.toLowerCase();
+  if (/speech-to-speech|voice-clon/.test(cat)) return "voiceClone";
+  if (/text-to-music|music/.test(cat)) return "music";
+  if (/sound-effect|sfx/.test(cat)) return "sfx";
+  if (/avatar|talking/.test(cat)) return "talkingAvatar";
+  if (/text-to-speech|text-to-audio/.test(cat)) return "voice";
+  return null; // genuinely unknown — treated as "don't assume compatible" by the caller
+}
 function findCuratedEntry(modelId) {
   for (const arr of Object.values(CURATED_ARRAYS)) {
     const found = arr.find((m) => m.id === modelId);
@@ -276,10 +305,21 @@ const FalAdapter = {
     if (!details) return null;
     const targetCaps = this.getCapabilities(modelId);
     const targetFamily = inferProviderFamily(modelId, details.label);
+    // Real, confirmed fix: "audio" alone is too broad — a target that's
+    // a voice model must only be matched against other voice models,
+    // never a voice-cloning/music/SFX/avatar model just because they're
+    // all technically "audio." Not applied to image/video, which don't
+    // have this same over-broad-bucket problem.
+    const targetSubType = details.mediaType === "audio" ? getAudioSubType(modelId, details.raw?.guideMetadata?.category) : null;
     const candidates = this.discoverModels({ mediaType: details.mediaType })
       .filter((m) => m.id !== modelId)
       .map((m) => ({ ...m, status: this.getStatus(m.id) }))
-      .filter((m) => ["selectable", "supported"].includes(m.status.status));
+      .filter((m) => ["selectable", "supported"].includes(m.status.status))
+      .filter((m) => {
+        if (details.mediaType !== "audio" || !targetSubType) return true; // only enforced when we actually know the target's real sub-type
+        const candDetails = this.getModelDetails(m.id);
+        return getAudioSubType(m.id, candDetails?.raw?.guideMetadata?.category) === targetSubType;
+      });
     if (!candidates.length) return null;
     const scored = candidates.map((c) => {
       const caps = this.getCapabilities(c.id);
