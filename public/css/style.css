@@ -59,4 +59,42 @@
     box-shadow: 0 12px 40px rgba(0,0,0,.2);
     text-align: center;
     min-width: 320px;
+    max-width: 480px;
+}
+
+/* Never actually defined despite being used all over the app (Credits
+   panel, model hints, etc.) — sat between Bootstrap's .small (0.875rem)
+   and nothing, so it silently had zero effect everywhere it was used. */
+.xx-small {
+    font-size: 0.7rem;
+}
+
+/* Advanced Mode — power-user controls (custom model IDs, live model
+   verification, model overrides) are hidden by default and revealed by
+   the "Advanced" toggle in the nav. option elements support display:none
+   in all evergreen browsers, so this also cleanly hides "Custom model
+   ID..." choices from every model dropdown without touching the select's
+   own rendering logic. */
+.advanced-only {
+    display: none;
+}
+body.advanced-mode .advanced-only {
+    display: revert;
+}
+.simple-only {
+    display: revert;
+}
+body.advanced-mode .simple-only {
+    display: none;
+}
+
+.mode-choice-card {
+    cursor: pointer;
+    transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s;
+    border: 1px solid transparent !important;
+}
+.mode-choice-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.12) !important;
+    border-color: #0d6efd !important;
 }

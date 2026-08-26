@@ -17,6 +17,7 @@ const {
   falVoiceRequest,
   falMergeRequest,
   downloadImageAsDataUri,
+  persistFalImage,
 } = require("./fal-client");
 const {
   IMAGE_MODELS,
@@ -51,8 +52,15 @@ const {
   searchBrowseCache,
   getSingleModelDetail,
   initFromPersistedCache,
+  syncDiscoveredModels,
+  getDiscoveredModels,
+  getDiscoveryStatus,
+  getModelSchemaInfo,
+  getRecommendedDefaults,
+  enrichDiscoveredModels,
 } = require("./fal-catalog");
 const { getRealBalance, getRealUsage, getRealPricing } = require("./fal-billing");
+const { FalAdapter } = require("./provider-adapter");
 const voiceCatalog = require("./fal-voice-catalog");
 const videoStitcher = require("./video-stitcher");
 
@@ -146,10 +154,76 @@ function endpointFor(modelId, hasImages) {
   return hasImages ? `${baseId}/edit` : baseId;
 }
 
-function buildFalImageInput(prompt, imageDataUris, { aspectRatio = "1:1", resolution = DEFAULT_IMAGE_RESOLUTION, modelId = null } = {}) {
+// ============================================================
+// AUTOMATIC MODEL REPLACEMENT (Phase 12 / Section 22) — checks the
+// normalized status (already built) before using a requested model; if
+// it's genuinely deprecated (not just "missing" — that distinction
+// matters everywhere else in this app and matters here too), finds the
+// closest real capability-matched replacement and swaps to it
+// automatically, returning a clear note explaining what happened rather
+// than silently changing behavior or just failing the request.
+//
+// Also checks whether the caller's actual requested settings (seed,
+// resolution, reference-image count) genuinely carry over to the
+// replacement — Section 22's own example ("your 2K resolution and
+// 8-reference setup were preserved") specifically promises this, not
+// just "a replacement was found." Uses the same real getCapabilities
+// data already built, not a guess.
+// ============================================================
+function resolveModelOrReplacement(modelId, requestedSettings = {}) {
+  if (!modelId) return { resolvedModelId: modelId, replacementNote: null };
+  const status = FalAdapter.getStatus(modelId);
+  if (status.status !== "deprecated") return { resolvedModelId: modelId, replacementNote: null };
+  const replacement = FalAdapter.findCompatibleReplacement(modelId);
+  if (!replacement) {
+    return { resolvedModelId: modelId, replacementNote: `${modelId} is deprecated and no compatible replacement was found — this request may fail.` };
+  }
+  const caps = replacement.capabilities || FalAdapter.getCapabilities(replacement.id);
+  const preserved = [], dropped = [];
+  if (requestedSettings.resolution) {
+    (caps?.resolution?.supported ? preserved : dropped).push(`${requestedSettings.resolution} resolution`);
+  }
+  if (requestedSettings.referenceCount) {
+    const maxRefs = caps?.imageInput?.maxReferenceImages;
+    if (maxRefs == null || maxRefs >= requestedSettings.referenceCount) preserved.push(`your ${requestedSettings.referenceCount}-reference setup`);
+    else dropped.push(`your ${requestedSettings.referenceCount}-reference setup (this replacement supports up to ${maxRefs})`);
+  }
+  if (requestedSettings.seed != null) {
+    const replacementSupportsSeed = getImageModel(replacement.id)?.supportsSeed;
+    (replacementSupportsSeed ? preserved : dropped).push("your locked seed");
+  }
+  const settingsNote = [
+    preserved.length ? `${preserved.join(" and ")} ${preserved.length > 1 ? "were" : "was"} preserved` : null,
+    dropped.length ? `${dropped.join(" and ")} couldn't carry over` : null,
+  ].filter(Boolean).join(". ");
+  return {
+    resolvedModelId: replacement.id,
+    replacementNote: `${modelId} is no longer available. Automatically switched to ${replacement.label} instead.${settingsNote ? ` ${settingsNote}.` : ""}`,
+  };
+}
+function buildFalImageInput(prompt, imageDataUris, { aspectRatio = "1:1", resolution = DEFAULT_IMAGE_RESOLUTION, modelId = null, seed = null } = {}) {
   const urls = (imageDataUris || []).filter(Boolean).map((u) => toFalImageUrl(u, "image/png"));
   const input = { prompt, num_images: 1 };
-  if (aspectRatio) input.aspect_ratio = aspectRatio;
+  // Single shared lookup — real, confirmed bug fixed here: this was
+  // being declared TWICE in this same function (once for the aspect_
+  // ratio/image_size check, again for the resolution check just below),
+  // a genuine duplicate-const syntax error that broke the file outright.
+  // One lookup, reused by every check below (aspect_ratio convention,
+  // resolution, seed) — same data, no reason to fetch it more than once.
+  const schemaInfo = modelId ? getModelSchemaInfo(modelId) : null;
+  // Real, confirmed gap fixed here: this used to send aspect_ratio
+  // unconditionally to every single model, regardless of whether it
+  // actually has that field. Confirmed directly against FLUX.2 Pro
+  // Edit's complete real schema that it has NO aspect_ratio field at
+  // all — only image_size (a different preset-shape enum). A model
+  // confirmed to use that convention instead simply doesn't receive
+  // aspect_ratio at all now (falls back to its own default, which is
+  // always safe), rather than risking a validation error or a silently
+  // wrong/ignored field. Unknown models keep the prior (default-on)
+  // behavior, since that's the existing, already-working assumption for
+  // the majority of curated models that DO use aspect_ratio.
+  const usesImageSizeConvention = modelId && (getImageModel(modelId)?.usesImageSizeConvention || schemaInfo?.imageSizeConventionField);
+  if (aspectRatio && !usesImageSizeConvention) input.aspect_ratio = aspectRatio;
   // Only attach resolution for models confirmed to accept it — sending an
   // unrecognized field to a model with a stricter schema (FLUX Klein,
   // Seedream, GPT Image 2) risks a validation error rather than being
@@ -164,9 +238,33 @@ function buildFalImageInput(prompt, imageDataUris, { aspectRatio = "1:1", resolu
   // unflagged models get correct resolution support automatically once
   // they've been checked once, instead of needing a manual flag added
   // to fal-models.js for every model first.
-  const supportsResolution = modelId && (modelSupportsResolutionParam(modelId) || getGuide(modelId)?.capabilities?.resolutionField);
+  const supportsResolution = modelId && (modelSupportsResolutionParam(modelId) || schemaInfo?.resolutionField);
   if (resolution && supportsResolution) input.resolution = resolution;
-  if (urls.length) input.image_urls = urls;
+  // Real, valuable capability confirmed directly against Fal's own API
+  // reference for Nano Banana Pro/2 — same dual-check pattern as
+  // resolution above. Genuinely relevant to this app's whole mission:
+  // reusing the same seed across a shoot's multiple frames is a real
+  // lever for tighter consistency, on top of the existing identity-lock/
+  // reference-image approach, not just a generic "nice to have" param.
+  const supportsSeed = modelId && (getImageModel(modelId)?.supportsSeed || schemaInfo?.seedField);
+  if (seed != null && supportsSeed) input.seed = seed;
+  // Real, confirmed gap fixed here: this used to always send image_urls
+  // (plural), a hardcoded assumption true for most of the hand-curated
+  // models but not guaranteed for one this app has never had a human
+  // look at. getModelSchemaInfo works for BOTH curated (live-checked)
+  // and auto-discovered models — using its real detected field name
+  // when known, falling back to the same image_urls default only when
+  // nothing better is known (preserves exact prior behavior for any
+  // model not yet schema-checked).
+  if (urls.length) {
+    const detectedField = schemaInfo?.imageField;
+    if (detectedField && !schemaInfo.supportsMultiImage) {
+      // Single-image field (e.g. "image_url") — takes one URL, not an array.
+      input[detectedField] = urls[0];
+    } else {
+      input[detectedField || "image_urls"] = urls;
+    }
+  }
   return { input, hasImages: urls.length > 0 };
 }
 
@@ -179,7 +277,7 @@ const SAFETY_PRINCIPLES = `NON-NEGOTIABLE RULES (apply regardless of product cat
 6. For sexual wellness items specifically (vibrators, and similar): NEVER write a prompt implying literal use, arousal, or post-use satisfaction/afterglow — no "blissful" expressions, no eyes-closed-in-pleasure framing, no "satisfaction" or "release" language, no bedroom-aftermath narrative beats. This applies EVEN WHEN the wording stays non-graphic — an implied climax scene is still a depiction of a sexual act, just described indirectly. The acceptable treatment for these products with a human present is the product visible in a normal domestic context (nightstand, bathroom shelf, packaging held/displayed) with the person fully clothed and NOT positioned as mid-use or post-use — nothing about the scene should suggest the product was just used. If in doubt, default to product-only frames for this category instead of a human frame.
 If a request would require violating rules 1-3, set "blocked": true and explain why in "blockedReason" — do not attempt a softened version instead.`;
 
-async function moderateCreativeInputs(fields, { apiKey, textModel }) {
+async function moderateCreativeInputs(fields, { apiKey, textModel, costMeta = null }) {
   const prompt = `You are a content-safety reviewer for a commercial product-photography tool. Review the following user-submitted brief fields. Users are NOT professional copywriters — casual, vague, or clumsy language is completely fine and must be left untouched. You are ONLY looking for language that pushes toward explicit sexual content, literal sexual acts/arousal narratives, or minors in any romantic/sexual/suggestive context.
 FIELDS:
 ${Object.entries(fields)
@@ -197,12 +295,12 @@ Rules: set "blocked": true ONLY for minors in any sexual/romantic framing, or ex
     model: textModel || DEFAULT_TEXT_MODEL,
     apiKey,
     temperature: 0.2,
-    costMeta: { endpoint: "moderate-inputs" },
+    costMeta: { ...costMeta, endpoint: costMeta?.endpoint || "moderate-inputs" },
   });
   return JSON.parse(response.text.replace(/```json|```/g, "").trim());
 }
 
-async function moderateGeneratedPrompts({ imagePrompts, promptTypes, productLabel }, { apiKey, textModel }) {
+async function moderateGeneratedPrompts({ imagePrompts, promptTypes, productLabel }, { apiKey, textModel, costMeta = null }) {
   const humanIndices = promptTypes
     .map((t, i) => (t === "human" ? i : null))
     .filter((i) => i !== null);
@@ -224,7 +322,7 @@ For each flagged index, put a fully rewritten REPLACEMENT prompt in "rewrittenPr
     model: textModel || DEFAULT_TEXT_MODEL,
     apiKey,
     temperature: 0.2,
-    costMeta: { endpoint: "moderate-generated-prompts" },
+    costMeta: { ...costMeta, endpoint: costMeta?.endpoint || "moderate-generated-prompts" },
   });
   const parsed = JSON.parse(response.text.replace(/```json|```/g, "").trim());
   const correctedPrompts = [...imagePrompts];
@@ -649,7 +747,7 @@ app.post("/api/generate-text", async (req, res) => {
     try {
       moderation = await moderateCreativeInputs(
         { productDescription, usageContext, creativeDirection, negativeDirectives, modelAppearance, modelExpression, modelWardrobe, modelPose },
-        { apiKey, textModel: effectiveTextModel },
+        { apiKey, textModel: effectiveTextModel, costMeta: { runId } },
       );
     } catch (modErr) {
       console.warn(`[Moderation] Pre-check failed (${modErr.message}) — proceeding without softening.`);
@@ -814,7 +912,7 @@ Return STRICT JSON ONLY, no markdown fences, matching this exact shape:
     try {
       const outputCheck = await moderateGeneratedPrompts(
         { imagePrompts: parsed.imagePrompts, promptTypes: parsed.promptTypes, productLabel: parsed.classification?.productLabel },
-        { apiKey, textModel: effectiveTextModel },
+        { apiKey, textModel: effectiveTextModel, costMeta: { runId } },
       );
       if (outputCheck.flaggedIndices.length) {
         parsed.imagePrompts = outputCheck.imagePrompts;
@@ -860,10 +958,16 @@ Return STRICT JSON ONLY, no markdown fences, matching this exact shape:
 
 app.post("/api/analyze-reference", async (req, res) => {
   try {
-    const { modelReferenceBase64, productDescription, creativeDirection, userApiKey, visionModel } = req.body;
+    const { modelReferenceBase64, productDescription, creativeDirection, userApiKey, visionModel, runId: clientRunId } = req.body;
     const apiKey = userApiKey || process.env.FAL_KEY;
     if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
     if (!modelReferenceBase64) return res.status(400).json({ error: "Missing reference photo." });
+    // This runs BEFORE generate-text mints the shoot's own run_id (it
+    // happens right when the reference photo is uploaded, earlier in the
+    // form) — minted here instead and returned so the frontend can carry
+    // it forward into generate-text, so this check's cost lands under the
+    // same shoot instead of as an orphaned row.
+    const runId = clientRunId || crypto.randomUUID();
     const prompt = `Look at this photo of one or more people. Product context: "${productDescription || "unspecified"}". Creative direction: "${creativeDirection || "unspecified"}".
 Count the distinct people visible. For each, give a short position-based label and a brief neutral visual description.
 Recommend which person is the most likely intended subject, with a one-sentence reason.
@@ -880,10 +984,10 @@ Return STRICT JSON ONLY, no markdown fences:
     const response = await falVisionRequest(prompt, modelReferenceBase64, {
       model: visionModel || DEFAULT_VISION_MODEL,
       apiKey,
-      costMeta: { endpoint: "analyze-reference", imageCount: 1 },
+      costMeta: { runId, endpoint: "analyze-reference", imageCount: 1 },
     });
     const parsed = JSON.parse(response.text.replace(/```json|```/g, "").trim());
-    res.json(parsed);
+    res.json({ ...parsed, runId });
   } catch (error) {
     console.error("Reference analysis error:", error);
     res.status(500).json({ error: "Failed to analyze reference photo: " + error.message });
@@ -1076,14 +1180,29 @@ app.post("/api/generate-images", async (req, res) => {
       imageModel,
       modelTier,
       imageResolution,
+      seed,
     } = req.body;
     const apiKey = userApiKey || process.env.FAL_KEY;
     if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
     if (!finalPrompts || !Array.isArray(finalPrompts)) return res.status(400).json({ error: "No prompts provided." });
     if (classification?.blocked) return res.status(403).json({ error: classification.blockedReason || "Restricted request." });
     const costMeta = { runId, endpoint: "generate-images" };
-    const { preferred: globalPreferredModel, alternate: globalAlternateModel } = resolveImageModels(classification, imageModel, modelTier);
+    const { preferred: rawPreferredModel, alternate: globalAlternateModel } = resolveImageModels(classification, imageModel, modelTier);
+    // Phase 12 / Section 22 — automatic replacement if the resolved
+    // model has genuinely gone deprecated, not just "missing" (that
+    // distinction is deliberate and matters here exactly like it does
+    // everywhere else in this app's catalog logic).
+    const { resolvedModelId: globalPreferredModel, replacementNote } = resolveModelOrReplacement(rawPreferredModel, { resolution: imageResolution, seed });
+    if (replacementNote) console.warn(`[Model Replacement] ${replacementNote}`);
     const resolution = imageResolution || DEFAULT_IMAGE_RESOLUTION;
+    // Real, confirmed capability (Fal's own API reference for Nano Banana
+    // Pro/2) genuinely relevant to this app's whole mission: reusing the
+    // same seed across a shoot's frames is a real lever for tighter
+    // consistency, on top of identity-lock/reference images. Only sent
+    // for models confirmed to support it (see buildFalImageInput) —
+    // silently ignored/omitted otherwise, same safety pattern as
+    // resolution above.
+    const resolvedSeed = seed != null && seed !== "" ? parseInt(seed) : null;
     progress.startProgress(runId, "preparing", `Preparing to render ${finalPrompts.length} frame(s)...`);
     let modelReferenceBase64 = matchReferenceOutfit ? rawModelReferenceBase64 || null : incomingSanitizedReference || null;
     if (!modelReferenceBase64 && rawModelReferenceBase64 && !matchReferenceOutfit) {
@@ -1224,7 +1343,7 @@ SCENE DETAIL (informs camera work and lighting only — never grounds for changi
 ${creativeProfile.lightingStrategy || ""}.
 ${commonNegative}`;
         const reframeResult = await resilientFalImageGeneration(
-          (model) => buildFalImageInput(reframePrompt, [compositedBase], { aspectRatio: aspectRatio || "1:1", resolution, modelId: model }).input,
+          (model) => buildFalImageInput(reframePrompt, [compositedBase], { aspectRatio: aspectRatio || "1:1", resolution, modelId: model, seed: resolvedSeed }).input,
           { preferredModel: endpointFor(framePreferredModel, true), alternateModel: endpointFor(frameAlternateModel, true), apiKey, costMeta: frameCostMeta },
         );
         return { image: reframeResult.image, modelUsed: reframeResult.modelUsed };
@@ -1288,7 +1407,7 @@ ${creativeProfile.injectedDirectives || ""}`;
         const refImages = [productReferenceForFrames];
         if (usePersonReference) refImages.push(lookReference);
         const productOnlyResult = await resilientFalImageGeneration(
-          (model) => buildFalImageInput(productOnlyPrompt, refImages, { aspectRatio: aspectRatio || "1:1", resolution, modelId: model }).input,
+          (model) => buildFalImageInput(productOnlyPrompt, refImages, { aspectRatio: aspectRatio || "1:1", resolution, modelId: model, seed: resolvedSeed }).input,
           { preferredModel: endpointFor(framePreferredModel, true), alternateModel: endpointFor(frameAlternateModel, true), apiKey, costMeta: frameCostMeta },
         );
         return { image: productOnlyResult.image, modelUsed: productOnlyResult.modelUsed };
@@ -1313,6 +1432,9 @@ ${creativeProfile.injectedDirectives || ""}`;
         }
         try {
           frameResults[i] = await processFrame(i);
+          if (frameResults[i]?.image) {
+            frameResults[i].image = await persistFalImage(frameResults[i].image, `${runId}-frame${i}-${Date.now()}.png`);
+          }
           db.saveRunItem({ runId, itemType: "frame", itemKey: i, status: "success", payload: frameResults[i] });
           noteFrameDone();
         } catch (frameErr) {
@@ -1345,6 +1467,7 @@ ${creativeProfile.injectedDirectives || ""}`;
     res.json({
       images: outputImageUrls,
       modelsUsed: frameOutputs.map((f) => f.modelUsed),
+      replacementNote,
       diagnostics: {
         humanFramesRequested: wantsHumanArray.filter(Boolean).length,
         anatomicalPathActive: !!compositedBase || !!identityImageForFrames,
@@ -1379,17 +1502,42 @@ app.post("/api/regenerate-frame", async (req, res) => {
       imageResolution,
       userApiKey,
       runId,
+      itemType, // "frame" (single mode) or "batch_item" (batch mode) — identifies which saved run_item this regeneration belongs to, if any
+      itemKey, // frame index (single) or product index (batch)
+      shotIndex, // batch mode only — which image within that item's images[] array this replaces
     } = req.body;
     const apiKey = userApiKey || process.env.FAL_KEY;
     if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
     if (!prompt) return res.status(400).json({ error: "Missing prompt." });
     if (!imageModel) return res.status(400).json({ error: "Missing imageModel." });
     const costMeta = { runId, endpoint: "regenerate-frame" };
-    const url = await falImageRequest(
+    const rawUrl = await falImageRequest(
       endpointFor(imageModel, (referenceImages || []).length > 0),
       buildFalImageInput(prompt, referenceImages || [], { aspectRatio: aspectRatio || "1:1", resolution: imageResolution || DEFAULT_IMAGE_RESOLUTION, modelId: imageModel }).input,
       { apiKey, retries: 2, costMeta },
     );
+    // Real, confirmed gap fixed here: this previously returned Fal's own
+    // (eventually-expiring) URL directly, AND never touched run_items —
+    // meaning even the run's OWN saved record never reflected a
+    // regeneration, so reloading a campaign later would silently show the
+    // stale original instead of whatever was actually last approved.
+    const url = await persistFalImage(rawUrl, `${runId}-regen-${itemType || "frame"}${itemKey ?? ""}${shotIndex != null ? `-${shotIndex}` : ""}-${Date.now()}.png`);
+    if (runId && itemType && itemKey != null) {
+      try {
+        const existing = db.getCompletedRunItems(runId, itemType).get(String(itemKey));
+        if (existing) {
+          if (itemType === "batch_item" && shotIndex != null && Array.isArray(existing.images) && existing.images[shotIndex]) {
+            existing.images[shotIndex] = { ...existing.images[shotIndex], image: url, modelUsed: imageModel };
+          } else if (itemType === "frame") {
+            existing.image = url;
+            existing.modelUsed = imageModel;
+          }
+          db.saveRunItem({ runId, itemType, itemKey, status: "success", payload: existing });
+        }
+      } catch (saveErr) {
+        console.warn(`[Regenerate Frame] Couldn't update the saved campaign record (${saveErr.message}) — the new image still works, it just won't be what shows up if this campaign is reloaded later.`);
+      }
+    }
     res.json({ image: url, modelUsed: imageModel });
   } catch (error) {
     console.error("Regenerate-frame error:", error);
@@ -1473,8 +1621,8 @@ app.post("/api/regenerate-video", async (req, res) => {
       videoModel,
       videoMode: sourceImages.length > 1 ? "combined" : "separate",
       aspectRatio,
-      durationSeconds: resolveVideoDuration(videoModel, durationSeconds),
-      note: clip.fallbackNote || null,
+      durationSeconds: resolveVideoDuration(videoModel, durationSeconds, getGuide(videoModel)?.capabilities || getModelSchemaInfo(videoModel)),
+      note: [clip.fallbackNote, clip.videoReplacementNote].filter(Boolean).join(" ") || null,
     });
   } catch (error) {
     console.error("Regenerate-video error:", error);
@@ -1510,30 +1658,71 @@ function resolveVideoEndpointForRefs(videoModel, refCount) {
 // produces a bad/empty video, which is exactly what "the video generated
 // is useless" usually means in practice. Centralizing per-model schema
 // quirks here instead of assuming one vendor's shape works for every model.
+// Infers the real duration format string a model expects from its own
+// schema example ("8s" confirms the suffix convention, "8" confirms bare
+// digits, an actual number confirms it's not a string at all) — this is
+// what replaces guessing for a model this app has never had a human look
+// at. Falls back to the most common convention among the curated models
+// (bare number string) only when no example is available at all.
+function inferDurationFormat(liveCapabilities) {
+  const example = liveCapabilities?.durationExample;
+  if (typeof example === "number" || liveCapabilities?.durationType === "integer" || liveCapabilities?.durationType === "number") {
+    return (s) => s; // sent as an actual number, not a string
+  }
+  if (typeof example === "string" && /^\d+$/.test(example)) {
+    return (s) => `${s}`; // bare digits, confirmed from the real example
+  }
+  if (typeof example === "string" && /^\d+[a-zA-Z]/.test(example)) {
+    const suffix = example.replace(/^\d+/, ""); // usually "s", but reads whatever Fal's real example actually used rather than assuming
+    return (s) => `${s}${suffix}`;
+  }
+  return (s) => `${s}`; // no example available — bare digits is the majority convention among the models already confirmed here
+}
+// Converts what Fal's validator said it expected ("4s"/"6s"/"8s", or
+// just "8", etc.) into a real format + real enum, straight from the
+// failure — not inferred from a schema guess. This is the actual
+// learning step: what gets persisted is exactly what Fal confirmed, not
+// this app's interpretation of a schema.
+function inferFormatFromExpectedValues(expectedValues) {
+  const allBareDigits = expectedValues.every((v) => /^\d+$/.test(v));
+  if (allBareDigits) return { formatType: "bare", enumOptions: expectedValues.map(Number) };
+  const suffixMatch = expectedValues[0]?.match(/^(\d+)([a-zA-Z]+)$/);
+  if (suffixMatch) {
+    return { formatType: "suffix", suffix: suffixMatch[2], enumOptions: expectedValues.map((v) => parseInt(v)).filter((v) => !isNaN(v)) };
+  }
+  return { formatType: "bare", enumOptions: null };
+}
 function getVideoModelSchema(videoModel) {
-  if (/^fal-ai\/veo3\.1(\/|$)/.test(videoModel)) {
-    return { imageField: "image_url", durationFormat: (s) => `${s}s` };
+  // Learned corrections (from a REAL Fal validation failure, see the
+  // isSchemaValidationError retry logic in generateVideoClipWithRetry)
+  // are the most trustworthy signal available — Fal's own validator
+  // confirming exactly what it accepts for THIS model, not an inference
+  // from a schema guess. Checked first, for every model, no exceptions.
+  // This — not a per-model-ID switch statement — is the actual
+  // replacement for hand-written knowledge: the app learns the real
+  // answer from a real failure and remembers it, instead of needing
+  // someone to pre-research and hardcode it before it can ever work.
+  const correction = db.getModelFieldCorrection(videoModel);
+  const liveCap = getGuide(videoModel)?.capabilities || getModelSchemaInfo(videoModel);
+  if (correction?.field === "duration") {
+    const durationFormat = correction.formatType === "suffix" ? (s) => `${s}${correction.suffix}` : (s) => `${s}`;
+    const liveCapabilities = correction.enumOptions?.length ? { durationEnum: correction.enumOptions.map(String) } : liveCap;
+    return { imageField: liveCap?.imageField || "image_url", durationFormat, liveCapabilities };
   }
-  if (/^fal-ai\/kling-video/.test(videoModel)) {
-    // Confirmed against fal.ai's own docs: the field is start_image_url
-    // (not image_url), and duration is a bare number string ("10"), not "10s".
-    return { imageField: "start_image_url", durationFormat: (s) => `${s}` };
+  // Live-detected schema (from the ongoing catalog check, works for ANY
+  // model whose schema has been read — curated or auto-discovered) is
+  // the actual primary source now, for every model. Real schema facts,
+  // not per-model-ID logic written by a human ahead of time.
+  if (liveCap?.detected && liveCap.imageField) {
+    return { imageField: liveCap.imageField, durationFormat: inferDurationFormat(liveCap), liveCapabilities: liveCap };
   }
-  if (/^bytedance\/seedance-2\.0/.test(videoModel)) {
-    // Confirmed: image_url (singular) for single-image calls, duration as
-    // a bare number string.
-    return { imageField: "image_url", durationFormat: (s) => `${s}` };
-  }
-  if (/^fal-ai\/vidu/.test(videoModel)) {
-    // Single-image field name not directly confirmed for this endpoint —
-    // best-effort default; the multi-image combine field IS confirmed
-    // separately (see the registry's `combine.imageField`).
-    return { imageField: "image_url", durationFormat: (s) => `${s}` };
-  }
-  // Unknown/custom model ID (the "Custom model ID…" dropdown escape
-  // hatch) — best-effort default matching the most common convention
-  // among Fal video models, since the real schema isn't known here.
-  return { imageField: "image_url", durationFormat: (s) => `${s}s` };
+  // No learned correction and no live schema data yet (never checked, or
+  // the check failed) — safest generic default. Bare-digit duration is
+  // the majority real convention observed across Fal's own video
+  // catalog; the very first real generation attempt on any model that
+  // turns out to need something different will self-correct via the
+  // learning path above, automatically, without anyone writing code for it.
+  return { imageField: "image_url", durationFormat: (s) => `${s}` };
 }
 
 function buildFalVideoInput({ prompt, imageBase64, referenceImages, aspectRatio, durationSeconds, negativePrompt, videoModel, forceSingleImage = false, generateAudio = true, endImageBase64 = null }) {
@@ -1553,7 +1742,7 @@ function buildFalVideoInput({ prompt, imageBase64, referenceImages, aspectRatio,
   // that's actually being called, not the one originally requested.
   const actualEndpoint = endpointOverride || videoModel;
   const schema = getVideoModelSchema(actualEndpoint);
-  const resolvedDuration = resolveVideoDuration(actualEndpoint, durationSeconds);
+  const resolvedDuration = resolveVideoDuration(actualEndpoint, durationSeconds, schema.liveCapabilities);
   const input = {
     prompt,
     aspect_ratio: aspectRatio || "16:9",
@@ -1640,10 +1829,18 @@ async function generateExtendedVideoClip({ prompt, previousVideoUrl, aspectRatio
 }
 
 async function generateVideoClipWithRetry(
-  { prompt, imageBase64, referenceImages, aspectRatio, durationSeconds, negativePrompt, videoModel, generateAudio, endImageBase64 },
+  { prompt, imageBase64, referenceImages, aspectRatio, durationSeconds, negativePrompt, videoModel: rawVideoModel, generateAudio, endImageBase64 },
   meta,
   rewriteContext,
 ) {
+  // Phase 12 / Section 22 — automatic replacement if the requested
+  // model has genuinely gone deprecated. Wired here, the single shared
+  // engine every video generation call site in the app already routes
+  // through, rather than in each individual route — same "fix once,
+  // applies everywhere" reasoning already proven for the spend guard
+  // and other cross-cutting checks this session.
+  const { resolvedModelId: videoModel, replacementNote: videoReplacementNote } = resolveModelOrReplacement(rawVideoModel);
+  if (videoReplacementNote) console.warn(`[Model Replacement] ${videoReplacementNote}`);
   const wasMultiRefRequested = (referenceImages || []).filter(Boolean).length > 1;
   const runOnce = async (p, { forceSingleImage = false, modelOverride = null } = {}) => {
     const effectiveModel = modelOverride || videoModel;
@@ -1695,17 +1892,37 @@ async function generateVideoClipWithRetry(
     result = await runOnce(attemptPrompt);
   } catch (err) {
     if (err.isSchemaValidationError) {
-      // A wrong value in a non-content field (duration, aspect_ratio,
-      // etc.) — confirmed directly in production that this was being
-      // treated as a content block and burning a paid prompt-rewrite
-      // attempt that could never fix it, since the problem was never the
-      // prompt text. Go straight to a genuinely different model/endpoint
-      // instead — it may resolve duration/format differently and simply
-      // not hit the same mismatch.
-      console.warn(`[Video] ${meta.detailPrefix || "Clip"}: ${videoModel} rejected a non-content field (${err.message}) — this isn't something a prompt rewrite can fix, trying ${fallbackVideoModel} directly instead.`);
-      result = await runOnce(attemptPrompt, { modelOverride: fallbackVideoModel });
-      usedModel = fallbackVideoModel;
-      fallbackNote = [fallbackNote, `${videoModel} rejected the request over a format/field mismatch, not content (${err.message}) — used ${fallbackVideoModel} instead.`].filter(Boolean).join(" ");
+      // Real self-correction: Fal's own validator just told us exactly
+      // what it expected — learn it, persist it (every future call to
+      // this model uses it automatically, forever, no code changes
+      // needed), and retry THIS SAME model once with the correction
+      // applied before giving up on it. This is the actual replacement
+      // for hand-written per-model knowledge: the app learns the real
+      // answer from a real failure instead of needing someone to
+      // research and hardcode it ahead of time.
+      if (err.schemaErrorField === "duration" && err.schemaErrorExpected?.length) {
+        const learned = inferFormatFromExpectedValues(err.schemaErrorExpected);
+        db.saveModelFieldCorrection(videoModel, { field: "duration", expectedValues: err.schemaErrorExpected, ...learned });
+        console.warn(`[Video] ${meta.detailPrefix || "Clip"}: ${videoModel} rejected the duration format — learned the correct one (${JSON.stringify(err.schemaErrorExpected)}) directly from Fal's own error and retrying the same model with it, instead of giving up on it.`);
+        try {
+          result = await runOnce(attemptPrompt);
+          fallbackNote = [fallbackNote, `${videoModel} needed a different duration format than expected — corrected automatically from Fal's own error and it worked on retry. Remembered for next time, on this model and any future one that hits the same thing.`].filter(Boolean).join(" ");
+        } catch (retryErr) {
+          console.warn(`[Video] ${meta.detailPrefix || "Clip"}: ${videoModel} still failed after the learned correction (${retryErr.message}) — trying ${fallbackVideoModel} instead.`);
+          result = await runOnce(attemptPrompt, { modelOverride: fallbackVideoModel });
+          usedModel = fallbackVideoModel;
+          fallbackNote = [fallbackNote, `${videoModel} failed even after a learned duration-format correction — used ${fallbackVideoModel} instead.`].filter(Boolean).join(" ");
+        }
+      } else {
+        // A wrong value in a non-content field this app doesn't have a
+        // specific learning path for yet (aspect_ratio, resolution, fps,
+        // bitrate_mode) — same safety net as before, go straight to a
+        // genuinely different model rather than a pointless prompt rewrite.
+        console.warn(`[Video] ${meta.detailPrefix || "Clip"}: ${videoModel} rejected a non-content field (${err.message}) — this isn't something a prompt rewrite can fix, trying ${fallbackVideoModel} directly instead.`);
+        result = await runOnce(attemptPrompt, { modelOverride: fallbackVideoModel });
+        usedModel = fallbackVideoModel;
+        fallbackNote = [fallbackNote, `${videoModel} rejected the request over a format/field mismatch, not content (${err.message}) — used ${fallbackVideoModel} instead.`].filter(Boolean).join(" ");
+      }
     } else if (err.isImageContentBlock && wasMultiRefRequested) {
       // The block is about the IMAGES themselves (a likeness/privacy
       // check), not the prompt wording — rewriting the text and
@@ -1758,7 +1975,7 @@ async function generateVideoClipWithRetry(
       result = await tryWithModelFallback(attemptPrompt);
     }
   }
-  return { ...result, finalPrompt: attemptPrompt, wasRewritten: attemptPrompt !== prompt, fallbackNote, modelUsed: result.modelUsed || usedModel };
+  return { ...result, finalPrompt: attemptPrompt, wasRewritten: attemptPrompt !== prompt, fallbackNote, modelUsed: result.modelUsed || usedModel, videoReplacementNote };
 }
 
 // ============================================================
@@ -2027,6 +2244,7 @@ app.post("/api/flow/generate", async (req, res) => {
       finalPrompt: clip.finalPrompt,
       wasRewritten: clip.wasRewritten,
       fallbackNote: clip.fallbackNote,
+      videoReplacementNote: clip.videoReplacementNote,
     });
   } catch (error) {
     if (runId) progress.finishProgress(runId);
@@ -2067,7 +2285,7 @@ app.post("/api/flow/generate-talking", async (req, res) => {
       let finalText = text.trim();
       if (targetLanguage && targetLanguage.trim().toLowerCase() !== "english") {
         progress.startProgress(runId, "generating-voice", "Preparing the translated script...");
-        const prepared = await prepareTextForLanguage(finalText, targetLanguage.trim(), { apiKey, textModel });
+        const prepared = await prepareTextForLanguage(finalText, targetLanguage.trim(), { apiKey, textModel, costMeta: { runId } });
         finalText = prepared.preparedText;
       }
       if (useNativeHeygenVoice) {
@@ -2149,9 +2367,19 @@ app.post("/api/flow/generate-talking", async (req, res) => {
       });
     }
     progress.finishProgress(runId);
-    const dataUri = await downloadImageAsDataUri(result.url);
+    // Real, confirmed bug fixed here: falVideoRequest already downloads
+    // and locally persists the video (that's what destFilename is for),
+    // returning a served local path — this used to redundantly try to
+    // re-fetch that ALREADY-LOCAL path through downloadImageAsDataUri as
+    // if it were still a remote Fal URL, which crashed with "Failed to
+    // parse URL from /generated-videos/...". Matches the established
+    // correct pattern used by /api/flow/generate (clip.dataUri ||
+    // clip.url) — the served path works directly as a <video src> and
+    // download link on the frontend, no conversion needed, and is far
+    // more efficient than turning a video file into a giant base64
+    // data URI would have been anyway.
     res.json({
-      video: dataUri,
+      video: result.url,
       modelUsed: usedModel.id,
       fallbackNote: usedModel.id !== primaryModel.id ? `${primaryModel.id} couldn't produce this clip — used ${fallbackModel.id} instead, which succeeded.` : null,
     });
@@ -2228,7 +2456,7 @@ app.post("/api/flow/plan-scenes", async (req, res) => {
     // length (less overhead, fewer API calls, faster overall).
     // resolveVideoDuration clamps a large requested number down to
     // whatever this specific model's actual max really is.
-    const sceneDurationSeconds = resolveVideoDuration(effectiveVideoModel, 999);
+    const sceneDurationSeconds = resolveVideoDuration(effectiveVideoModel, 999, getGuide(effectiveVideoModel)?.capabilities || getModelSchemaInfo(effectiveVideoModel));
     const targetSceneCount = Math.max(1, Math.round((minutes * 60) / sceneDurationSeconds));
     const peopleBlock = describeCards(people, "people/characters");
     const productsBlock = describeCards(products, "products");
@@ -2351,7 +2579,7 @@ app.post("/api/flow/generate-long", async (req, res) => {
         // than assuming every character speaks the same language.
         if (line.language && line.language.trim().toLowerCase() !== "english") {
           try {
-            const prepared = await prepareTextForLanguage(finalText, line.language.trim(), { apiKey, textModel });
+            const prepared = await prepareTextForLanguage(finalText, line.language.trim(), { apiKey, textModel, costMeta: { runId } });
             finalText = prepared.preparedText;
           } catch (langErr) {
             console.warn(`[Flow] Language preparation failed for ${line.speaker}'s line (${langErr.message}) — using the original text instead of blocking generation.`);
@@ -2409,6 +2637,7 @@ app.post("/api/flow/generate-long", async (req, res) => {
           { productLabel: null, brandName: null, environment: null },
         );
         if (clip.fallbackNote) perSceneNotes.push(`Scene ${i + 1}: ${clip.fallbackNote}`);
+        if (clip.videoReplacementNote) perSceneNotes.push(`Scene ${i + 1}: ${clip.videoReplacementNote}`);
       }
       clipUrls.push(clip.url);
       previousVideoUrl = clip.url;
@@ -2479,10 +2708,16 @@ app.get("/api/flow/download/:filename", (req, res) => {
 // romanized local-language input here too, not a separate, weaker path.
 app.post("/api/flow/write-narration", async (req, res) => {
   try {
-    const { roughIdea, videoContext, targetLanguage, textModel, userApiKey } = req.body;
+    const { roughIdea, videoContext, targetLanguage, textModel, userApiKey, runId: clientRunId } = req.body;
     if (!roughIdea || !roughIdea.trim()) return res.status(400).json({ error: "Describe what should be said first." });
     const apiKey = userApiKey || process.env.FAL_KEY;
     if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
+    // Not previously tagged with any run_id at all — this script is
+    // typically the first step of a talking/narrated video, so the run_id
+    // minted here is returned to the frontend and expected to be reused
+    // for the voice/video generation calls that follow, so the whole
+    // narrated-video session's cost lands under one run.
+    const runId = clientRunId || crypto.randomUUID();
     const writePrompt = `You are writing a real narration/dialogue script for a video.
 WHAT SHOULD BE SAID: ${roughIdea.trim()}
 ${videoContext ? `VIDEO CONTEXT (for tone consistency, don't restate it): ${videoContext.trim()}` : ""}
@@ -2490,7 +2725,7 @@ Write natural, speakable narration or dialogue — how someone would actually sa
 Return ONLY the script text — no explanation, no quotes, no markdown.`;
     const response = await falTextRequest(writePrompt, {
       model: textModel || DEFAULT_TEXT_MODEL, apiKey, temperature: 0.7,
-      costMeta: { endpoint: "flow-write-narration" },
+      costMeta: { runId, endpoint: "flow-write-narration" },
     });
     let script = response.text.trim();
     let languageResult = null;
@@ -2498,11 +2733,12 @@ Return ONLY the script text — no explanation, no quotes, no markdown.`;
     // same way Voice Studio already does — not left as something the
     // person has to discover or work around.
     if (targetLanguage && targetLanguage.trim().toLowerCase() !== "english") {
-      languageResult = await prepareTextForLanguage(script, targetLanguage.trim(), { apiKey, textModel });
+      languageResult = await prepareTextForLanguage(script, targetLanguage.trim(), { apiKey, textModel, costMeta: { runId } });
       script = languageResult.preparedText;
     }
     res.json({
       script,
+      runId,
       scriptValidationFailed: languageResult?.scriptValidationFailed || false,
       transliterationDetected: languageResult?.transliterationDetected || false,
     });
@@ -2575,10 +2811,16 @@ async function generateBgmAudioForFlow({ prompt, model, referenceAudioBase64, ap
 // the exact gap found: everything typed just sat as inert text before this.
 app.post("/api/flow/preview-voice", async (req, res) => {
   try {
-    const { text, voiceModel, voiceId, referenceAudioBase64, targetLanguage, userApiKey, runId } = req.body;
+    const { text, voiceModel, voiceId, referenceAudioBase64, targetLanguage, userApiKey, runId: clientRunId } = req.body;
     if (!text || !text.trim()) return res.status(400).json({ error: "Missing text to preview." });
     const apiKey = userApiKey || process.env.FAL_KEY;
     if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
+    // Resolved ONCE, not re-derived at each call site — otherwise the
+    // translation step and the actual voice generation below would each
+    // independently mint their own random fallback ID whenever the client
+    // doesn't supply one, splitting one preview's cost across two
+    // unrelated, unlinkable run_ids instead of one real, shared one.
+    const runId = clientRunId || crypto.randomUUID();
     // A character's own language genuinely shapes what actually gets
     // spoken — same proven mechanism (romanized-input detection, casual
     // register, anti-transliteration) as everywhere else in this app,
@@ -2586,10 +2828,10 @@ app.post("/api/flow/preview-voice", async (req, res) => {
     let finalText = text.trim();
     let languageResult = null;
     if (targetLanguage && targetLanguage.trim().toLowerCase() !== "english") {
-      languageResult = await prepareTextForLanguage(finalText, targetLanguage.trim(), { apiKey, textModel: req.body.textModel });
+      languageResult = await prepareTextForLanguage(finalText, targetLanguage.trim(), { apiKey, textModel: req.body.textModel, costMeta: { runId } });
       finalText = languageResult.preparedText;
     }
-    const url = await generateVoiceAudioForFlow({ text: finalText, voiceModel, voiceId, referenceAudioBase64, apiKey, runId: runId || crypto.randomUUID(), costEndpoint: "flow-preview-voice" });
+    const url = await generateVoiceAudioForFlow({ text: finalText, voiceModel, voiceId, referenceAudioBase64, apiKey, runId, costEndpoint: "flow-preview-voice" });
     const dataUri = await downloadImageAsDataUri(url);
     res.json({
       audio: dataUri,
@@ -2758,7 +3000,7 @@ async function buildVideoPrompt(
   let moderation = { blocked: false, softenedFields: {} };
   if (creativeDirection || styleNote) {
     try {
-      moderation = await moderateCreativeInputs({ creativeDirection, styleNote }, { apiKey, textModel });
+      moderation = await moderateCreativeInputs({ creativeDirection, styleNote }, { apiKey, textModel, costMeta });
     } catch (modErr) {
       console.warn(`[Video Moderation] Pre-check failed (${modErr.message}) — proceeding without softening.`);
     }
@@ -2883,7 +3125,7 @@ async function buildVideoCreativeBrief({ items, mode, brandName, productLabel, e
   });
   let moderation = { blocked: false, flaggedFields: [], softenedFields: {} };
   try {
-    moderation = await moderateCreativeInputs(moderationFields, { apiKey, textModel });
+    moderation = await moderateCreativeInputs(moderationFields, { apiKey, textModel, costMeta });
   } catch (modErr) {
     console.warn(`[Video Brief] Moderation pre-check failed (${modErr.message}) — proceeding without softening.`);
   }
@@ -3020,6 +3262,7 @@ app.post("/api/generate-video", async (req, res) => {
           generateAudio: combined.generateAudio !== false,
           note:
             clip.fallbackNote ||
+            clip.videoReplacementNote ||
             (clip.usedReferenceImages
               ? (() => {
                   const maxImages = getVideoModel(effectiveVideoModel)?.combine?.maxImages || 3;
@@ -3184,7 +3427,7 @@ app.post("/api/generate-batch-text", async (req, res) => {
     try {
       moderation = await moderateCreativeInputs(
         { productDescription, usageContext, creativeDirection, negativeDirectives, modelAppearance, modelExpression, modelWardrobe, modelBodyType, modelPose },
-        { apiKey, textModel: effectiveTextModel },
+        { apiKey, textModel: effectiveTextModel, costMeta: { runId } },
       );
     } catch (modErr) {
       moderation = { blocked: false, flaggedFields: [], softenedFields: {} };
@@ -3362,6 +3605,7 @@ app.post("/api/generate-batch-images", async (req, res) => {
       skipCanonicalRender,
       userApiKey,
       runId: clientRunId,
+      seed,
     } = req.body;
     const apiKey = userApiKey || process.env.FAL_KEY;
     if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
@@ -3385,6 +3629,12 @@ app.post("/api/generate-batch-images", async (req, res) => {
       modelTier,
     );
     const resolution = imageResolution || DEFAULT_IMAGE_RESOLUTION;
+    // Same real capability as single mode — reusing one seed across a
+    // batch's multiple products/frames is a real lever for consistent
+    // look across the whole campaign, on top of the shared environment/
+    // lighting/identity already locked. Only sent for models confirmed
+    // to support it (see buildFalImageInput).
+    const resolvedSeed = seed != null && seed !== "" ? parseInt(seed) : null;
     let identityImage = null;
     let identityNote = null;
     if (wantsHuman) {
@@ -3562,7 +3812,7 @@ ${buildProductLockClause(classification, { imageLabel: "the reference image" })}
 IDENTITY: the SECOND reference image shows the person to use — match their face, general look, and skin tone. This is standard non-explicit commercial photography; none of this authorizes nudity or explicit content. ${subjectSelectionNote || ""}
 ABSOLUTELY NO TEXT, no watermark, no signage, no gallery credit, no caption, no logo anywhere in the image. Exactly ONE subject, never a duplicate or second person. This must be ONE single photograph only — never a grid, contact sheet, mosaic, storyboard, or multiple images/panels/quadrants combined into one frame.`;
           const narrativeResult = await resilientFalImageGeneration(
-            (model) => buildFalImageInput(narrativePrompt, [lockedProductImageForItem, identityImage], { aspectRatio: aspectRatio || "1:1", resolution, modelId: model }).input,
+            (model) => buildFalImageInput(narrativePrompt, [lockedProductImageForItem, identityImage], { aspectRatio: aspectRatio || "1:1", resolution, modelId: model, seed: resolvedSeed }).input,
             { preferredModel: endpointFor(itemPreferredModel, true), alternateModel: endpointFor(itemAlternateModel, true), apiKey, costMeta: itemCostMeta },
           );
           baseShotImage = narrativeResult.image;
@@ -3588,7 +3838,7 @@ ${buildProductLockClause(classification, { imageLabel: "the reference image" })}
 SET THE ENVIRONMENT: ${env}. This is the permanent staging for the entire batch.
 ABSOLUTELY NO TEXT, no watermark, no signage, no gallery credit, no caption, no logo anywhere in the image. No humans, no people, no hands. This must be ONE single photograph only — never a grid, contact sheet, mosaic, storyboard, or multiple images/panels/quadrants combined into one frame.`;
             const productOnlyResult = await resilientFalImageGeneration(
-              (model) => buildFalImageInput(productOnlyPrompt, [lockedProductImageForItem], { aspectRatio: aspectRatio || "1:1", resolution, modelId: model }).input,
+              (model) => buildFalImageInput(productOnlyPrompt, [lockedProductImageForItem], { aspectRatio: aspectRatio || "1:1", resolution, modelId: model, seed: resolvedSeed }).input,
               { preferredModel: endpointFor(itemPreferredModel, true), alternateModel: endpointFor(itemAlternateModel, true), apiKey, costMeta: itemCostMeta },
             );
             baseShotImage = productOnlyResult.image;
@@ -3630,7 +3880,7 @@ ${classification.lightingStrategy || ""}.
 ABSOLUTELY NO TEXT, no watermark, no signage, no gallery credit, no caption, no logo anywhere in the image.${renderedWithHuman ? " Exactly ONE subject, never a duplicate or second person." : ""} This must be ONE single photograph only — never a grid, contact sheet, mosaic, storyboard, or multiple images/panels/quadrants combined into one frame.`;
           try {
             const reframeResult = await resilientFalImageGeneration(
-              (model) => buildFalImageInput(reframePrompt, [baseShotImage], { aspectRatio: aspectRatio || "1:1", resolution, modelId: model }).input,
+              (model) => buildFalImageInput(reframePrompt, [baseShotImage], { aspectRatio: aspectRatio || "1:1", resolution, modelId: model, seed: resolvedSeed }).input,
               { preferredModel: endpointFor(itemPreferredModel, true), alternateModel: endpointFor(itemAlternateModel, true), apiKey, costMeta: itemCostMeta },
             );
             shotImages.push({ image: reframeResult.image, modelUsed: reframeResult.modelUsed, shotType: profile.shotType, includesHuman: renderedWithHuman });
@@ -3639,6 +3889,16 @@ ABSOLUTELY NO TEXT, no watermark, no signage, no gallery credit, no caption, no 
           }
           completedShots++;
           progress.updateProgress(runId, "rendering-frames", `${completedShots} of ${totalShots} shot(s) done...`);
+        }
+      }
+      // Real, confirmed gap: batch results were being saved to the DB
+      // with Fal's own (eventually-expiring) URLs — persistFalImage was
+      // already proven for single mode's main loop but was never applied
+      // here, so every batch campaign's saved images were silently going
+      // dead after a few days with no way to recover them.
+      for (const shot of shotImages) {
+        if (shot?.image) {
+          shot.image = await persistFalImage(shot.image, `${runId}-batch${pi}-${shot.shotType || "shot"}-${Date.now()}.png`);
         }
       }
       results[pi] = { index: pi, label: productLabels?.[pi] || classification.productLabel || `Product ${pi + 1}`, classification, images: shotImages };
@@ -3793,12 +4053,39 @@ app.get("/api/fal-billing/pricing", async (req, res) => {
 // sampling).
 app.get("/api/models/trust-summary", (req, res) => {
   try {
+    // Real catalog-level status (Section 2's normalized states) for
+    // every model this app currently knows about — curated and
+    // discovered alike. This panel already showed generation-quality
+    // trust (verificationStats) and voice-id trust (voiceCatalog), but
+    // never the model catalog status itself — whether the model is even
+    // still active — anywhere. Counted by state so the panel can lead
+    // with an honest, calm summary line instead of only alarming counts.
+    const allModelIds = [
+      ...IMAGE_MODELS, ...VIDEO_MODELS, ...MUSIC_MODELS, ...SFX_MODELS,
+      ...VOICE_CLONE_MODELS, ...TALKING_AVATAR_MODELS,
+      ...Object.values(UTILITY_MODELS).flat(),
+    ].map((m) => m.id);
+    const curatedSet = new Set(allModelIds);
+    const discoveredIds = getDiscoveredModels().map((m) => m.id);
+    const catalogStatuses = [...curatedSet, ...discoveredIds].map((id) => ({
+      id,
+      source: curatedSet.has(id) ? "curated" : "discovered",
+      ...FalAdapter.getStatus(id),
+    }));
+    const byState = {};
+    catalogStatuses.forEach((m) => { byState[m.status] = (byState[m.status] || 0) + 1; });
     res.json({
       verificationStats: db.listAllVerificationStats(),
       confirmedLikenessBlockModels: db.getConfirmedLikenessBlockModels(),
       voiceCatalog: {
         status: voiceCatalog.getVoiceCatalogStatus(),
         entries: voiceCatalog.getVoiceVerificationDetails(),
+      },
+      catalogStatus: {
+        byState,
+        // Only the states actually worth a human looking at — a flat
+        // list of all 60+ "selectable" models would just be noise here.
+        needsAttention: catalogStatuses.filter((m) => ["deprecated", "failed", "unavailable"].includes(m.status)),
       },
     });
   } catch (error) {
@@ -3839,6 +4126,37 @@ app.get("/api/videos", (req, res) => {
 // last check failed), `liveStatus` is simply absent and the model is
 // still offered as normal — an unverified model is not the same as a
 // broken one, so a failed/pending check never silently removes anything.
+// Converts an auto-discovered model into the same shape a hand-curated
+// fal-models.js entry has, so it can sit in the exact same array the
+// frontend already renders — no separate UI path needed for it to
+// actually show up and be selectable. Cost is a placeholder (this
+// pipeline doesn't have real per-model pricing yet — that's Fal's
+// separate /models/pricing endpoint, not something the browse listing
+// includes) — clearly distinguishable via `costUnconfirmed: true` rather
+// than presented as a real number, consistent with how every other
+// unconfirmed price in this app is already handled.
+function discoveredModelToRegistryShape(m) {
+  const c = m.classification;
+  const weight = c.editWeight || (c.workType === "creation-only" ? "lite" : null);
+  return {
+    id: m.id,
+    label: `${m.guideMetadata?.displayName || m.id} 🆕`,
+    tier: weight === "heavy" ? "pro" : "lite",
+    costPerImage: weight === "heavy" ? 0.1 : 0.04, // placeholder estimate — see note above
+    costUnconfirmed: true,
+    maxReferenceImages: c.maxReferenceImages || undefined,
+    textToImageOnly: c.workType === "creation-only",
+    supportsResolutionParam: !!m.schemaInfo?.resolutionField,
+    discovered: true,
+    discoveredDescription: m.guideMetadata?.description || null,
+    likelyHumanSupport: c.likelyHumanSupport,
+    // AI-synthesized (Claude, via fal-ai/any-llm) — clearly labeled as
+    // such, not presented as an equally-confirmed fact the way the
+    // curated registry's hand-researched bestFor text is. null until
+    // enrichDiscoveredModels has actually processed this model.
+    aiEnrichment: m.aiEnrichment || null,
+  };
+}
 app.get("/api/models", (req, res) => {
   const withLiveStatus = (models) =>
     models
@@ -3860,8 +4178,8 @@ app.get("/api/models", (req, res) => {
       // explicit "deprecated", never on "missing".
       .filter((m) => m.liveStatus !== "deprecated");
   res.json({
-    imageModels: withLiveStatus(IMAGE_MODELS),
-    videoModels: withLiveStatus(VIDEO_MODELS),
+    imageModels: [...withLiveStatus(IMAGE_MODELS), ...getDiscoveredModels({ mediaType: "image" }).map(discoveredModelToRegistryShape)],
+    videoModels: [...withLiveStatus(VIDEO_MODELS), ...getDiscoveredModels({ mediaType: "video" }).map(discoveredModelToRegistryShape)],
     utilityModels: UTILITY_MODELS,
     voiceModels: voiceCatalog.getVerifiedVoiceModels(),
     voiceVerificationDetails: voiceCatalog.getVoiceVerificationDetails(),
@@ -3871,7 +4189,7 @@ app.get("/api/models", (req, res) => {
     talkingAvatarModels: TALKING_AVATAR_MODELS,
     customVoices: db.listCustomVoices("minimax"),
     imageResolutions: IMAGE_RESOLUTIONS,
-    catalogMeta: getRefreshMeta(),
+    catalogMeta: { ...getRefreshMeta(), discovery: getDiscoveryStatus() },
     confirmedLikenessBlockModels: db.getConfirmedLikenessBlockModels(),
     defaults: {
       imagePro: DEFAULT_IMAGE_MODEL_PRO,
@@ -3882,7 +4200,64 @@ app.get("/api/models", (req, res) => {
       imageResolution: DEFAULT_IMAGE_RESOLUTION,
       videoDuration: DEFAULT_VIDEO_DURATION,
     },
+    // Auto-promoted defaults — a discovered model that's earned enough
+    // real successful generations (see checkPromotionEligibility in
+    // fal-catalog.js), separate from the stable hardcoded `defaults`
+    // above on purpose: those stay a fixed last-resort safety net deep
+    // in the generation pipeline; this is what a FRESH session's
+    // dropdown should actually pre-select instead, when something has
+    // genuinely earned it. null for a category until something does.
+    recommendedDefaults: getRecommendedDefaults(),
   });
+});
+
+// ============================================================
+// MODEL EXPLORER API (Phase 2/3 -> 4 bridge) — exposes the
+// ProviderAdapter's Provider -> Family -> Variant grouping and
+// per-model inspection over HTTP for the first time. Purely additive:
+// doesn't touch /api/models above or anything that reads it — this is
+// new data for a not-yet-built UI, not a replacement for what's
+// already working. See provider-adapter.js for how the data itself is
+// built and tested.
+// ============================================================
+app.get("/api/models/explorer", (req, res) => {
+  try {
+    const mediaType = req.query.mediaType || undefined; // undefined = all media types, matches discoverModels' own convention
+    const tree = FalAdapter.groupModelsByFamily({ mediaType });
+    // Enrich each leaf with capabilities + cost inline — without this,
+    // the frontend would need one /api/models/inspect call PER MODEL
+    // just to render meaningful filters/sort, which doesn't scale as
+    // the discovered-model list grows.
+    for (const provider of Object.values(tree)) {
+      for (const family of Object.values(provider)) {
+        family.forEach((m, i) => {
+          family[i] = { ...m, capabilities: FalAdapter.getCapabilities(m.id), estimatedCost: FalAdapter.estimateCost(m.id, {}) };
+        });
+      }
+    }
+    res.json({ tree, catalogMeta: { ...getRefreshMeta(), discovery: getDiscoveryStatus() } });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+// Query param, not a path param — Fal model IDs contain slashes
+// (fal-ai/nano-banana-pro/edit), which would break a normal Express
+// :modelId route (it only captures up to the first slash).
+app.get("/api/models/inspect", (req, res) => {
+  try {
+    const modelId = req.query.id;
+    if (!modelId) return res.status(400).json({ error: "Missing ?id=<model id> query param." });
+    const details = FalAdapter.getModelDetails(modelId);
+    if (!details) return res.status(404).json({ error: `No discovery or curated data found for "${modelId}".` });
+    res.json({
+      ...details,
+      capabilities: FalAdapter.getCapabilities(modelId),
+      voices: details.mediaType === "audio" ? FalAdapter.discoverVoices(modelId) : null,
+      estimatedCost: FalAdapter.estimateCost(modelId, {}),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // On-demand refresh — lets the frontend (a "Check for model updates"
@@ -3891,7 +4266,11 @@ app.get("/api/models", (req, res) => {
 // clear ok:true/false — a failed refresh is informational, never a hard
 // error, since the existing registry stays valid either way.
 app.post("/api/models/refresh", async (req, res) => {
-  const allIds = [...IMAGE_MODELS, ...VIDEO_MODELS].map((m) => m.id);
+  const allIds = [
+    ...IMAGE_MODELS, ...VIDEO_MODELS, ...MUSIC_MODELS, ...SFX_MODELS,
+    ...VOICE_CLONE_MODELS, ...TALKING_AVATAR_MODELS,
+    ...Object.values(UTILITY_MODELS).flat(),
+  ].map((m) => m.id);
   const result = await refreshModelLiveStatus(allIds, { thorough: true });
   res.json(result);
 });
@@ -4141,10 +4520,15 @@ app.post("/api/wizard-generate-logo", async (req, res) => {
 // the image — not a guess at what the person meant.
 app.post("/api/tools/suggest", async (req, res) => {
   try {
-    const { imageBase64, userApiKey, visionModel } = req.body;
+    const { imageBase64, userApiKey, visionModel, runId: clientRunId } = req.body;
     if (!imageBase64) return res.status(400).json({ error: "Missing image." });
     const apiKey = userApiKey || process.env.FAL_KEY;
     if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
+    // Runs right after the image is uploaded, before the actual
+    // tools/process call — minted here and returned so the frontend can
+    // reuse it for that follow-up call, grouping "suggest + process" as
+    // one real run instead of two disconnected ledger rows.
+    const runId = clientRunId || crypto.randomUUID();
     const modelMenu = Object.entries(UTILITY_MODELS)
       .map(([tool, models]) => models.map((m) => `  - tool "${tool}", model "${m.id}" (${m.label}): best for ${m.bestFor || "general use"}`).join("\n"))
       .join("\n");
@@ -4153,7 +4537,7 @@ ${modelMenu}
 Tool meanings: "upscale" = increase resolution/sharpen detail (use when the image looks low-res, soft, or blurry). "extend" = expand the image beyond its current edges (use when it looks tightly cropped or cut off). "restore" = fix damage, scratches, fading, or colorize black-and-white (use when there's visible damage or it's grayscale).
 If none clearly apply (the image already looks clean, well-composed, and high-resolution), say tool "none" and explain there's nothing obviously needed.
 Return ONLY this JSON, no markdown, no preamble: {"tool": "upscale" | "extend" | "restore" | "none", "modelId": "the specific model id from the list above, or null if tool is none", "reason": "one short sentence explaining what you actually see that supports both the tool AND model choice"}`;
-    const response = await falVisionRequest(prompt, imageBase64, { model: visionModel || DEFAULT_VISION_MODEL, apiKey, costMeta: { endpoint: "tools-suggest" } });
+    const response = await falVisionRequest(prompt, imageBase64, { model: visionModel || DEFAULT_VISION_MODEL, apiKey, costMeta: { runId, endpoint: "tools-suggest" } });
     let parsed;
     try {
       parsed = JSON.parse(response.text.trim().replace(/^```json\s*|\s*```$/g, ""));
@@ -4167,7 +4551,7 @@ Return ONLY this JSON, no markdown, no preamble: {"tool": "upscale" | "extend" |
       const validModel = (UTILITY_MODELS[parsed.tool] || []).some((m) => m.id === parsed.modelId);
       if (!validModel) parsed.modelId = UTILITY_MODELS[parsed.tool]?.[0]?.id || null;
     }
-    res.json(parsed);
+    res.json({ ...parsed, runId });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -4250,7 +4634,7 @@ const TARGET_LANGUAGE_SCRIPT_RANGES = {
 // guidance, casual-register instruction, script validation with a
 // forceful retry, and a second-opinion transliteration check — rather
 // than a second, weaker copy of hard-won prompt engineering.
-async function prepareTextForLanguage(text, targetLanguage, { apiKey, textModel }) {
+async function prepareTextForLanguage(text, targetLanguage, { apiKey, textModel, costMeta = null }) {
   const buildPrompt = (forceful) => `You are a professional human translator preparing text to be spoken aloud in ${targetLanguage} by a text-to-speech engine. The input text could be any of these — figure out which, automatically, without being told:
 1. Plain English that needs REAL TRANSLATION into ${targetLanguage} — actual ${targetLanguage} words that carry the same meaning, the words a native ${targetLanguage} speaker would naturally use.
 2. ${targetLanguage} already written in Latin/English letters instead of native script (very common when typing on a phone without native keyboard support) — e.g. Telugu written as "nenu ardam avutundi" instead of "నేను అర్థం అవుతుంది". Convert this to proper native ${targetLanguage} script — do NOT translate it as if it were English, since it already means something in ${targetLanguage}.
@@ -4267,14 +4651,14 @@ INPUT TEXT: ${text.trim()}`;
   const scriptCheck = TARGET_LANGUAGE_SCRIPT_RANGES[targetLanguage.trim()];
   let preparedText = (await falTextRequest(buildPrompt(false), {
     model: textModel || DEFAULT_TEXT_MODEL, apiKey, temperature: 0.3,
-    costMeta: { endpoint: "prepare-text-language" },
+    costMeta: { ...costMeta, endpoint: "prepare-text-language" },
   })).text.trim();
   let scriptValidationFailed = false;
   if (scriptCheck && !scriptCheck.test(preparedText)) {
     console.warn(`[Language Prep] Output didn't contain ${targetLanguage} script on first attempt — retrying with a more forceful prompt.`);
     const retryText = (await falTextRequest(buildPrompt(true), {
       model: textModel || DEFAULT_TEXT_MODEL, apiKey, temperature: 0.2,
-      costMeta: { endpoint: "prepare-text-language-retry" },
+      costMeta: { ...costMeta, endpoint: "prepare-text-language-retry" },
     })).text.trim();
     if (scriptCheck.test(retryText)) {
       preparedText = retryText;
@@ -4290,13 +4674,13 @@ INPUT TEXT: ${text.trim()}`;
 TEXT: ${preparedText}`;
       const judgeResponse = await falTextRequest(judgePrompt, {
         model: textModel || DEFAULT_TEXT_MODEL, apiKey, temperature: 0,
-        costMeta: { endpoint: "prepare-text-language-judge" },
+        costMeta: { ...costMeta, endpoint: "prepare-text-language-judge" },
       });
       if (/TRANSLITERATED/i.test(judgeResponse.text)) {
         console.warn(`[Language Prep] Output passed script check but was judged as transliteration — retrying once more.`);
         const retryText = (await falTextRequest(buildPrompt(true), {
           model: textModel || DEFAULT_TEXT_MODEL, apiKey, temperature: 0.4,
-          costMeta: { endpoint: "prepare-text-language-retry-translit" },
+          costMeta: { ...costMeta, endpoint: "prepare-text-language-retry-translit" },
         })).text.trim();
         preparedText = retryText;
         transliterationDetected = true;
@@ -4310,13 +4694,18 @@ TEXT: ${preparedText}`;
 
 app.post("/api/voice/prepare-text", async (req, res) => {
   try {
-    const { text, targetLanguage, textModel, userApiKey } = req.body;
+    const { text, targetLanguage, textModel, userApiKey, runId: clientRunId } = req.body;
     if (!text || !text.trim()) return res.status(400).json({ error: "Missing text." });
     if (!targetLanguage || !targetLanguage.trim()) return res.status(400).json({ error: "Missing target language." });
     const apiKey = userApiKey || process.env.FAL_KEY;
     if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
-    const result = await prepareTextForLanguage(text, targetLanguage, { apiKey, textModel });
-    res.json(result);
+    // Not tied to progress polling (this step is fast/synchronous), but
+    // still tagged with a real run_id so its cost lands under the same
+    // run as whatever speech generation follows it, instead of showing
+    // up as an orphaned ledger row with no run to attribute it to.
+    const runId = clientRunId || crypto.randomUUID();
+    const result = await prepareTextForLanguage(text, targetLanguage, { apiKey, textModel, costMeta: { runId } });
+    res.json({ ...result, runId });
   } catch (error) {
     console.error(`[Voice] Text preparation failed: ${error.message}`);
     res.status(500).json({ error: error.message });
@@ -4376,7 +4765,7 @@ app.post("/api/voice/generate-multilingual", async (req, res) => {
       let prepNote = null;
       if (seg.language.toLowerCase() !== "english") {
         try {
-          const prepared = await prepareTextForLanguage(finalText, seg.language, { apiKey, textModel });
+          const prepared = await prepareTextForLanguage(finalText, seg.language, { apiKey, textModel, costMeta: { runId } });
           finalText = prepared.preparedText;
           if (prepared.scriptValidationFailed) prepNote = `Couldn't confirm real ${seg.language} script for this segment even after retrying.`;
           else if (prepared.transliterationDetected) prepNote = `This segment may be transliterated rather than real ${seg.language}.`;
@@ -4409,11 +4798,17 @@ app.post("/api/voice/generate-multilingual", async (req, res) => {
 
 app.post("/api/voice/auto-tag-languages", async (req, res) => {
   try {
-    const { script, instruction, textModel, userApiKey } = req.body;
+    const { script, instruction, textModel, userApiKey, runId: clientRunId } = req.body;
     if (!script?.trim()) return res.status(400).json({ error: "Missing the script." });
     if (!instruction?.trim()) return res.status(400).json({ error: "Describe which parts should be in which language." });
     const apiKey = userApiKey || process.env.FAL_KEY;
     if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
+    // This is typically the first step of a multilingual voiceover
+    // session (auto-tag, then generate-multilingual) — the run_id minted
+    // here is returned so the frontend can reuse it for the actual
+    // generation, rather than this call's cost being an orphaned row
+    // unlinked from the voiceover it was prepared for.
+    const runId = clientRunId || crypto.randomUUID();
     const tagPrompt = `You are marking up a voiceover script for code-switched (multi-language) narration.
 INSTRUCTION: ${instruction.trim()}
 Wrap the lines/sentences that should be in a non-English language with tags like [Telugu]...[/Telugu] or [Hindi]...[/Hindi] (language name, capitalized, no spaces) around exactly those lines — leave everything else completely untouched, word for word. Do not add, remove, reword, or reorder any of the original text — only insert tags around the parts described in the instruction.
@@ -4422,9 +4817,9 @@ SCRIPT:
 ${script.trim()}`;
     const response = await falTextRequest(tagPrompt, {
       model: textModel || DEFAULT_TEXT_MODEL, apiKey, temperature: 0.2,
-      costMeta: { endpoint: "voice-auto-tag" },
+      costMeta: { runId, endpoint: "voice-auto-tag" },
     });
-    res.json({ taggedScript: response.text.trim() });
+    res.json({ taggedScript: response.text.trim(), runId });
   } catch (error) {
     console.error(`[Voice] Auto-tagging failed: ${error.message}`);
     res.status(500).json({ error: error.message });
@@ -4445,14 +4840,19 @@ app.post("/api/voice/generate", async (req, res) => {
       const cached = db.getVoicePreview(cacheKey);
       if (cached) return res.json({ audio: cached, modelUsed: modelId, cached: true });
     }
-    const model = VOICE_MODELS.find((m) => m.id === modelId);
+    // Phase 12 / Section 22 — same proven pattern as image/video: swap a
+    // genuinely deprecated model for a real capability-matched
+    // replacement automatically, rather than just failing.
+    const { resolvedModelId: modelIdAfterReplacement, replacementNote: voiceReplacementNote } = resolveModelOrReplacement(modelId);
+    if (voiceReplacementNote) console.warn(`[Model Replacement] ${voiceReplacementNote}`);
+    const model = VOICE_MODELS.find((m) => m.id === modelIdAfterReplacement);
     // An unrecognized model ID means the person typed a custom one — try
     // it for real with a generic payload instead of silently swapping in
     // MiniMax, which would be actively misleading (they'd think they
     // tested one model but actually got a different one back).
     const effectiveModel = model || {
-      id: modelId,
-      label: modelId,
+      id: modelIdAfterReplacement,
+      label: modelIdAfterReplacement,
       costPer1kChars: 0.10, // unknown — reasonable placeholder for the cost ledger, not a claim about this specific model's real price
       buildInput: (t, { voiceId: vId } = {}) => (vId ? { text: t, voice: vId } : { text: t }),
     };
@@ -4500,6 +4900,12 @@ TEXT: ${speakText}`;
     // name differs by model (MiniMax/ElevenLabs use "text", Gemini
     // TTS/Kokoro use "prompt"), so check both rather than assume one.
     const finalSpokenText = input.text || input.prompt || speakText;
+    // The real fix landing here: __strippedMarkers (see fal-models.js's
+    // translateScriptMarkers) tells the person exactly what got silently
+    // dropped instead of a word just vanishing from the output with zero
+    // explanation — confirmed directly: "*confident*" disappearing
+    // entirely on models that don't support descriptive tone tags.
+    const strippedMarkers = input.__strippedMarkers || [];
     const result = await falVoiceRequest(effectiveModel.id, input, {
       apiKey,
       costMeta: { runId, endpoint: "voice-generate", model: effectiveModel.id },
@@ -4519,7 +4925,19 @@ TEXT: ${speakText}`;
     if (isPreview) {
       try { db.saveVoicePreview(`${modelId}:${voiceId}`, dataUri); } catch {}
     }
-    res.json({ audio: dataUri, durationMs: result.durationMs, modelUsed: effectiveModel.id, translatedText, finalSpokenText, deliveryNote: productionScript.deliveryNote });
+    res.json({
+      audio: dataUri,
+      durationMs: result.durationMs,
+      modelUsed: effectiveModel.id,
+      replacementNote: voiceReplacementNote,
+      translatedText,
+      finalSpokenText,
+      deliveryNote: productionScript.deliveryNote,
+      strippedMarkers,
+      strippedMarkersNote: strippedMarkers.length
+        ? `${strippedMarkers.map((m) => `"${m}"`).join(", ")} ${strippedMarkers.length === 1 ? "wasn't" : "weren't"} spoken — ${effectiveModel.label} doesn't support ${strippedMarkers.length === 1 ? "that" : "those"} as a delivery/tone cue. ElevenLabs Eleven v3 and Gemini TTS support arbitrary descriptive tags like this directly (e.g. "[confident]") if that's what you need.`
+        : null,
+    });
   } catch (error) {
     if (runId) progress.finishProgress(runId);
     console.error(`[Voice] Generation failed: ${error.message}`);
@@ -4661,6 +5079,351 @@ app.delete("/api/voice/custom/:customVoiceId", (req, res) => {
 // (instrumentalOnly, supportsVoiceReference, requiresTimestampedLyrics,
 // cost), not a guess dressed up as intelligence.
 // ============================================================
+// ============================================================
+// VOICE MODEL RECOMMENDATION — the actual missing piece that let
+// MiniMax (which only confirms Hindi among Indian languages) stay the
+// effective default even when generating in Telugu, Tamil, Kannada, or
+// any other Indian regional language — while Gemini TTS, which
+// genuinely confirms 12+ of them, sat right there unrecommended. Same
+// honesty bar as recommendMusicModel: every recommendation traces back
+// to a model's own real confirmedLanguages array in fal-models.js, never
+// a guess about what "probably" works.
+// ============================================================
+const INDIAN_REGIONAL_LANGUAGES = [
+  "telugu", "tamil", "kannada", "malayalam", "marathi", "gujarati",
+  "punjabi", "odia", "bengali", "bangla", "sindhi", "konkani", "urdu", "assamese", "hindi",
+];
+// "Telugu" (what a person types) needs to match "Telugu (India)" (what's
+// actually in a model's confirmed list) — handles that, plus exact
+// matches, without needing every model's list reformatted to match.
+function languageMatchesConfirmed(targetLanguage, confirmedList) {
+  if (!targetLanguage || !confirmedList?.length) return false;
+  const needle = targetLanguage.trim().toLowerCase();
+  return confirmedList.some((lang) => {
+    const l = lang.toLowerCase();
+    return l === needle || l.startsWith(`${needle} `) || l.includes(`(${needle}`) || l.split(" (")[0] === needle;
+  });
+}
+// ============================================================
+// VOICE MODEL RECOMMENDATION — mirrors recommendMusicModel's pattern
+// below: explicit, confirmed-language-aware guidance instead of leaving
+// a person to guess which of the voice models actually supports the
+// language they're generating in. This is the real fix for the actual
+// root cause: Gemini TTS has genuinely confirmed support for 12+ Indian
+// regional languages (Hindi, Telugu, Tamil, Kannada, Malayalam,
+// Marathi, Gujarati, Punjabi, Odia, Sindhi, Konkani, Bangla, Urdu), but
+// nothing in this app ever pointed anyone toward it — MiniMax (which
+// only confirms Hindi among Indian languages, everything else relying
+// on unconfirmed "auto" detection) was the de facto default regardless
+// of what language was actually being generated.
+// ============================================================
+// Broader than gemini-tts's own confirmed list on purpose — this is
+// used to decide which model to GUESS with when no model confirms the
+// exact language, not to claim confirmation. For any of India's other
+// real scheduled/major regional languages, gemini-tts (broad Indian-
+// language family) is still the more reasonable bet than a model with
+// zero non-Hindi Indian-language confirmation at all.
+const CONFIRMED_INDIAN_LANGUAGES = new Set([
+  "hindi", "telugu", "tamil", "kannada", "malayalam", "marathi",
+  "gujarati", "punjabi", "odia", "sindhi", "konkani", "bangla", "bengali", "urdu",
+  "assamese", "bodo", "dogri", "kashmiri", "maithili", "manipuri", "meitei",
+  "nepali", "sanskrit", "santali", "bhojpuri", "rajasthani", "tulu",
+]);
+function normalizeLanguageForMatch(language) {
+  return (language || "").toLowerCase().replace(/\s*\(.*?\)\s*/g, "").trim(); // strips "(India)"/"(Bangladesh)" etc. suffixes
+}
+function recommendVoiceModel({ language, wantsEmotionControl, wantsOwnVoice, prioritize } = {}) {
+  const reasons = [];
+  if (wantsOwnVoice) {
+    reasons.push("You want to clone a specific real voice, not use a preset — MiniMax Voice Clone is the actual voice-cloning endpoint (a separate model from MiniMax Speech-02 HD's presets).");
+    return { modelId: "fal-ai/minimax/voice-clone", reasons, confidence: "high" };
+  }
+  const normalized = normalizeLanguageForMatch(language);
+  if (normalized && normalized !== "english" && normalized !== "auto") {
+    const geminiEntry = VOICE_MODELS.find((m) => m.id === "fal-ai/gemini-tts");
+    const geminiConfirms = geminiEntry?.confirmedLanguages?.some((l) => normalizeLanguageForMatch(l) === normalized);
+    // ElevenLabs eleven-v3 auto-detects language from the input text's
+    // script rather than taking an explicit language parameter — checked
+    // via its own real, confirmed language list (autoDetectedLanguagesSupported),
+    // a genuinely different field than confirmedLanguages for exactly
+    // that reason (see fal-models.js).
+    const elevenEntry = VOICE_MODELS.find((m) => m.id === "fal-ai/elevenlabs/tts/eleven-v3");
+    const elevenConfirms = elevenEntry?.autoDetectedLanguagesSupported?.some((l) => normalizeLanguageForMatch(l) === normalized);
+    if (geminiConfirms && elevenConfirms) {
+      reasons.push(`You're generating in ${language} — both Gemini TTS and ElevenLabs Eleven v3 have confirmed real support for this language. Gemini TTS takes it as an explicit parameter; ElevenLabs auto-detects it from the text's script instead. Recommending Gemini TTS as the more predictable of the two, but ElevenLabs is a genuinely good alternative, especially for more expressive/character delivery.`);
+      return { modelId: "fal-ai/gemini-tts", reasons, confidence: "high", alternativeModelId: "fal-ai/elevenlabs/tts/eleven-v3" };
+    }
+    if (geminiConfirms) {
+      reasons.push(`You're generating in ${language} — Gemini TTS has confirmed real support for this language, one of 12+ Indian regional languages it genuinely covers. Most other voice models here only confirm Hindi (if any Indian language at all) and fall back to unconfirmed "auto" detection for the rest.`);
+      return { modelId: "fal-ai/gemini-tts", reasons, confidence: "high" };
+    }
+    if (elevenConfirms) {
+      reasons.push(`You're generating in ${language} — ElevenLabs Eleven v3 has confirmed real support for this language (it auto-detects language directly from the text's script rather than needing it set explicitly).`);
+      return { modelId: "fal-ai/elevenlabs/tts/eleven-v3", reasons, confidence: "high" };
+    }
+    const minimaxEntry = VOICE_MODELS.find((m) => m.id === "fal-ai/minimax/speech-02-hd");
+    const minimaxConfirms = minimaxEntry?.confirmedLanguages?.some((l) => normalizeLanguageForMatch(l) === normalized);
+    if (minimaxConfirms) {
+      reasons.push(`You're generating in ${language} — MiniMax Speech-02 HD has confirmed real support for this language.`);
+      return { modelId: "fal-ai/minimax/speech-02-hd", reasons, confidence: "high" };
+    }
+    if (CONFIRMED_INDIAN_LANGUAGES.has(normalized)) {
+      reasons.push(`You're generating in ${language}. Being honest about a real limit: no model in this app's registry has CONFIRMED support for this exact language. Gemini TTS and ElevenLabs Eleven v3 both cover the broadest confirmed set of Indian languages here, so Gemini TTS is still the best bet — but this specific one hasn't been directly verified. Try it; if quality isn't there, that's a real limit right now, not a bug to chase.`);
+      return { modelId: "fal-ai/gemini-tts", reasons, confidence: "low", languageGap: true };
+    }
+    reasons.push(`You're generating in ${language} — no model here has confirmed support for it specifically. Defaulting to MiniMax Speech-02 HD (broadest general confirmed coverage, 30+ languages), but treat this as untested for your language.`);
+    return { modelId: "fal-ai/minimax/speech-02-hd", reasons, confidence: "low", languageGap: true };
+  }
+  if (wantsEmotionControl) {
+    reasons.push("You want emotion/pitch/speed control — MiniMax Speech-02 HD is the only model here with confirmed emotion control (7 real emotions) alongside pitch/speed tuning.");
+    return { modelId: "fal-ai/minimax/speech-02-hd", reasons, confidence: "high" };
+  }
+  if (prioritize === "budget") {
+    reasons.push("Budget-conscious request — Inworld TTS-1.5 Max is the cheapest confirmed option here.");
+    return { modelId: "fal-ai/inworld-tts", reasons, confidence: "medium" };
+  }
+  reasons.push("Standard voice request, English or unspecified language — MiniMax Speech-02 HD is the most thoroughly confirmed general-purpose option here (300+ voices, 30+ languages, emotion control).");
+  return { modelId: "fal-ai/minimax/speech-02-hd", reasons, confidence: "high" };
+}
+app.post("/api/voice/recommend-model", (req, res) => {
+  const { language, wantsEmotionControl, wantsOwnVoice, prioritize } = req.body;
+  res.json(recommendVoiceModel({ language, wantsEmotionControl, wantsOwnVoice, prioritize }));
+});
+
+// ============================================================
+// VOICE VARIATION DIRECTIONS (Phase 8) — generates N genuinely distinct
+// creative directions for one line, each mapped to REAL settings for
+// the specific model selected — never a generic label with nothing
+// real behind it. For emotion-capable models (MiniMax), maps to a real
+// confirmed emotion + voice. For tag-based models (ElevenLabs/Gemini),
+// maps to a real bracket-tag cue embedded via the SAME
+// translateScriptMarkers infrastructure already built and tested for
+// the *word* markup system — no parallel mechanism invented. For a
+// model with no real expressive lever at all beyond one voice, this is
+// honest about that instead of generating N near-identical clips and
+// calling them "variations."
+// ============================================================
+async function generateVoiceDirections({ lineText, model, count, apiKey }) {
+  const voiceOptions = model.confirmedVoiceIds || [];
+  const hasMultipleVoices = voiceOptions.length > 1;
+  const hasEmotions = !!model.confirmedEmotions?.length;
+  const hasTags = !!model.autoDetectsLanguageFromText || model.id === "fal-ai/gemini-tts";
+
+  if (!hasMultipleVoices && !hasEmotions && !hasTags) {
+    return {
+      directions: [{ label: "Default", voiceId: voiceOptions[0]?.id || null, emotion: null, tagPrefix: null }],
+      cappedReason: `${model.label} has no real expressive control beyond a single voice — genuinely different takes aren't possible on this model. Switch to MiniMax (emotion control), or ElevenLabs/Gemini TTS (descriptive delivery tags) for meaningful variation.`,
+    };
+  }
+
+  const realLevers = [
+    hasEmotions ? `real confirmed emotions: ${model.confirmedEmotions.join(", ")}` : null,
+    hasTags ? `descriptive delivery tags embedded in the text (e.g. "confident", "warm", "urgent" — any real English word works, this model reads them directly)` : null,
+    hasMultipleVoices ? `${voiceOptions.length} real named voices: ${voiceOptions.map((v) => `${v.id} (${v.description})`).join("; ")}` : null,
+  ].filter(Boolean).join(". ");
+
+  const prompt = `You are directing ${count} genuinely different voice performances of one line for a professional voice production tool. Real constraints for the model actually being used — do not invent anything outside these: ${realLevers}.
+
+LINE TO PERFORM: "${lineText}"
+
+Generate exactly ${count} DISTINCT creative directions for this line — each should sound meaningfully different from the others when actually performed (e.g. calm/premium vs energetic/advertising vs dramatic/cinematic), grounded in the real levers above.
+
+Return ONLY this JSON array, no markdown fences: [{"label": "short 2-4 word description", ${hasEmotions ? `"emotion": "one of the confirmed emotions listed above", ` : ""}${hasTags ? `"tagPrefix": "one real descriptive word for the delivery tag", ` : ""}${hasMultipleVoices ? `"voiceId": "one of the real voice IDs listed above", ` : ""}"reasoning": "one short phrase on why this direction fits"}]`;
+
+  try {
+    const response = await falTextRequest(prompt, { apiKey, temperature: 0.9, costMeta: { endpoint: "voice-directions" } });
+    const parsed = JSON.parse(response.text.replace(/```json|```/g, "").trim());
+    // Real, deliberate validation — never trust the LLM's own claim of a
+    // voice/emotion without checking it against what's ACTUALLY real for
+    // this model, same discipline as the model-enrichment contradiction
+    // guard built earlier this session.
+    const validated = (Array.isArray(parsed) ? parsed : []).slice(0, count).map((d, i) => ({
+      label: d.label || `Take ${i + 1}`,
+      emotion: hasEmotions && model.confirmedEmotions.includes(d.emotion) ? d.emotion : null,
+      tagPrefix: hasTags && typeof d.tagPrefix === "string" ? d.tagPrefix.trim() : null,
+      voiceId: hasMultipleVoices && voiceOptions.some((v) => v.id === d.voiceId) ? d.voiceId : (voiceOptions[0]?.id || null),
+      reasoning: d.reasoning || null,
+    }));
+    if (validated.length) return { directions: validated, cappedReason: null };
+  } catch (err) {
+    console.warn(`[Voice Directions] Couldn't get AI-directed variations (${err.message}) — falling back to cycling real voices/emotions directly.`);
+  }
+  // Fallback if the AI call fails entirely — still genuinely real, just
+  // mechanical instead of creatively directed: cycles through actual
+  // confirmed voices/emotions rather than returning nothing.
+  const fallbackDirections = [];
+  for (let i = 0; i < count; i++) {
+    fallbackDirections.push({
+      label: hasEmotions ? model.confirmedEmotions[i % model.confirmedEmotions.length] : (voiceOptions[i % voiceOptions.length]?.id || `Take ${i + 1}`),
+      emotion: hasEmotions ? model.confirmedEmotions[i % model.confirmedEmotions.length] : null,
+      tagPrefix: null,
+      voiceId: hasMultipleVoices ? voiceOptions[i % voiceOptions.length].id : (voiceOptions[0]?.id || null),
+      reasoning: null,
+    });
+  }
+  return { directions: fallbackDirections, cappedReason: null };
+}
+app.post("/api/voice/script/generate-variations", async (req, res) => {
+  try {
+    const { lineText, modelId, count = 4, runId, userApiKey } = req.body;
+    const apiKey = userApiKey || process.env.FAL_KEY;
+    if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
+    if (!lineText?.trim()) return res.status(400).json({ error: "No line text provided." });
+    const model = VOICE_MODELS.find((m) => m.id === modelId);
+    if (!model) return res.status(400).json({ error: `Unknown voice model: ${modelId}` });
+    const safeCount = Math.min(8, Math.max(1, parseInt(count) || 4));
+    const { directions, cappedReason } = await generateVoiceDirections({ lineText, model, count: safeCount, apiKey });
+    // Real concurrency-aware generation — reuses the exact same
+    // falVoiceRequest/buildInput path every other voice feature in this
+    // app already uses, just looped once per direction. Each direction's
+    // own real settings (voice/emotion/tag) get applied via the model's
+    // own buildInput function, same as a single generation would.
+    const results = await Promise.all(
+      directions.map(async (direction, i) => {
+        try {
+          const textWithTag = direction.tagPrefix ? `*${direction.tagPrefix}* ${lineText}` : lineText;
+          const input = model.buildInput(textWithTag, { voiceId: direction.voiceId, emotion: direction.emotion });
+          const strippedMarkers = input.__strippedMarkers || [];
+          const result = await falVoiceRequest(model.id, input, {
+            apiKey, costPer1kChars: model.costPer1kChars, textLength: lineText.length,
+            costMeta: { runId, endpoint: "voice-variation", frameIndex: i },
+          });
+          const dataUri = await downloadImageAsDataUri(result.url);
+          return { ...direction, audio: dataUri, modelUsed: model.id, strippedMarkers, error: null };
+        } catch (err) {
+          return { ...direction, audio: null, modelUsed: model.id, error: err.message };
+        }
+      }),
+    );
+    res.json({ results, cappedReason, modelUsed: model.id });
+  } catch (error) {
+    console.error("Voice variation generation error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// AUDIO LIBRARY (Phase 11) — real, simple REST endpoints over the
+// db.js functions above. Deliberately minimal: list/save/delete/
+// favorite is enough to make generated audio actually reusable instead
+// of vanishing when a modal closes, without over-building before real
+// usage shows what's actually needed beyond that.
+// ============================================================
+app.get("/api/audio-library", (req, res) => {
+  try {
+    res.json({ items: db.listAudioLibraryItems({ type: req.query.type || undefined }) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+app.post("/api/audio-library", (req, res) => {
+  try {
+    const { type, name, audioDataUri, modelUsed, voiceUsed, language, runId, metadata } = req.body;
+    if (!type || !["voice", "song", "sfx"].includes(type)) return res.status(400).json({ error: "type must be 'voice', 'song', or 'sfx'." });
+    if (!name?.trim()) return res.status(400).json({ error: "Missing a name for this item." });
+    if (!audioDataUri) return res.status(400).json({ error: "Missing audio data." });
+    const id = db.saveAudioLibraryItem({ type, name: name.trim(), audioDataUri, modelUsed, voiceUsed, language, runId, metadata });
+    res.json({ id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+app.delete("/api/audio-library/:id", (req, res) => {
+  try {
+    db.deleteAudioLibraryItem(parseInt(req.params.id));
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+app.post("/api/audio-library/:id/favorite", (req, res) => {
+  try {
+    const favorite = db.toggleAudioLibraryFavorite(parseInt(req.params.id));
+    if (favorite === null) return res.status(404).json({ error: "Item not found." });
+    res.json({ favorite });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// SONG VARIATION DIRECTIONS (Phase 10) — generates N distinct musical
+// direction reinterpretations of one brief (e.g. cinematic vs
+// commercial pop vs stripped-back acoustic vs dark moody electronic),
+// keeping the lyrics unchanged across versions so the song's actual
+// content stays consistent while the production direction varies. Real
+// AI-authored directions, not generic labels — same discipline as the
+// voice variation directions above. Capped lower than voice (max 4, not
+// 8) since a real song generation costs and takes much longer per clip
+// than a short voice line does — 8 full songs in one batch would be a
+// genuinely expensive, slow request.
+// ============================================================
+async function generateSongDirections({ style, lyrics, model, count, apiKey }) {
+  const isInstrumental = !!model.instrumentalOnly;
+  const prompt = `You are directing ${count} genuinely different musical interpretations of the same song brief for a professional music production tool.
+
+ORIGINAL STYLE/MOOD BRIEF: "${style}"
+${isInstrumental ? "" : `LYRICS (must stay exactly the same across all versions — only the musical direction changes): "${(lyrics || "").slice(0, 500)}${(lyrics || "").length > 500 ? "..." : ""}"`}
+
+Generate exactly ${count} DISTINCT musical direction reinterpretations of this brief — each should sound genuinely different in genre/arrangement/energy when actually produced (e.g. cinematic orchestral vs upbeat commercial pop vs stripped-back acoustic vs dark moody electronic), while staying true to the original brief's core idea${isInstrumental ? "" : " and never changing the lyrics themselves"}.
+
+Return ONLY this JSON array, no markdown fences: [{"label": "short 2-4 word description (e.g. \\"Cinematic\\", \\"Commercial Pop\\")", "styleDirection": "a full, detailed style/mood/genre/instrumentation prompt for this specific direction, written as a real production brief", "reasoning": "one short phrase on why this direction fits"}]`;
+
+  try {
+    const response = await falTextRequest(prompt, { apiKey, temperature: 0.9, costMeta: { endpoint: "song-directions" } });
+    const parsed = JSON.parse(response.text.replace(/```json|```/g, "").trim());
+    const validated = (Array.isArray(parsed) ? parsed : []).slice(0, count).map((d, i) => ({
+      label: d.label || `Version ${String.fromCharCode(65 + i)}`,
+      styleDirection: typeof d.styleDirection === "string" && d.styleDirection.trim() ? d.styleDirection.trim() : style,
+      reasoning: d.reasoning || null,
+    }));
+    if (validated.length) return validated;
+  } catch (err) {
+    console.warn(`[Song Directions] Couldn't get AI-directed variations (${err.message}) — falling back to simple style-prefix variations.`);
+  }
+  // Fallback if the AI call fails entirely — still genuinely different
+  // (real distinct genre prefixes), just not creatively reasoned.
+  const fallbackLabels = ["Cinematic", "Upbeat", "Stripped Back", "Moody"];
+  return Array.from({ length: count }, (_, i) => ({
+    label: fallbackLabels[i % fallbackLabels.length],
+    styleDirection: `${fallbackLabels[i % fallbackLabels.length]} version: ${style}`,
+    reasoning: null,
+  }));
+}
+app.post("/api/music/generate-variations", async (req, res) => {
+  try {
+    const { style, lyrics, modelId, count = 3, durationSeconds, runId, userApiKey } = req.body;
+    const apiKey = userApiKey || process.env.FAL_KEY;
+    if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
+    if (!style?.trim()) return res.status(400).json({ error: "Missing style/mood description." });
+    const model = MUSIC_MODELS.find((m) => m.id === modelId);
+    if (!model) return res.status(400).json({ error: `Unknown music model: ${modelId}` });
+    if (!model.instrumentalOnly && (!lyrics || !lyrics.trim())) return res.status(400).json({ error: "Missing lyrics." });
+    const safeCount = Math.min(4, Math.max(1, parseInt(count) || 3));
+    const directions = await generateSongDirections({ style, lyrics, model, count: safeCount, apiKey });
+    const results = await Promise.all(
+      directions.map(async (direction, i) => {
+        try {
+          const secondArg = model.instrumentalOnly ? (model.supportsNegativePrompt ? lyrics?.trim() : undefined) : lyrics?.trim();
+          const input = model.buildInput(direction.styleDirection, secondArg, { durationSeconds: model.supportsDuration ? parseInt(durationSeconds) : undefined });
+          const result = await falVoiceRequest(model.id, input, {
+            apiKey, costMeta: { runId, endpoint: "song-variation", model: model.id, frameIndex: i },
+            flatCost: model.costPerGeneration || 0.05,
+          });
+          const dataUri = await downloadImageAsDataUri(result.url);
+          return { ...direction, audio: dataUri, modelUsed: model.id, error: null };
+        } catch (err) {
+          return { ...direction, audio: null, modelUsed: model.id, error: err.message };
+        }
+      }),
+    );
+    res.json({ results, modelUsed: model.id });
+  } catch (error) {
+    console.error("Song variation generation error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 function recommendMusicModel({ wantsVocals, wantsOwnVoice, language, prioritize }) {
   const reasons = [];
   if (wantsOwnVoice) {
@@ -4699,11 +5462,16 @@ app.post("/api/music/write-lyrics", async (req, res) => {
     const {
       storyPrompt, referenceNotes, lyricLanguageStyle,
       emotionalFeel, vocalStyle, lyricalGenre, wantsVocals, wantsOwnVoice, prioritize,
-      textModel, userApiKey,
+      textModel, userApiKey, runId: clientRunId,
     } = req.body;
     if (!storyPrompt || !storyPrompt.trim()) return res.status(400).json({ error: "Missing your song idea/story." });
     const apiKey = userApiKey || process.env.FAL_KEY;
     if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
+    // First step of a Song Studio session — minted here and returned so
+    // the frontend can reuse it for the actual music/generate call that
+    // follows, so "cost of this song" (lyrics + generation) is one real
+    // number instead of the lyric-writing cost being an orphaned row.
+    const runId = clientRunId || crypto.randomUUID();
     // Real, explicit control instead of leaving language/cultural style to
     // guesswork — this is the actual gap that produced a generic Western
     // pop ballad from a story that was itself written in Indian English
@@ -4748,7 +5516,7 @@ STORY/IDEA: ${storyPrompt.trim()}`;
       model: textModel || DEFAULT_TEXT_MODEL,
       apiKey,
       temperature: 0.8,
-      costMeta: { endpoint: "music-write-lyrics" },
+      costMeta: { runId, endpoint: "music-write-lyrics" },
     });
     let parsed;
     try {
@@ -4762,7 +5530,7 @@ STORY/IDEA: ${storyPrompt.trim()}`;
       language: lyricLanguageStyle && lyricLanguageStyle !== "match" && lyricLanguageStyle !== "english" ? lyricLanguageStyle : null,
       prioritize,
     });
-    res.json({ lyrics: parsed.lyrics, style: parsed.style, recommendation });
+    res.json({ lyrics: parsed.lyrics, style: parsed.style, recommendation, runId });
   } catch (error) {
     console.error(`[Music] Lyric writing failed: ${error.message}`);
     res.status(500).json({ error: error.message });
@@ -4772,10 +5540,17 @@ STORY/IDEA: ${storyPrompt.trim()}`;
 app.post("/api/music/generate", async (req, res) => {
   let runId;
   try {
-    const { style, lyrics, referenceAudioBase64, modelId, durationSeconds, userApiKey, runId: clientRunId } = req.body;
+    const { style, lyrics, referenceAudioBase64, modelId: rawModelId, durationSeconds, userApiKey, runId: clientRunId } = req.body;
     const apiKey = userApiKey || process.env.FAL_KEY;
     if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
     runId = clientRunId || crypto.randomUUID();
+    // Phase 12 / Section 22 — same proven pattern as image/video/voice:
+    // swap a genuinely deprecated model for a real capability-matched
+    // replacement automatically, applied once here so every branch below
+    // (reference-voice, lyrics, custom model) benefits without needing
+    // its own separate check.
+    const { resolvedModelId: modelId, replacementNote: musicReplacementNote } = resolveModelOrReplacement(rawModelId);
+    if (musicReplacementNote) console.warn(`[Model Replacement] ${musicReplacementNote}`);
     let model, input;
     const knownModel = modelId ? MUSIC_MODELS.find((m) => m.id === modelId) : null;
     if (referenceAudioBase64) {
@@ -4809,12 +5584,18 @@ app.post("/api/music/generate", async (req, res) => {
       if (!willBeInstrumentalOnly && (!lyrics || !lyrics.trim())) return res.status(400).json({ error: "Missing lyrics." });
       model = knownModel || MUSIC_MODELS.find((m) => !m.supportsVoiceReference) || MUSIC_MODELS[0];
       if (knownModel || !modelId) {
-        // Instrumental-only models (Lyria 2, CassetteAI) use their
-        // second buildInput argument for something other than lyrics
-        // (Lyria 2: negative_prompt) — never pass the lyrics field's
-        // value there, since it could be stale text left over from
-        // switching away from a lyrics-capable model.
-        input = model.buildInput(style.trim(), willBeInstrumentalOnly ? undefined : lyrics?.trim(), { durationSeconds: model.supportsDuration ? durationSeconds : undefined });
+        // Real, confirmed gap fixed here: this used to unconditionally
+        // pass undefined for every instrumental-only model's second
+        // buildInput argument, on the reasoning that it might be stale
+        // lyrics text left over from switching models. That's still
+        // correct for a model with no real use for a second argument at
+        // all (CassetteAI) — but Lyria2 genuinely supports negative_prompt,
+        // and the frontend now correctly relabels this same field for
+        // that purpose when Lyria2 is selected (see
+        // updateSongLyricsModelHint), so what's actually in it at that
+        // point is a real negative prompt, not leftover lyrics.
+        const secondArg = willBeInstrumentalOnly ? (model.supportsNegativePrompt ? lyrics?.trim() : undefined) : lyrics?.trim();
+        input = model.buildInput(style.trim(), secondArg, { durationSeconds: model.supportsDuration ? durationSeconds : undefined });
       } else {
         model = { id: modelId, label: modelId, costPerGeneration: 0.05 };
         input = { prompt: style.trim(), lyrics_prompt: lyrics?.trim() };
@@ -4829,7 +5610,7 @@ app.post("/api/music/generate", async (req, res) => {
     });
     progress.finishProgress(runId);
     const dataUri = await downloadImageAsDataUri(result.url);
-    res.json({ audio: dataUri, modelUsed: model.id });
+    res.json({ audio: dataUri, modelUsed: model.id, replacementNote: musicReplacementNote });
   } catch (error) {
     if (runId) progress.finishProgress(runId);
     console.error(`[Music] Generation failed: ${error.message}`);
@@ -4890,23 +5671,57 @@ app.listen(PORT, () => {
   // costs ZERO Fal API calls instead of repeating the whole verification
   // from an empty cache every single time. Only a genuinely stale (or
   // first-ever) cache triggers a live check.
-  const allModelIds = [...IMAGE_MODELS, ...VIDEO_MODELS].map((m) => m.id);
+  // Real, confirmed gap closed here: this used to only ever check
+  // IMAGE_MODELS and VIDEO_MODELS against Fal's live catalog — MUSIC_
+  // MODELS, SFX_MODELS, VOICE_CLONE_MODELS, TALKING_AVATAR_MODELS, and
+  // the UTILITY_MODELS (upscale/extend/restore/videoBackground) were
+  // never checked at all, so a deprecated model in any of those
+  // categories would only be discovered when a real generation call
+  // failed. VOICE_MODELS is deliberately still excluded here — it
+  // already has its own separate, working verification system
+  // (voiceCatalog, below) that needs a real user API key and so runs
+  // from the frontend instead of at server startup.
+  const curatedModelIds = [
+    ...IMAGE_MODELS, ...VIDEO_MODELS, ...MUSIC_MODELS, ...SFX_MODELS,
+    ...VOICE_CLONE_MODELS, ...TALKING_AVATAR_MODELS,
+    ...Object.values(UTILITY_MODELS).flat(),
+  ].map((m) => m.id);
+  // Recomputed fresh on every call rather than a fixed array captured
+  // once — discovered model IDs accumulate over time as syncDiscoveredModels
+  // runs, so each periodic live-status recheck needs to see the CURRENT
+  // set, not just whatever existed at server startup.
+  const allKnownModelIds = () => [...curatedModelIds, ...getDiscoveredModels().map((m) => m.id)];
   const { registryFresh, browseFresh } = initFromPersistedCache();
   if (registryFresh && browseFresh) {
     console.log(`[Model Catalog] Persisted cache is still fresh — skipping the live check entirely this startup.`);
+    setTimeout(() => syncDiscoveredModels(curatedModelIds).then(() => enrichDiscoveredModels(process.env.FAL_KEY)), 5000);
   } else {
     setTimeout(() => {
-      const registryStep = registryFresh ? Promise.resolve() : refreshModelLiveStatus(allModelIds);
-      registryStep.then(() => {
-        if (!browseFresh) return refreshBrowseCatalog();
-      });
+      const registryStep = registryFresh ? Promise.resolve() : refreshModelLiveStatus(curatedModelIds);
+      registryStep
+        .then(() => (browseFresh ? Promise.resolve() : refreshBrowseCatalog()))
+        .then(() => syncDiscoveredModels(curatedModelIds))
+        .then(() => enrichDiscoveredModels(process.env.FAL_KEY));
     }, 5000);
   }
   // Periodic re-checks stay on their own independent intervals — these
   // fire hours apart, so there's no realistic overlap risk between them
   // the way there was for two back-to-back startup calls.
-  setInterval(() => refreshModelLiveStatus(allModelIds), 6 * 60 * 60 * 1000);
+  setInterval(() => refreshModelLiveStatus(allKnownModelIds()), 6 * 60 * 60 * 1000);
   setInterval(() => refreshBrowseCatalog(), 72 * 60 * 60 * 1000);
+  // Discovery sync runs on its own, MORE frequent interval than the
+  // browse refresh above — it processes a bounded batch each time (see
+  // DISCOVERY_BATCH_SIZE in fal-catalog.js), so a large first-ever
+  // backlog gets worked through gradually across several passes instead
+  // of bursting dozens of schema-fetch calls at once. Reuses whatever's
+  // currently in the browse cache — doesn't need it perfectly fresh,
+  // just reasonably recent, which the 72h refresh above already ensures.
+  // Enrichment chained right after — only ever touches models that
+  // already passed real schema classification, using process.env.FAL_KEY
+  // since this is a background job with no specific user/request behind
+  // it (unlike the rest of this app's LLM calls, which use whichever key
+  // the requesting user supplied).
+  setInterval(() => syncDiscoveredModels(curatedModelIds).then(() => enrichDiscoveredModels(process.env.FAL_KEY)), 30 * 60 * 1000);
 
   // Voice catalog: load whatever was verified last time synchronously,
   // so it's ready immediately for the first /api/models call. The

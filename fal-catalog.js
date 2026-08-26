@@ -16,8 +16,9 @@
 // ============================================================
 
 const API_BASE = "https://api.fal.ai/v1";
-const { buildExampleSnippet, detectSchema } = require("./fal-schema-utils");
+const { buildExampleSnippet, detectSchema, classifyModelCapabilities } = require("./fal-schema-utils");
 const db = require("./db");
+const { falTextRequest } = require("./fal-client");
 
 // modelId -> { status, displayName, description, category, exampleCode, checkedAt }
 const liveStatusCache = new Map();
@@ -255,7 +256,19 @@ function getLiveStatus(modelId) {
 // people can browse without needing to know exactly what to search for,
 // not re-fetch narrowly on every keystroke.
 // ============================================================
-const BROWSE_CATEGORIES = ["image-to-image", "text-to-image", "image-to-video", "text-to-video"];
+// Confirmed as real Fal category values by directly observing them as
+// the self-reported category on real Fal model pages (ElevenLabs TTS,
+// Chatterbox Speech-to-Speech, etc.) — not guessed. Image/video
+// categories were already covered; audio was the real, confirmed gap.
+const BROWSE_CATEGORIES = ["image-to-image", "text-to-image", "image-to-video", "text-to-video", "text-to-speech", "text-to-audio", "speech-to-speech", "text-to-music"];
+// Safety net for categories this app doesn't know the exact slug for —
+// Fal's own /models search matches free text against name, description,
+// AND category, so a plain-language term still finds relevant models
+// even if this app's guessed category slug above is slightly wrong or
+// Fal renames/adds one. Deliberately not relied on alone (category
+// filtering above is more precise when it works) — this exists purely
+// to catch what a wrong/missing category guess would otherwise lose.
+const DISCOVERY_SAFETY_NET_TERMS = ["voice clone", "sound effect generator", "talking avatar", "lip sync", "video background removal", "music generation"];
 let browseCache = { models: [], lastFetched: null, fetching: false, error: null };
 
 function loadPersistedBrowseCache() {
@@ -280,6 +293,19 @@ async function fetchOneCategory(category) {
   const { models } = await res.json();
   return models.map((m) => ({ id: m.endpoint_id, ...extractGuideMetadata(m) }));
 }
+// Free-text pass — Fal's own /models search matches q against name,
+// description, AND category, so this catches anything a wrong/missing
+// category guess above would otherwise miss entirely.
+async function fetchOneSearchTerm(term) {
+  const params = new URLSearchParams({ q: term, limit: "20", status: "active" });
+  const res = await fetchFalApi(`${API_BASE}/models?${params.toString()}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`q="${term}" returned ${res.status}: ${body.slice(0, 150)}`);
+  }
+  const { models } = await res.json();
+  return models.map((m) => ({ id: m.endpoint_id, ...extractGuideMetadata(m) }));
+}
 
 async function refreshBrowseCatalog() {
   if (browseCache.fetching) return browseCache; // don't stack concurrent refreshes
@@ -300,6 +326,15 @@ async function refreshBrowseCatalog() {
     // startup is real and worth spacing out, not just here.
     await new Promise((r) => setTimeout(r, 1500)); // real gap — 400ms wasn't enough, confirmed by actual 429s
   }
+  for (const term of DISCOVERY_SAFETY_NET_TERMS) {
+    try {
+      const models = await fetchOneSearchTerm(term);
+      allModels.push(...models);
+    } catch (err) {
+      failures.push({ category: `q="${term}"`, reason: err.message });
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
   // De-dupe (some models can legitimately appear in more than one category)
   const seen = new Set();
   const deduped = allModels.filter((m) => (seen.has(m.id) ? false : (seen.add(m.id), true)));
@@ -311,14 +346,387 @@ async function refreshBrowseCatalog() {
   };
   persistBrowseCache();
   console.log(
-    `[Model Catalog] Browse cache refreshed: ${deduped.length} model(s) across ${BROWSE_CATEGORIES.length} categories.` +
+    `[Model Catalog] Browse cache refreshed: ${deduped.length} model(s) across ${BROWSE_CATEGORIES.length} categories + ${DISCOVERY_SAFETY_NET_TERMS.length} safety-net search(es).` +
       (failures.length ? ` ${failures.length} category fetch(es) failed — ${failures.map((f) => `[${f.category}] ${f.reason}`).join("; ")}` : ""),
   );
   return browseCache;
 }
 
+// ============================================================
+// NORMALIZED MODEL STATUS — the exact 8-state model requested
+// (DISCOVERED/VERIFIED/SUPPORTED/SELECTABLE/FAILED/DEPRECATED/
+// UNAVAILABLE/UNKNOWN), computed from signals this app ALREADY tracks
+// (live-status cache, discovered-models cache, learned corrections,
+// real usage stats) — not a new tracking mechanism, a new lens on data
+// already collected. Deliberately conservative, matching the
+// already-learned "missing != broken" lesson elsewhere in this file: a
+// model only ever moves to DEPRECATED or FAILED on strong, explicit
+// evidence (provider's own deprecated flag, or enough real failed
+// generation attempts), never on a missed search, rate limit, or
+// timeout.
+//
+// UNAVAILABLE is defined but deliberately left effectively unreachable
+// from current signals — this app has no reliable way to distinguish a
+// genuine confirmed-404 from a temporary discovery-index miss (the
+// "missing" status has shown real false positives even on repeated
+// checks), so treating anything as UNAVAILABLE right now would
+// reintroduce the exact bug already fixed once. DEPRECATED (provider's
+// own explicit flag) and FAILED (real usage data) are the two
+// legitimate removal/warning signals this app can actually back up
+// today.
+// ============================================================
+const MODEL_STATUS = {
+  DISCOVERED: "discovered",
+  VERIFIED: "verified",
+  SUPPORTED: "supported",
+  SELECTABLE: "selectable",
+  FAILED: "failed",
+  DEPRECATED: "deprecated",
+  UNAVAILABLE: "unavailable",
+  UNKNOWN: "unknown",
+};
+function getNormalizedStatus(modelId, { isCurated = false } = {}) {
+  const live = liveStatusCache.get(modelId);
+  const discovered = discoveredModelsCache.get(modelId);
+  const correction = db.getModelFieldCorrection(modelId);
+  const usageStats = db.getModelSuccessStats(modelId);
+
+  if (live?.status === "deprecated") {
+    return { status: MODEL_STATUS.DEPRECATED, reason: "Provider explicitly marked this model deprecated.", detail: live };
+  }
+  // Real usage confirming a problem is a much stronger signal than a
+  // single discovery-check miss — needs a real sample size (5+ attempts)
+  // before it's trusted, not one unlucky call.
+  if (usageStats.totalCount >= 5 && usageStats.successRate < 0.2) {
+    return { status: MODEL_STATUS.FAILED, reason: `${usageStats.totalCount} real attempts, only ${Math.round(usageStats.successRate * 100)}% succeeded.`, detail: usageStats };
+  }
+  if (isCurated) {
+    return { status: MODEL_STATUS.SELECTABLE, reason: "Curated entry with a confirmed, hand-verified request shape.", detail: live || null };
+  }
+  if (discovered?.classification?.classified && !discovered.excluded) {
+    const hasKnownShape = !!(discovered.schemaInfo?.imageField || discovered.schemaInfo?.audioField || discovered.schemaInfo?.hasPrompt || correction);
+    if (hasKnownShape) {
+      return { status: MODEL_STATUS.SELECTABLE, reason: "Real schema confirms how to build a request for this model.", detail: discovered.classification };
+    }
+    return { status: MODEL_STATUS.VERIFIED, reason: "Schema read and classified, but not enough field detail to safely build a request yet.", detail: discovered.classification };
+  }
+  if (discovered) {
+    return { status: MODEL_STATUS.DISCOVERED, reason: "Found in the browse catalog, not yet schema-classified.", detail: null };
+  }
+  return { status: MODEL_STATUS.UNKNOWN, reason: "No discovery or verification data available for this model yet.", detail: null };
+}
+
 function getBrowseCache() {
   return browseCache;
+}
+
+// ============================================================
+// AUTO-DISCOVERY — the actual mechanism that makes new Fal releases
+// usable without a developer hand-writing an entry for them. Takes
+// whatever the browse catalog found (real, live, all of Fal's active
+// models in the categories/searches above) minus whatever's already in
+// the hand-curated lists (fal-models.js — those stay as-is, this only
+// ever ADDS to them), fetches each new one's real schema, classifies it
+// via classifyModelCapabilities (objective facts only), and persists the
+// result. Processes a bounded batch per call (not the whole backlog at
+// once) — each new model needs its own schema-expand API call, so a
+// first-ever run against a large backlog spreads itself across several
+// scheduled sync passes rather than firing dozens of calls in one burst.
+// ============================================================
+const DISCOVERED_MODELS_KEY = "discovered_models_v1";
+// Matches the registry's own proven-safe chunk size (50 IDs per call,
+// see refreshModelLiveStatus above) — now that this is a single batched
+// call regardless of size (see the fix below), there's no longer a
+// reason to keep this artificially small.
+const DISCOVERY_BATCH_SIZE = 40;
+let discoveredModelsCache = new Map(); // id -> { id, guideMetadata, schemaInfo, classification, discoveredAt }
+function loadPersistedDiscoveredModels() {
+  const saved = db.getSettingJson(DISCOVERED_MODELS_KEY);
+  if (Array.isArray(saved)) {
+    discoveredModelsCache = new Map(saved.map((m) => [m.id, m]));
+    console.log(`[Model Catalog] Loaded ${discoveredModelsCache.size} previously auto-discovered model(s) from disk.`);
+  }
+}
+function persistDiscoveredModels() {
+  db.setSettingJson(DISCOVERED_MODELS_KEY, [...discoveredModelsCache.values()]);
+}
+
+async function syncDiscoveredModels(curatedIds) {
+  const curatedSet = new Set(curatedIds);
+  const candidates = browseCache.models.filter((m) => !curatedSet.has(m.id) && !discoveredModelsCache.has(m.id));
+  if (!candidates.length) return { newlyDiscovered: 0, remaining: 0 };
+  const toProcess = candidates.slice(0, DISCOVERY_BATCH_SIZE);
+  // Real, confirmed bug fixed here: this used to call getSingleModelDetail
+  // once PER candidate — a separate API call for each of up to
+  // DISCOVERY_BATCH_SIZE models, one right after another. That's exactly
+  // the mistake the registry's OWN check already learned from and fixed
+  // (see refreshModelLiveStatus above, and its "used to run automatically
+  // on every server restart" comment) — confirmed in production here too:
+  // a 15-candidate batch triggered repeated 429s, capped retry waits that
+  // were too short to actually clear Fal's real rate window (which asked
+  // for waits up to 57s), and the whole batch failed with 0 classified.
+  // Fixed the same way the registry fixes it: ONE batched findModelsLive
+  // call for the whole set (well under its own 50-per-chunk cap), not one
+  // call per model.
+  let found;
+  try {
+    const result = await findModelsLive(toProcess.map((c) => c.id), { retries: 2, maxWaitMs: 8000 });
+    found = new Map(result.models.map((m) => [m.endpoint_id, m]));
+  } catch (err) {
+    console.warn(`[Model Discovery] Batch lookup failed (${err.message}) — will retry this whole batch on a later sync.`);
+    return { newlyDiscovered: 0, remaining: candidates.length };
+  }
+  // Real, confirmed bug fixed here: Fal's batched endpoint_id lookup
+  // misses most specific IDs when queried together (confirmed directly
+  // in production — the registry's own thorough check saw a 34/44 miss
+  // rate on the exact same kind of batched query), and this had no
+  // fallback for that at all — anything missed was silently skipped
+  // forever, which is why a 40-candidate batch classified exactly zero.
+  // Reuses the registry's own proven individual-lookup fallback, but
+  // capped to a SMALL number per sync (not all of them) — the registry
+  // only runs its version in rare, manual "thorough" mode; this runs
+  // automatically every 30 minutes, so re-checking dozens of missed IDs
+  // individually every single cycle would just recreate the original
+  // rate-limit storm on a recurring schedule instead of a one-time event.
+  const missed = toProcess.filter((c) => !found.has(c.id));
+  const INDIVIDUAL_FALLBACK_CAP = 8;
+  if (missed.length) {
+    console.log(`[Model Discovery] ${missed.length} model(s) missed the batch lookup — individually double-checking up to ${INDIVIDUAL_FALLBACK_CAP} of them this pass (the rest retry on a later sync).`);
+    for (const candidate of missed.slice(0, INDIVIDUAL_FALLBACK_CAP)) {
+      try {
+        const { models } = await findModelsLive([candidate.id], { retries: 2, maxWaitMs: 8000 });
+        if (models[0]) found.set(candidate.id, models[0]);
+      } catch (err) {
+        console.warn(`[Model Discovery] Individual lookup failed for ${candidate.id} (${err.message}) — will retry on a later sync.`);
+      }
+      await new Promise((r) => setTimeout(r, 2000)); // real pacing — see refreshBrowseCatalog's own tuning notes on why this can't be shorter
+    }
+  }
+  let added = 0;
+  for (const candidate of toProcess) {
+    const live = found.get(candidate.id);
+    if (!live) continue; // not found in this batch — left unprocessed, will be retried next sync rather than guessed at
+    try {
+      const detail = { id: candidate.id, ...extractGuideMetadata(live) };
+      const classification = classifyModelCapabilities(detail.capabilities, {
+        category: detail.category, tags: detail.tags, description: detail.description,
+      });
+      // Only keep what's actually relevant to this app — a real image/
+      // video/audio model with an understandable schema. Everything
+      // else (3D, training, understanding/analysis models, anything the
+      // schema-read failed on) is deliberately left out rather than
+      // cluttering the picker with things this app has no use for.
+      if (classification.classified && classification.mediaType !== "unknown" && classification.workType !== "unknown") {
+        discoveredModelsCache.set(candidate.id, {
+          id: candidate.id,
+          guideMetadata: { displayName: detail.displayName, description: detail.description, category: detail.category, tags: detail.tags, licenseType: detail.licenseType, thumbnailUrl: detail.thumbnailUrl },
+          schemaInfo: detail.capabilities,
+          classification,
+          aiSummary: null, // filled in lazily by a separate, cached synthesis pass — see synthesizeModelSummary
+          discoveredAt: new Date().toISOString(),
+        });
+        added++;
+      } else {
+        // Still recorded (with classified:false) so this candidate isn't
+        // re-fetched forever on every sync — but excluded from anything
+        // user-facing via getDiscoveredModels' classified filter below.
+        discoveredModelsCache.set(candidate.id, { id: candidate.id, classification, discoveredAt: new Date().toISOString(), excluded: true });
+      }
+    } catch (err) {
+      console.warn(`[Model Discovery] Couldn't classify ${candidate.id} (${err.message}) — will retry on a later sync.`);
+    }
+  }
+  persistDiscoveredModels();
+  console.log(`[Model Discovery] Classified ${added} newly-usable model(s) this pass (${toProcess.length - added} excluded/unresolved). ${candidates.length - toProcess.length} still queued for a later sync.`);
+  return { newlyDiscovered: added, remaining: candidates.length - toProcess.length };
+}
+
+// Reader for the merge step in server.js's /api/models — filters out
+// anything Fal has explicitly marked deprecated (cross-checked against
+// the SAME live-status cache the curated registry uses), so a model Fal
+// has dropped disappears from the picker immediately without deleting
+// any of its stored data — fully reversible if it turns out to be a
+// false alarm, exactly the same behavior as the curated registry.
+//
+// Deliberately mirrors the curated registry's own real, already-fixed
+// bug: "missing" (not found via Fal's Find/discovery-index lookup) is
+// NOT the same as "deprecated" — confirmed in production that several
+// real, working, docs-confirmed endpoints come back "missing" from that
+// index simply because Fal doesn't separately index every tier/variant.
+// Only an EXPLICIT "deprecated" status is a trustworthy removal signal.
+function getDiscoveredModels({ mediaType = null } = {}) {
+  return [...discoveredModelsCache.values()]
+    .filter((m) => m.classification?.classified && !m.excluded)
+    .filter((m) => !mediaType || m.classification.mediaType === mediaType)
+    .filter((m) => {
+      const live = liveStatusCache.get(m.id);
+      return !live || live.status !== "deprecated"; // never checked yet, or found active = fine; only an explicit "deprecated" hides it
+    });
+}
+
+// Unified schema-capability lookup — checks the curated registry's own
+// live-checked data first (getGuide, via liveStatusCache), then falls
+// back to an auto-discovered model's own schema (captured once at
+// discovery time, in discoveredModelsCache) if it's not in the curated
+// set. This is what lets request-building code (buildFalImageInput and
+// friends) work identically for a hand-curated model and a model this
+// app has never seen a human look at — one lookup, same real schema
+// facts either way.
+function getModelSchemaInfo(modelId) {
+  const curated = liveStatusCache.get(modelId);
+  if (curated?.capabilities?.detected) return curated.capabilities;
+  const discovered = discoveredModelsCache.get(modelId);
+  if (discovered?.schemaInfo?.detected) return discovered.schemaInfo;
+  return null;
+}
+
+// ============================================================
+// AI-ASSISTED MODEL ENRICHMENT — pure schema/regex classification can
+// tell WHAT a model technically accepts, but not what it's actually
+// GOOD for, or which family/tier it belongs to — that needs either
+// real accumulated usage data (which takes time) or reading its own
+// description with real understanding, which an LLM can do and a
+// regex can't. Uses fal-ai/any-llm (Claude, the same model already
+// used throughout this app for creative-director work) — run ONCE per
+// model and cached, never regenerated, and never allowed to override
+// an OBJECTIVE schema fact (see the contradiction check below). This
+// is enrichment, not a new source of truth: exactly the distinction
+// the person asked for when flagging that the AI doing this can
+// itself be wrong sometimes.
+// ============================================================
+async function synthesizeModelEnrichment(modelId, { guideMetadata, schemaInfo, apiKey }) {
+  if (!apiKey) return null; // can't run without a key — caller decides whether that's fatal
+  const objectiveFacts = {
+    mediaType: guideMetadata?.category || "unknown",
+    hasImageInput: !!schemaInfo?.imageField,
+    maxReferenceImages: schemaInfo?.maxImages || null,
+    hasAudioInput: !!schemaInfo?.audioField,
+    hasDurationControl: !!schemaInfo?.durationField,
+    voiceOptions: schemaInfo?.voiceOptions?.options || null,
+    languageOptions: schemaInfo?.languageOptions?.options || null,
+    allRealFields: schemaInfo?.allFields || [],
+  };
+  const prompt = `You are enriching an entry in an AI model registry with real, honest information — this will be shown directly to users choosing between models, so accuracy matters more than sounding impressive.
+
+MODEL: ${modelId}
+FAL'S OWN LISTING:
+- Display name: ${guideMetadata?.displayName || "unknown"}
+- Description: ${guideMetadata?.description || "none provided"}
+- Category: ${guideMetadata?.category || "unknown"}
+- Tags: ${(guideMetadata?.tags || []).join(", ") || "none"}
+
+OBJECTIVE FACTS ALREADY CONFIRMED FROM ITS REAL SCHEMA — do not contradict these, you may only explain them:
+${JSON.stringify(objectiveFacts, null, 2)}
+
+Based ONLY on the information above (never invent a fact not supported by it), write:
+1. "bestFor": one honest sentence on what this model is actually good for, grounded in its real description/category — not generic marketing language.
+2. "familyGuess": your best guess at which model family/provider lineage this belongs to (e.g. "Google Gemini Image family", "ByteDance Seedream family") — say "unknown" if the name/description doesn't clearly indicate one.
+3. "tierGuess": if the name/description suggests a tier (fast/lite/pro/turbo/hd/standard), name it — otherwise "unknown".
+4. "cautionNotes": anything worth a human double-checking before fully trusting this entry, or an empty string if nothing stands out.
+
+Return ONLY this JSON, no markdown fences: {"bestFor": "...", "familyGuess": "...", "tierGuess": "...", "cautionNotes": "..."}`;
+  try {
+    const response = await falTextRequest(prompt, { apiKey, temperature: 0.3, costMeta: { endpoint: "model-enrichment", model: modelId } });
+    const parsed = JSON.parse(response.text.replace(/```json|```/g, "").trim());
+    // Real, deliberate guard, directly per the person's own caution:
+    // checks the LLM's own output against the objective facts it was
+    // JUST HANDED — not against the real world (no way to verify that
+    // here), but this catches the specific, real failure mode of the
+    // model contradicting information already given to it.
+    const contradictsGivenFacts =
+      objectiveFacts.hasImageInput === false && /\bedit(ing)?\b/i.test(parsed.bestFor || "") && !/\b(creat|generat)/i.test(parsed.bestFor || "");
+    return {
+      ...parsed,
+      aiSynthesized: true,
+      synthesizedAt: new Date().toISOString(),
+      flaggedForReview: contradictsGivenFacts,
+    };
+  } catch (err) {
+    console.warn(`[Model Enrichment] Couldn't synthesize enrichment for ${modelId} (${err.message}) — model stays fully usable with schema-only classification, this just doesn't add the extra writeup.`);
+    return null;
+  }
+}
+// Processes a bounded batch per call, same pacing philosophy as
+// syncDiscoveredModels above — an LLM call costs real money and takes
+// real time per model, more than a schema fetch does, so this runs a
+// smaller batch and only for models already successfully classified
+// (schema-confirmed usable) that don't have enrichment yet.
+const ENRICHMENT_BATCH_SIZE = 10;
+async function enrichDiscoveredModels(apiKey) {
+  if (!apiKey) return { enriched: 0, remaining: 0 };
+  const candidates = [...discoveredModelsCache.values()].filter((m) => m.classification?.classified && !m.excluded && !m.aiEnrichment);
+  if (!candidates.length) return { enriched: 0, remaining: 0 };
+  const toProcess = candidates.slice(0, ENRICHMENT_BATCH_SIZE);
+  let enriched = 0;
+  for (const model of toProcess) {
+    const result = await synthesizeModelEnrichment(model.id, { guideMetadata: model.guideMetadata, schemaInfo: model.schemaInfo, apiKey });
+    if (result) {
+      model.aiEnrichment = result;
+      discoveredModelsCache.set(model.id, model);
+      enriched++;
+    }
+    await new Promise((r) => setTimeout(r, 500)); // gentler than the schema-fetch pacing — a text model call, not the same rate-limit-prone Models API
+  }
+  if (enriched) persistDiscoveredModels();
+  console.log(`[Model Enrichment] Enriched ${enriched}/${toProcess.length} model(s) this pass. ${candidates.length - toProcess.length} still queued for a later sync.`);
+  return { enriched, remaining: candidates.length - toProcess.length };
+}
+
+function getDiscoveryStatus() {
+  const usableModels = [...discoveredModelsCache.values()].filter((m) => m.classification?.classified && !m.excluded);
+  return {
+    totalDiscovered: discoveredModelsCache.size,
+    usable: usableModels.length,
+    enriched: usableModels.filter((m) => m.aiEnrichment).length,
+  };
+}
+
+// ============================================================
+// AUTO-PROMOTION — once a discovered model has earned enough real,
+// successful generations, it becomes a genuine recommended default, not
+// just an available option buried in the dropdown. This is the concrete
+// meaning of "the system gets smarter over time": trust here is built
+// from actual real usage outcomes (the same transactions table the
+// whole ledger already relies on), not a one-time schema check.
+//
+// Deliberately does NOT touch the hardcoded DEFAULT_IMAGE_MODEL_PRO-
+// style constants used deep in the generation pipeline as a last-resort
+// safety net when nothing else is specified anywhere — those stay
+// stable, since they're a genuine fallback of last resort, not a UX
+// choice. What promotion actually changes is what a FRESH session's
+// dropdown pre-selects — see getRecommendedDefaults, consumed by
+// server.js's /api/models.
+// ============================================================
+const PROMOTION_MIN_SUCCESSES = parseInt(process.env.MODEL_PROMOTION_MIN_SUCCESSES, 10) || 15;
+const PROMOTION_MIN_SUCCESS_RATE = parseFloat(process.env.MODEL_PROMOTION_MIN_SUCCESS_RATE) || 0.8;
+function checkPromotionEligibility(modelId) {
+  const stats = db.getModelSuccessStats(modelId);
+  const eligible = stats.successCount >= PROMOTION_MIN_SUCCESSES && stats.successRate >= PROMOTION_MIN_SUCCESS_RATE;
+  return { eligible, ...stats };
+}
+// Returns { image: modelId|null, video: modelId|null, audio: modelId|null }
+// — the best (highest real successCount) promoted discovered model per
+// media type, or null if none has earned promotion yet for that type.
+// The frontend uses this to decide what a fresh session's dropdown
+// pre-selects; falls back to the existing curated default whenever this
+// is null, which is the common case until something genuinely earns it.
+function getRecommendedDefaults() {
+  const byMediaType = {};
+  for (const model of getDiscoveredModels()) {
+    const mediaType = model.classification?.mediaType;
+    if (!mediaType) continue;
+    const promo = checkPromotionEligibility(model.id);
+    if (!promo.eligible) continue;
+    const current = byMediaType[mediaType];
+    if (!current || promo.successCount > current.successCount) {
+      byMediaType[mediaType] = { id: model.id, successCount: promo.successCount, successRate: promo.successRate };
+    }
+  }
+  return {
+    image: byMediaType.image?.id || null,
+    video: byMediaType.video?.id || null,
+    audio: byMediaType.audio?.id || null,
+  };
 }
 
 function searchBrowseCache({ q, category }) {
@@ -388,6 +796,7 @@ function getRefreshMeta() {
 function initFromPersistedCache() {
   const registryFresh = loadPersistedRegistryCache();
   const browseFresh = loadPersistedBrowseCache();
+  loadPersistedDiscoveredModels();
   return { registryFresh, browseFresh };
 }
 
@@ -401,4 +810,13 @@ module.exports = {
   searchBrowseCache,
   getSingleModelDetail,
   initFromPersistedCache,
+  syncDiscoveredModels,
+  getDiscoveredModels,
+  getDiscoveryStatus,
+  getModelSchemaInfo,
+  checkPromotionEligibility,
+  getRecommendedDefaults,
+  enrichDiscoveredModels,
+  getNormalizedStatus,
+  MODEL_STATUS,
 };

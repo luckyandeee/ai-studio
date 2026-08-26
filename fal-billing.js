@@ -47,23 +47,50 @@ async function getRealBalance(adminKey) {
   return { available: true, username: data.username, balance: data.credits?.current_balance ?? null, currency: data.credits?.currency || "USD" };
 }
 
+// Real, confirmed response shape from Fal's own current OpenAPI spec
+// (docs.fal.ai/platform-apis/v1/models/usage) — usage line items are
+// NOT a flat array. They're grouped under time_series[].results[], one
+// bucket per time period, each bucket holding one row per distinct
+// endpoint/price combination active in that period. There is no
+// top-level "items" or "records" field at all — this app's original
+// code assumed one and silently got nothing back for it, which is
+// exactly why this always showed "No usage recorded yet." regardless of
+// real usage. Flattened here into the flat per-line-item shape the
+// frontend already expects, so the frontend needs no changes.
+//
+// Also real and confirmed: Fal defaults "start" to 24 HOURS ago if not
+// specified — so even with the parsing fixed, anything older than a day
+// would still never show up unless a wider range is requested
+// explicitly. Defaulted to 30 days here (Fal caps the range at 90).
 async function getRealUsage(adminKey, { start, end, cursor, limit = 100 } = {}) {
   const headers = adminAuthHeaders(adminKey);
   if (!headers) {
     return { available: false, reason: "No Fal Admin API Key configured — add one in Settings to see your real usage history here." };
   }
   const params = new URLSearchParams();
-  if (start) params.set("start", start);
+  params.set("start", start || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
   if (end) params.set("end", end);
   if (cursor) params.set("cursor", cursor);
   params.set("limit", String(Math.min(limit, 200)));
+  params.set("expand", "time_series");
   const res = await fetch(`${API_BASE}/models/usage?${params.toString()}`, { headers });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     return { available: false, reason: `Fal usage API returned ${res.status}: ${body.slice(0, 200)}` };
   }
   const data = await res.json();
-  return { available: true, ...data };
+  const items = (data.time_series || []).flatMap((bucket) =>
+    (bucket.results || []).map((r) => ({
+      timestamp: bucket.bucket,
+      endpoint_id: r.endpoint_id,
+      quantity: r.quantity,
+      unit: r.unit,
+      unit_price: r.unit_price,
+      cost_total: r.cost_total,
+      currency: r.currency,
+    }))
+  );
+  return { available: true, items, next_cursor: data.next_cursor, has_more: data.has_more };
 }
 
 // Pricing appears to work with a regular (non-admin) key per Fal's own

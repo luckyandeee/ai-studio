@@ -28,6 +28,7 @@ const path = require("path");
 const db = require("./db");
 const progress = require("./progress");
 const { estimateImageCost, estimateVideoCost } = require("./fal-models");
+const { getRealBalance } = require("./fal-billing");
 
 function configureFal(apiKey) {
   if (apiKey) fal.config({ credentials: apiKey });
@@ -52,15 +53,80 @@ function configureFal(apiKey) {
 const MAX_CONCURRENT_FAL_CALLS = parseInt(process.env.FAL_MAX_CONCURRENCY, 10) || 3;
 let activeFalCalls = 0;
 const falCallWaitQueue = [];
+
+// ============================================================
+// SPEND GUARD (real balance, HARD BLOCK) — Fal has no API to pause
+// spending after the fact, and letting a pay-as-you-go account go
+// negative is worth avoiding rather than discovering after the fact, so
+// the only real lever is refusing to place a call before it happens.
+// Checked right here, in the single choke point every paid Fal call
+// already passes through (withConcurrencyLimit) — applies everywhere in
+// the app automatically, no need to touch the 59+ individual call sites.
+//
+// Real, deliberate scope limit: this uses process.env.FAL_ADMIN_KEY
+// specifically, NOT whatever admin key a person may have typed into the
+// Settings UI (that one only powers the Credits panel's manual
+// balance/usage lookup, sent per-request from the browser — threading
+// it down into this shared low-level module for every one of dozens of
+// call sites would be a much bigger change for uncertain benefit on a
+// single-tenant, self-hosted app like this one). For this guard to
+// actually block anything, FAL_ADMIN_KEY needs to be set in the
+// server's own .env — same key type, just configured server-side
+// instead of typed into the browser each time.
+//
+// Balance is cached briefly rather than fetched on every single call —
+// it doesn't change fast enough within a 60s window to justify hitting
+// Fal's own billing API that often, and doing so on every one of
+// potentially dozens of calls in a batch run would be wasteful.
+// ============================================================
+const REAL_BALANCE_CACHE_MS = 60 * 1000;
+const REAL_BALANCE_SAFETY_MARGIN_USD = parseFloat(process.env.FAL_BALANCE_SAFETY_MARGIN) || 0.5;
+let realBalanceCache = { value: null, checkedAt: 0 };
+async function checkRealBalanceGuard() {
+  const adminKey = process.env.FAL_ADMIN_KEY;
+  if (!adminKey) return { blocked: false }; // can't check without one — see note above; not an error, just an unguarded state
+  const now = Date.now();
+  if (realBalanceCache.value == null || now - realBalanceCache.checkedAt > REAL_BALANCE_CACHE_MS) {
+    try {
+      const real = await getRealBalance(adminKey);
+      if (real?.available && typeof real.balance === "number") {
+        realBalanceCache = { value: real.balance, checkedAt: now };
+      } else {
+        return { blocked: false }; // key present but balance unavailable (wrong scope, Fal outage, etc.) — fail open rather than blocking everything on a lookup problem
+      }
+    } catch (err) {
+      console.warn(`[Spend Guard] Couldn't check real Fal balance (${err.message}) — proceeding without this check this time.`);
+      return { blocked: false };
+    }
+  }
+  if (realBalanceCache.value <= REAL_BALANCE_SAFETY_MARGIN_USD) {
+    return {
+      blocked: true,
+      reason: `Real Fal account balance is $${realBalanceCache.value.toFixed(2)}, at or below the $${REAL_BALANCE_SAFETY_MARGIN_USD.toFixed(2)} safety margin — refusing this call to avoid the account going negative. Add funds at https://fal.ai/dashboard/billing, then try again.`,
+    };
+  }
+  return { blocked: false };
+}
 function withConcurrencyLimit(fn) {
   return new Promise((resolve, reject) => {
-    const run = () => {
+    const run = async () => {
       activeFalCalls++;
-      fn().then(resolve, reject).finally(() => {
+      try {
+        const guard = await checkRealBalanceGuard();
+        if (guard.blocked) {
+          const err = new Error(guard.reason);
+          err.isSpendGuardBlock = true;
+          err.status = 402;
+          throw err;
+        }
+        resolve(await fn());
+      } catch (err) {
+        reject(err);
+      } finally {
         activeFalCalls--;
         const next = falCallWaitQueue.shift();
         if (next) next();
-      });
+      }
     };
     if (activeFalCalls < MAX_CONCURRENT_FAL_CALLS) run();
     else falCallWaitQueue.push(run);
@@ -132,7 +198,25 @@ function diagnoseFalError(err) {
     (/"loc":\s*\[\s*"body"\s*,\s*"image_urls"/i.test(text || "") ||
       /partner_validation_failed/i.test(text || "") ||
       /likeness/i.test(text || ""));
-  return { status, detail: text || `HTTP ${status || "unknown"}`, isSafetyBlock, isImageContentBlock, isSchemaValidationError };
+  // Extracts what field was wrong AND what Fal's own validator actually
+  // expected, straight from its structured error body — this is the raw
+  // material a self-correction can be learned from (see
+  // parseSchemaCorrectionFromError in server.js), not a guess about what
+  // the format should be.
+  let schemaErrorField = null, schemaErrorExpected = null;
+  if (isSchemaValidationError) {
+    const locMatch = text.match(/"loc":\s*\[\s*"body"\s*,\s*"(duration|aspect_ratio|resolution|fps|bitrate_mode)"/i);
+    schemaErrorField = locMatch?.[1] || null;
+    // Pydantic's literal_error msg is typically "Input should be 'X'" or
+    // "Input should be 'X', 'Y' or 'Z'" for an enum — pulls every quoted
+    // value out of that, which works for both shapes.
+    const msgMatch = text.match(/"msg":\s*"([^"]*)"/i);
+    if (msgMatch) {
+      const quoted = [...msgMatch[1].matchAll(/'([^']+)'/g)].map((m) => m[1]);
+      schemaErrorExpected = quoted.length ? quoted : null;
+    }
+  }
+  return { status, detail: text || `HTTP ${status || "unknown"}`, isSafetyBlock, isImageContentBlock, isSchemaValidationError, schemaErrorField, schemaErrorExpected };
 }
 
 // ============================================================
@@ -422,6 +506,40 @@ async function downloadFalVideo(url, destFilename) {
   return `/generated-videos/${destFilename}`;
 }
 
+// Same real reasoning as video, confirmed as an actual gap: falImageRequest
+// returns Fal's own CDN URL directly, and until now nothing ever downloaded
+// it — that URL (and only that URL) is what got shown in the gallery AND
+// saved into run_items/campaigns for later reload. Fal's own URLs are only
+// guaranteed available for a handful of days, so every generated product
+// photo was silently going dead after that — not just in the current
+// session, but permanently in saved campaign history too, with no way to
+// recover it. Mirrors downloadFalVideo exactly, serving from its own
+// subfolder so it's clearly distinct from user-uploaded product images.
+const IMAGE_OUTPUT_DIR = path.join(__dirname, "public", "generated-images");
+function ensureImageDir() {
+  if (!fs.existsSync(IMAGE_OUTPUT_DIR)) fs.mkdirSync(IMAGE_OUTPUT_DIR, { recursive: true });
+}
+async function downloadFalImage(url, destFilename) {
+  ensureImageDir();
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Failed to download the generated image (HTTP ${resp.status}).`);
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  fs.writeFileSync(path.join(IMAGE_OUTPUT_DIR, destFilename), buffer);
+  return `/generated-images/${destFilename}`;
+}
+// Best-effort wrapper for call sites that display/persist a result but
+// shouldn't fail the whole request if the download hiccups — falls back
+// to Fal's own (eventually-expiring) URL rather than losing the image
+// outright, and logs loudly so a real, systemic failure doesn't go quiet.
+async function persistFalImage(url, destFilename) {
+  try {
+    return await downloadFalImage(url, destFilename);
+  } catch (err) {
+    console.warn(`[Image Persistence] Failed to download for permanent storage (${err.message}) — falling back to Fal's own URL, which will expire in a few days.`);
+    return url;
+  }
+}
+
 // Downloads a remote image (e.g. Fal's own CDN URL) and returns it as a
 // base64 data URI. Needed specifically because the BROWSER can't
 // reliably do this itself — a cross-origin fetch() to read another
@@ -475,7 +593,7 @@ async function falVideoRequest(
   } catch (err) {
     const diag = diagnoseFalError(err);
     if (costMeta) db.recordTransaction({ ...costMeta, model: modelId, status: diag.isSafetyBlock ? "blocked" : "error", note: diag.detail, cost: 0 });
-    throw Object.assign(new Error(`Video generation failed (${modelId}): ${diag.detail}`), { isSafetyBlock: diag.isSafetyBlock, isImageContentBlock: diag.isImageContentBlock, isSchemaValidationError: diag.isSchemaValidationError, filterReasons: diag.isSafetyBlock ? [diag.detail] : [] });
+    throw Object.assign(new Error(`Video generation failed (${modelId}): ${diag.detail}`), { isSafetyBlock: diag.isSafetyBlock, isImageContentBlock: diag.isImageContentBlock, isSchemaValidationError: diag.isSchemaValidationError, schemaErrorField: diag.schemaErrorField, schemaErrorExpected: diag.schemaErrorExpected, filterReasons: diag.isSafetyBlock ? [diag.detail] : [] });
   }
   const videoUrl = extractVideoUrl(result);
   if (!videoUrl) {
@@ -525,4 +643,5 @@ module.exports = {
   withConcurrencyLimit,
   isCircuitOpen,
   downloadImageAsDataUri,
+  persistFalImage,
 };

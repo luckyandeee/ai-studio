@@ -5,8 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
-    
+    "dev": "nodemon server.js",
+    "frontend": "vite"
   },
   "dependencies": {
     "@fal-ai/client": "^1.2.0",

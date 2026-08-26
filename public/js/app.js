@@ -264,6 +264,47 @@ async function fetchJson(url, options = {}, timeoutMs = 20 * 60 * 1000) {
   return { res, data };
 }
 const ACTIVE_RUN_KEY = "studio_active_run_v1";
+// ============================================================
+// ADVANCED MODE — power-user surfaces (Model Trust, custom model ID
+// options, reasoning/vision model overrides, live model catalog) are
+// hidden by default via the .advanced-only/.simple-only CSS classes
+// (see style.css) and only shown once this is turned on. Persisted so
+// it doesn't reset every reload, same pattern as the active-run/budget
+// settings below.
+// ============================================================
+const ADVANCED_MODE_KEY = "studio_advanced_mode_v1";
+function applyAdvancedMode(enabled) {
+  document.body.classList.toggle("advanced-mode", enabled);
+  const toggleEl = document.getElementById("advancedModeToggle");
+  if (toggleEl) toggleEl.checked = enabled;
+}
+(function initAdvancedMode() {
+  let enabled = false;
+  try { enabled = localStorage.getItem(ADVANCED_MODE_KEY) === "1"; } catch (e) {}
+  applyAdvancedMode(enabled);
+})();
+document.getElementById("advancedModeToggle")?.addEventListener("change", (e) => {
+  const enabled = e.target.checked;
+  applyAdvancedMode(enabled);
+  try { localStorage.setItem(ADVANCED_MODE_KEY, enabled ? "1" : "0"); } catch (err) {}
+  logActivity("info", `Advanced mode ${enabled ? "on" : "off"} — power-user model controls are now ${enabled ? "visible" : "hidden"}.`);
+});
+// Real, confirmed gap: none of the three results sections (single-mode
+// photoshoot, batch, video) ever had a way to hide themselves again once
+// shown — only reloading the page or switching modes entirely got rid of
+// them. These just toggle the section back to d-none; the underlying
+// results (state.imageHistory / state.videoHistory etc.) are untouched,
+// so nothing is actually lost — showing results again (e.g. re-opening
+// Video Library) works exactly as before.
+document.getElementById("hidePhotoshootResultsBtn")?.addEventListener("click", () => {
+  document.getElementById("photoshootResultsSection")?.classList.add("d-none");
+});
+document.getElementById("hideBatchResultsBtn")?.addEventListener("click", () => {
+  dom.batchResultsSection?.classList.add("d-none");
+});
+document.getElementById("hideVideoResultsBtn")?.addEventListener("click", () => {
+  dom.videoResultsSection?.classList.add("d-none");
+});
 function saveActiveRun(runId, mode) {
   try { localStorage.setItem(ACTIVE_RUN_KEY, JSON.stringify({ runId, mode, savedAt: Date.now() })); } catch (e) {}
 }
@@ -301,6 +342,7 @@ async function resumeRun(saved, statusData) {
       alert(`Resumed — ${doneFrames.length} frame(s) already done, won't be re-billed. Re-upload the product/reference photo, then Approve & Launch to finish the rest.`);
     }
   } else if (saved.mode === "batch") {
+    showAppMode("batch");
     if (statusData.campaign) {
       const bn = document.getElementById("batchBrandName");
       const pd = document.getElementById("batchProductDesc");
@@ -802,9 +844,10 @@ window.alert = function (message) {
 
 // ============================================================
 // RELIABILITY HEALTH — quota (429, YOUR account cap) vs overload (503,
-// Google's own servers) are DELIBERATELY kept as two separate signals,
-// never merged into one generic "there was a problem" warning, because
-// they mean different things and call for different reactions.
+// Fal's own servers / the underlying model provider) are DELIBERATELY
+// kept as two separate signals, never merged into one generic "there
+// was a problem" warning, because they mean different things and call
+// for different reactions.
 // ============================================================
 async function refreshReliabilityHealth() {
   try {
@@ -822,12 +865,12 @@ function updateReliabilityNavBadge(health) {
   if (health.quota.warn) {
     badge.classList.remove("d-none", "bg-warning");
     badge.classList.add("bg-danger");
-    badge.title = `Quota limit hit ${health.quota.count}x in the last hour (${health.quota.models.join(", ") || "recent calls"}). This is YOUR account's usage cap — waiting is the fix. Check https://aistudio.google.com/rate-limit.`;
+    badge.title = `Quota/rate limit hit ${health.quota.count}x in the last hour (${health.quota.models.join(", ") || "recent calls"}). This is YOUR account's usage cap on Fal — waiting (or raising your concurrency/tier) is the fix. Check https://fal.ai/dashboard/billing.`;
     badge.innerText = "⚠️ Quota";
   } else if (health.overload.warn) {
     badge.classList.remove("d-none", "bg-danger");
     badge.classList.add("bg-warning");
-    badge.title = `Google's servers reported overload ${health.overload.count}x in the last hour (${health.overload.models.join(", ") || "recent calls"}) — not your usage cap, usually temporary.`;
+    badge.title = `Fal reported overload/unavailability ${health.overload.count}x in the last hour (${health.overload.models.join(", ") || "recent calls"}) — not your usage cap, usually temporary (a specific model provider under heavy demand).`;
     badge.innerText = "🌐 Overload";
   } else {
     badge.classList.add("d-none");
@@ -841,7 +884,7 @@ async function warnIfReliabilityIssues() {
   if (health.quota.warn) {
     showToast(`⚠️ Quota limit hit ${health.quota.count}x in the last hour (${health.quota.models.join(", ") || "recent calls"}) — this is YOUR account's usage cap. Consider waiting before continuing.`, "danger");
   } else if (health.overload.warn) {
-    showToast(`🌐 Google's servers reported overload ${health.overload.count}x in the last hour — not your usage cap, usually temporary. The app will keep retrying through it.`, "warning");
+    showToast(`🌐 Fal reported overload ${health.overload.count}x in the last hour — not your usage cap, usually temporary. The app will keep retrying through it.`, "warning");
   }
 }
 // Polls the already-existing /api/run-status endpoint WHILE a video request
@@ -1018,6 +1061,7 @@ function renderVideoResults(videos, errors, { append = true } = {}) {
           <button type="button" class="btn btn-sm btn-outline-primary px-2 py-1" data-download-url="${v.url}" data-download-filename="${buildDownloadFilename([document.getElementById("brandName")?.value || document.getElementById("batchBrandName")?.value, v.label], "mp4")}">📥</button>
         </div>
         ${v.note ? `<div class="px-2 pb-2 xx-small text-muted">${v.note}</div>` : ""}
+        ${v.runSpend ? `<div class="px-2 pb-1 xx-small text-muted">💳 $${v.runSpend.spent.toFixed(3)} for this run <span class="text-muted">(${v.runSpend.callCount} call${v.runSpend.callCount === 1 ? "" : "s"})</span></div>` : ""}
         ${v.sourceImages?.length ? `
         <div class="px-2 pb-2">
           <textarea class="form-control form-control-sm mb-1" rows="2" placeholder="Describe a change and regenerate (optional — leave blank to just retry as-is)" data-video-edit-instruction="${cardId}"></textarea>
@@ -1222,12 +1266,33 @@ async function loadModelRegistry() {
     populateMusicModelSelects();
     state.customVoices = data.customVoices || [];
     state.modelDefaults = data.defaults || {};
+    state.recommendedDefaults = data.recommendedDefaults || {};
     state.imageResolutions = data.imageResolutions || [];
     state.confirmedLikenessBlockModels = data.confirmedLikenessBlockModels || [];
     populateStaticModelSelect(dom.globalImageModelSelect, state.imageModels);
     populateStaticModelSelect(dom.globalBatchImageModelSelect, state.imageModels);
     populateStaticModelSelect(dom.wizardImageModelSelect, state.imageModels);
     populateStaticModelSelect(dom.globalVideoModelSelect, state.videoModels);
+    // Auto-promotion — a discovered model that's earned enough real
+    // successful generations becomes the actual pre-selected dropdown
+    // value for a fresh session, not just an available option buried in
+    // the list (see getRecommendedDefaults in fal-catalog.js). Only
+    // applies when nothing was already explicitly chosen (the select is
+    // still on its placeholder "Auto" option) — a routine model-list
+    // refresh must never silently override a deliberate pick.
+    const applyRecommendedDefault = (selectEl, modelId) => {
+      if (!selectEl || !modelId) return;
+      if (selectEl.value) return; // something (Auto placeholder has a real value too, or an explicit pick) is already set — leave it alone
+      if ([...selectEl.options].some((o) => o.value === modelId)) selectEl.value = modelId;
+    };
+    if (state.recommendedDefaults.image) {
+      applyRecommendedDefault(dom.globalImageModelSelect, state.recommendedDefaults.image);
+      applyRecommendedDefault(dom.globalBatchImageModelSelect, state.recommendedDefaults.image);
+      applyRecommendedDefault(dom.wizardImageModelSelect, state.recommendedDefaults.image);
+    }
+    if (state.recommendedDefaults.video) {
+      applyRecommendedDefault(dom.globalVideoModelSelect, state.recommendedDefaults.video);
+    }
     updateImageToolModelOptions();
     updateVoiceStudioModelOptions();
     populateResolutionSelect(dom.globalImageResolutionSelect, state.imageResolutions, state.modelDefaults.imageResolution);
@@ -1291,11 +1356,19 @@ dom.refreshModelsBtn?.addEventListener("click", async () => {
     if (!res.ok || !data.ok) {
       logActivity("warning", `Model catalog check failed: ${data.error || "unknown error"} — existing list unchanged.`);
     } else if (data.flaggedCount > 0) {
-      logActivity("warning", `Model catalog check complete: ${data.flaggedCount} of ${data.checkedCount} model(s) confirmed deprecated/missing and removed from the dropdowns.`);
+      // Real, confirmed bug fixed here: this said "deprecated/missing" as
+      // if those were the same uncertain thing — but flaggedCount only
+      // ever counts a model Fal explicitly marked deprecated (see
+      // refreshModelLiveStatus's own removed/notInDiscoveryIndex/
+      // notYetVerified split, already correctly separated on the
+      // backend). "Missing" or "unverified" never appear in this count
+      // and never get removed — the wording just wasn't reflecting that.
+      const verifiedCount = data.checkedCount - data.flaggedCount - (data.unindexedCount || 0);
+      logActivity("warning", `Catalog synced: ${verifiedCount} verified, ${data.flaggedCount} confirmed deprecated (removed)${data.unindexedCount ? `, ${data.unindexedCount} pending verification` : ""}.`);
     } else if (data.unindexedCount > 0) {
-      logActivity("info", `Model catalog check complete: all ${data.checkedCount} model(s) still available (${data.unindexedCount} couldn't be fully confirmed this pass, but that doesn't mean broken).`);
+      logActivity("info", `Catalog synced: all ${data.checkedCount} model(s) still available — ${data.unindexedCount} couldn't be fully confirmed this pass, which doesn't mean broken, just not yet double-checked.`);
     } else {
-      logActivity("success", `Model catalog check complete: all ${data.checkedCount} model(s) confirmed active.`);
+      logActivity("success", `Catalog synced: all ${data.checkedCount} model(s) verified active.`);
     }
     await loadModelRegistry();
   } catch (err) {
@@ -1459,7 +1532,7 @@ dom.browseModelsBtn?.addEventListener("click", () => {
   // Sequence the modal swap on Bootstrap's own hide event instead of
   // firing both at once — opening a second modal before the first has
   // finished closing causes a leftover/duplicate backdrop in Bootstrap 5.
-  const openExplorer = () => new bootstrap.Modal(document.getElementById("modelExplorerModal")).show();
+  const openExplorer = () => new bootstrap.Modal(document.getElementById("browseCatalogModal")).show();
   if (settingsInstance) {
     settingsModalEl.addEventListener("hidden.bs.modal", openExplorer, { once: true });
     settingsInstance.hide();
@@ -1474,6 +1547,19 @@ dom.browseModelsBtn?.addEventListener("click", () => {
 // listener that shows/focuses the custom input (see readModelSelectEl's
 // neighbor above) is delegated and only fires on a real "change" event,
 // so setting .value alone isn't enough — it has to be dispatched.
+document.getElementById("globalSeedRandomizeBtn")?.addEventListener("click", () => {
+  const input = document.getElementById("globalSeedInput");
+  if (input) {
+    // Real 32-bit range — matches what Nano Banana Pro/2's own seed
+    // field actually accepts (a standard integer seed), not an
+    // arbitrary made-up range.
+    input.value = Math.floor(Math.random() * 2147483647);
+  }
+});
+document.getElementById("globalBatchSeedRandomizeBtn")?.addEventListener("click", () => {
+  const input = document.getElementById("globalBatchSeedInput");
+  if (input) input.value = Math.floor(Math.random() * 2147483647);
+});
 function applyModelAsCustom(selectId, modelId) {
   const selectEl = document.getElementById(selectId);
   if (!selectEl) return false;
@@ -1483,6 +1569,164 @@ function applyModelAsCustom(selectId, modelId) {
   if (customInput) customInput.value = modelId;
   return true;
 }
+
+// ============================================================
+// MODEL EXPLORER (Phase 4) — the search/sort/favorites HTML for this
+// already existed (modelExplorerSearch/Sort/FavoritesOnly/Results), but
+// had genuinely zero JavaScript behind it anywhere in this file, and
+// its container even shared a duplicate id with an unrelated older
+// modal (fixed separately — see browseCatalogModal). This is the real
+// implementation: fetches the live Provider -> Family -> Variant tree
+// (with capabilities/cost already enriched server-side) from
+// /api/models/explorer, and lets a person search/sort/favorite/select
+// from it into whichever model dropdown actually opened it.
+// ============================================================
+const MODEL_EXPLORER_FAVORITES_KEY = "studio_model_favorites_v1";
+function getModelFavorites() {
+  try { return new Set(JSON.parse(localStorage.getItem(MODEL_EXPLORER_FAVORITES_KEY) || "[]")); } catch (e) { return new Set(); }
+}
+function toggleModelFavorite(modelId) {
+  const favs = getModelFavorites();
+  favs.has(modelId) ? favs.delete(modelId) : favs.add(modelId);
+  try { localStorage.setItem(MODEL_EXPLORER_FAVORITES_KEY, JSON.stringify([...favs])); } catch (e) {}
+  return favs.has(modelId);
+}
+let modelExplorerState = { flatModels: [], targetSelectId: null, mediaType: null };
+function flattenExplorerTree(tree) {
+  const flat = [];
+  for (const [provider, families] of Object.entries(tree)) {
+    for (const [family, models] of Object.entries(families)) {
+      for (const m of models) flat.push({ ...m, provider, family });
+    }
+  }
+  return flat;
+}
+// Normalized status (Section 2's 8-state model) -> a short badge label +
+// Bootstrap color class. "verified"/"discovered" intentionally aren't
+// alarming colors — per this app's own hard-learned lesson, "not yet
+// fully confirmed" is not the same as "broken."
+const EXPLORER_STATUS_BADGE = {
+  selectable: { label: "Ready", cls: "bg-success" },
+  supported: { label: "Ready", cls: "bg-success" },
+  verified: { label: "Verified", cls: "bg-info text-dark" },
+  discovered: { label: "New", cls: "bg-secondary" },
+  failed: { label: "Issues", cls: "bg-danger" },
+  deprecated: { label: "Deprecated", cls: "bg-danger" },
+  unavailable: { label: "Unavailable", cls: "bg-danger" },
+  unknown: { label: "Unknown", cls: "bg-secondary" },
+};
+function renderModelExplorerResults() {
+  const resultsEl = document.getElementById("modelExplorerResults");
+  if (!resultsEl) return;
+  const query = (document.getElementById("modelExplorerSearch")?.value || "").trim().toLowerCase();
+  const sort = document.getElementById("modelExplorerSort")?.value || "default";
+  const favoritesOnly = document.getElementById("modelExplorerFavoritesOnly")?.checked;
+  const favorites = getModelFavorites();
+  let items = modelExplorerState.flatModels.filter((m) => {
+    if (favoritesOnly && !favorites.has(m.id)) return false;
+    if (!query) return true;
+    return `${m.id} ${m.label} ${m.provider} ${m.family}`.toLowerCase().includes(query);
+  });
+  if (sort === "cost-asc") {
+    items = [...items].sort((a, b) => (a.estimatedCost ?? Infinity) - (b.estimatedCost ?? Infinity));
+  } else if (sort === "favorites") {
+    items = [...items].sort((a, b) => (favorites.has(b.id) ? 1 : 0) - (favorites.has(a.id) ? 1 : 0));
+  }
+  if (!items.length) {
+    resultsEl.innerHTML = `<div class="text-muted small p-3">No models match${query ? ` "${escapeHtml(query)}"` : ""}${favoritesOnly ? " in your favorites" : ""}.</div>`;
+    return;
+  }
+  // Grouped by Provider > Family for readability, in whatever order
+  // sorting above already produced (so "cheapest first" still reads
+  // cheapest-first within the grouped view, not re-alphabetized away).
+  const groups = new Map();
+  items.forEach((m) => {
+    const key = `${m.provider} · ${m.family}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(m);
+  });
+  resultsEl.innerHTML = [...groups.entries()]
+    .map(([groupLabel, models]) => `
+      <div class="mb-2">
+        <div class="text-muted xx-small fw-bold text-uppercase mt-2 mb-1">${escapeHtml(groupLabel)}</div>
+        ${models.map((m) => {
+          const badge = EXPLORER_STATUS_BADGE[m.status?.status] || EXPLORER_STATUS_BADGE.unknown;
+          const isFav = favorites.has(m.id);
+          const cost = m.estimatedCost != null ? `$${Number(m.estimatedCost).toFixed(3)}${m.capabilities?.mediaType === "video" ? "/sec" : m.capabilities?.mediaType === "audio" ? "/gen" : ""}` : "—";
+          const caps = [];
+          if (m.capabilities?.imageInput?.supported) caps.push(`📎 up to ${m.capabilities.imageInput.maxReferenceImages || "?"} refs`);
+          if (m.capabilities?.voices) caps.push(`🎙️ ${m.capabilities.voices} voices`);
+          if (m.capabilities?.languages?.length) caps.push(`🌐 ${m.capabilities.languages.length} languages`);
+          if (m.capabilities?.negativePrompt) caps.push("🚫 negative prompt");
+          return `
+          <div class="d-flex justify-content-between align-items-start border rounded p-2 mb-1 model-explorer-card" data-explorer-select-id="${escapeHtml(m.id)}" data-explorer-select-label="${escapeHtml(m.label)}" style="cursor:pointer;">
+            <div class="flex-grow-1 me-2">
+              <div class="d-flex align-items-center gap-2 flex-wrap">
+                <span class="fw-semibold small">${escapeHtml(m.label)}</span>
+                <span class="badge ${badge.cls}" style="font-size:0.65rem;">${badge.label}</span>
+                ${m.source === "discovered" ? '<span class="badge bg-light text-dark border" style="font-size:0.65rem;">🆕 auto-discovered</span>' : ""}
+              </div>
+              ${m.capabilities?.bestFor ? `<div class="xx-small text-muted mt-1">${escapeHtml(m.capabilities.bestFor)}</div>` : ""}
+              ${caps.length ? `<div class="xx-small text-muted mt-1">${caps.join(" · ")}</div>` : ""}
+            </div>
+            <div class="d-flex flex-column align-items-end flex-shrink-0 gap-1">
+              <span class="small text-muted">${cost}</span>
+              <button type="button" class="btn btn-sm p-0 border-0" data-explorer-fav-id="${escapeHtml(m.id)}" title="${isFav ? "Remove favorite" : "Add favorite"}">${isFav ? "⭐" : "☆"}</button>
+            </div>
+          </div>`;
+        }).join("")}
+      </div>`)
+    .join("");
+  resultsEl.querySelectorAll("[data-explorer-fav-id]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleModelFavorite(btn.getAttribute("data-explorer-fav-id"));
+      renderModelExplorerResults(); // re-render so the star and any favorites-first sort reflect the change immediately
+    });
+  });
+  resultsEl.querySelectorAll("[data-explorer-select-id]").forEach((card) => {
+    card.addEventListener("click", () => {
+      const modelId = card.getAttribute("data-explorer-select-id");
+      const modelLabel = card.getAttribute("data-explorer-select-label");
+      if (!modelExplorerState.targetSelectId) return;
+      const selectEl = document.getElementById(modelExplorerState.targetSelectId);
+      const hasOption = selectEl && [...selectEl.options].some((o) => o.value === modelId);
+      if (hasOption) {
+        selectEl.value = modelId;
+        selectEl.dispatchEvent(new Event("change", { bubbles: true }));
+      } else {
+        applyModelAsCustom(modelExplorerState.targetSelectId, modelId);
+      }
+      logActivity("success", `Set "${modelLabel}" as the model for this step.`);
+      bootstrap.Modal.getInstance(document.getElementById("modelExplorerModal"))?.hide();
+    });
+  });
+}
+async function openModelExplorerFor(targetSelectId, mediaType) {
+  modelExplorerState.targetSelectId = targetSelectId;
+  modelExplorerState.mediaType = mediaType;
+  const badgeEl = document.getElementById("modelExplorerMediaTypeBadge");
+  if (badgeEl) badgeEl.textContent = mediaType ? mediaType[0].toUpperCase() + mediaType.slice(1) : "";
+  const resultsEl = document.getElementById("modelExplorerResults");
+  if (resultsEl) resultsEl.innerHTML = `<div class="text-muted small p-3">Loading...</div>`;
+  new bootstrap.Modal(document.getElementById("modelExplorerModal")).show();
+  try {
+    const { res, data } = await fetchJson(`/api/models/explorer${mediaType ? `?mediaType=${encodeURIComponent(mediaType)}` : ""}`);
+    if (!res.ok) throw new Error(data.error || "Failed to load models.");
+    modelExplorerState.flatModels = flattenExplorerTree(data.tree);
+    renderModelExplorerResults();
+  } catch (err) {
+    if (resultsEl) resultsEl.innerHTML = `<div class="text-danger small p-3">Couldn't load the model list: ${escapeHtml(err.message)}</div>`;
+  }
+}
+document.querySelectorAll("[data-model-explorer-btn]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    openModelExplorerFor(btn.getAttribute("data-model-explorer-btn"), btn.getAttribute("data-media-type"));
+  });
+});
+document.getElementById("modelExplorerSearch")?.addEventListener("input", renderModelExplorerResults);
+document.getElementById("modelExplorerSort")?.addEventListener("change", renderModelExplorerResults);
+document.getElementById("modelExplorerFavoritesOnly")?.addEventListener("change", renderModelExplorerResults);
 
 // Live search across Fal's ENTIRE catalog (not just this app's curated
 // list) — results include a real schema-derived example snippet, same
@@ -1575,7 +1819,7 @@ async function runModelSearch() {
         applyModelAsCustom(selectId, modelId);
         logActivity("success", `Set "${modelLabel}" (${modelId}) as the custom ${target} model — check the ${target === "video" ? "Video Brief" : "Photoshoot"} setup.`);
         showToast(`✅ "${modelLabel}" is now your custom ${target} model.`, "success");
-        bootstrap.Modal.getInstance(document.getElementById("modelExplorerModal"))?.hide();
+        bootstrap.Modal.getInstance(document.getElementById("browseCatalogModal"))?.hide();
       });
     });
   } catch (err) {
@@ -1640,7 +1884,7 @@ document.getElementById("modelBrowseRefreshBtn")?.addEventListener("click", asyn
 // Load the full catalog automatically the first time the Explorer opens,
 // per the actual ask: browse everything up front, don't require someone
 // to already know what to search for.
-document.getElementById("modelExplorerModal")?.addEventListener("shown.bs.modal", () => {
+document.getElementById("browseCatalogModal")?.addEventListener("shown.bs.modal", () => {
   if (!document.getElementById("modelSearchResults").dataset.loaded) {
     document.getElementById("modelSearchResults").dataset.loaded = "1";
     runModelSearch();
@@ -1660,6 +1904,34 @@ async function loadTrustSummary() {
     const { res, data } = await fetchJson("/api/models/trust-summary");
     if (!res.ok) throw new Error(data.error || "Failed to load.");
     const sections = [];
+    // Real catalog-level status (Section 2's normalized states) — leads
+    // the panel since "is this model even still active" is the more
+    // fundamental question than generation-quality trust below it. A
+    // calm one-line summary by default; only the states genuinely worth
+    // a human looking at (deprecated/failed/unavailable) get their own
+    // detail — everything "selectable" is just noise to list out.
+    if (data.catalogStatus) {
+      const { byState, needsAttention } = data.catalogStatus;
+      const total = Object.values(byState).reduce((a, b) => a + b, 0);
+      const readyCount = (byState.selectable || 0) + (byState.supported || 0);
+      const summaryParts = [`${readyCount} ready`];
+      if (byState.verified) summaryParts.push(`${byState.verified} verified`);
+      if (byState.discovered) summaryParts.push(`${byState.discovered} newly discovered`);
+      if (byState.unknown) summaryParts.push(`${byState.unknown} unknown`);
+      sections.push(`
+        <div class="mb-3">
+          <div class="fw-bold small mb-1">📦 Model catalog status</div>
+          <div class="xx-small text-muted mb-2">${total} model(s) tracked — ${summaryParts.join(", ")}${needsAttention.length ? `, ${needsAttention.length} needing attention` : ""}.</div>
+          ${needsAttention.length ? needsAttention.map((m) => `
+            <div class="border rounded p-2 mb-1 bg-light">
+              <div class="d-flex justify-content-between align-items-start">
+                <code class="xx-small">${escapeHtml(m.id)}</code>
+                <span class="badge ${m.status === "deprecated" ? "bg-danger" : m.status === "failed" ? "bg-warning text-dark" : "bg-secondary"}">${escapeHtml(m.status)}</span>
+              </div>
+              <div class="text-muted xx-small">${escapeHtml(m.reason)}</div>
+            </div>`).join("") : ""}
+        </div>`);
+    }
     if ((data.confirmedLikenessBlockModels || []).length > 0) {
       sections.push(`
         <div class="mb-3">
@@ -1802,6 +2074,7 @@ function populateMusicModelSelects() {
     const customOpt = document.createElement("option");
     customOpt.value = CUSTOM_MODEL_VALUE;
     customOpt.textContent = "Custom model ID...";
+    customOpt.className = "advanced-only";
     selectEl.appendChild(customOpt);
   });
   updateSongLyricsModelHint();
@@ -1816,15 +2089,48 @@ function updateSongLyricsModelHint() {
   const model = (state.musicModels || []).find((m) => m.id === modelId);
   durationSection?.classList.toggle("d-none", !model?.supportsDuration);
   if (model?.instrumentalOnly) {
-    hintEl.textContent = "This model is instrumental only — no lyrics field exists in its real schema, so anything typed below will be ignored.";
-    if (lyricsFieldWrap) lyricsFieldWrap.classList.add("d-none");
+    if (model?.supportsNegativePrompt) {
+      // Real fix for a real gap: Lyria2 genuinely supports negative_prompt
+      // (confirmed real field), but the lyrics field was just being
+      // hidden with no alternative — meaning there was no way to
+      // actually use this capability at all. Relabels the same input
+      // rather than hiding it, since the underlying textarea is what
+      // gets sent through either way (see the generate handler below).
+      hintEl.textContent = "This model is instrumental only, but genuinely supports negative prompting — use the field below to exclude things (e.g. \"vocals, fast tempo, drums\") rather than for lyrics.";
+      if (lyricsFieldWrap) {
+        lyricsFieldWrap.classList.remove("d-none");
+        const label = lyricsFieldWrap.querySelector("label");
+        if (label) label.textContent = "Negative prompt (optional) — things to exclude";
+        const textarea = document.getElementById("songLyricsPrompt");
+        if (textarea) textarea.placeholder = "e.g. vocals, fast tempo, distortion";
+      }
+    } else {
+      hintEl.textContent = "This model is instrumental only — no lyrics field exists in its real schema, so anything typed below will be ignored.";
+      if (lyricsFieldWrap) lyricsFieldWrap.classList.add("d-none");
+    }
   } else if (model?.requiresTimestampedLyrics) {
     hintEl.textContent = 'This model needs real timestamps on each lyric line, e.g. "[00:10.00]Moonlight spills through broken blinds" — not plain [Verse]/[Chorus] tags.';
-    if (lyricsFieldWrap) lyricsFieldWrap.classList.remove("d-none");
+    if (lyricsFieldWrap) {
+      lyricsFieldWrap.classList.remove("d-none");
+      resetSongLyricsFieldLabel(lyricsFieldWrap);
+    }
   } else {
     hintEl.textContent = model?.supportsDuration ? "" : "This model doesn't expose a real duration control — its length is determined by other factors (like lyrics length), not a setting you can pick.";
-    if (lyricsFieldWrap) lyricsFieldWrap.classList.remove("d-none");
+    if (lyricsFieldWrap) {
+      lyricsFieldWrap.classList.remove("d-none");
+      resetSongLyricsFieldLabel(lyricsFieldWrap);
+    }
   }
+}
+// Restores the lyrics field's real original label/placeholder — needed
+// because Lyria2's negative-prompt mode above relabels the exact same
+// input rather than adding a separate one, so switching back to a real
+// lyrics-capable model has to undo that, not just show the field again.
+function resetSongLyricsFieldLabel(lyricsFieldWrap) {
+  const label = lyricsFieldWrap.querySelector("label");
+  if (label) label.innerHTML = 'Lyrics <span class="text-muted fw-normal">(use [Verse], [Chorus], [Bridge], [Intro], [Outro] tags)</span>';
+  const textarea = document.getElementById("songLyricsPrompt");
+  if (textarea) textarea.placeholder = "[Verse]\n...\n[Chorus]\n...";
 }
 document.getElementById("songLyricsModelSelect")?.addEventListener("change", updateSongLyricsModelHint);
 document.getElementById("songDurationSlider")?.addEventListener("input", (e) => {
@@ -1884,6 +2190,7 @@ function populateStaticModelSelect(selectEl, models) {
   const customOpt = document.createElement("option");
   customOpt.value = CUSTOM_MODEL_VALUE;
   customOpt.textContent = "Custom model ID…";
+  customOpt.className = "advanced-only";
   selectEl.appendChild(customOpt);
   // Restore whatever was selected before, as long as it's still a valid
   // option — otherwise a routine background refresh would silently reset
@@ -1929,7 +2236,7 @@ function modelSelectHtml({ models, dataAttr, index, selectedValue = "", labelPre
     <select class="form-select form-select-sm" ${dataAttr}="${index}" data-model-custom-target="${customId}">
       <option value="">Default</option>
       ${options}
-      <option value="${CUSTOM_MODEL_VALUE}" ${isCustomSelected ? "selected" : ""}>Custom model ID…</option>
+      <option value="${CUSTOM_MODEL_VALUE}" class="${isCustomSelected ? "" : "advanced-only"}" ${isCustomSelected ? "selected" : ""}>Custom model ID…</option>
     </select>
     <input type="text" class="form-control form-control-sm mt-1 ${isCustomSelected ? "" : "d-none"}" id="${customId}" placeholder="e.g. fal-ai/some-model/edit" value="${isCustomSelected ? selectedValue : ""}">
     ${excludedCount > 0 ? `<small class="text-muted xx-small d-block mt-1">${excludedCount} model(s) hidden — either they don't accept enough reference images for this step's compositing, or they're known/confirmed to reject human-inclusive combined requests.</small>` : ""}
@@ -2084,9 +2391,37 @@ async function refreshCreditsSummary() {
         data.remainingInr != null ? `≈ ₹${data.remainingInr.toFixed(2)}` : "";
     if (dom.creditsFxRate)
       dom.creditsFxRate.innerText = `$1 ≈ ₹${data.exchangeRateUsdToInr}`;
+    renderCreditsByFeature(data.byFeature);
   } catch (err) {
     console.warn("Could not refresh credits summary:", err.message);
   }
+}
+// Where the money is actually going — Photography vs Video vs Audio vs
+// Text & Planning, computed server-side (db.js's categorizeTransaction)
+// from real model IDs, not guessed here. Simple proportional bars,
+// widest-first, since this is a glance-at-it panel, not a full chart.
+const CREDITS_FEATURE_ICONS = { Photography: "📸", Video: "🎬", Audio: "🎙️", "Text & Planning": "📝", "Vision & Analysis": "👁️", Other: "🔧" };
+function renderCreditsByFeature(byFeature) {
+  const container = document.getElementById("creditsByFeatureBars");
+  if (!container) return;
+  if (!byFeature || !byFeature.length) {
+    container.innerHTML = `<div class="text-muted xx-small">No spend recorded yet.</div>`;
+    return;
+  }
+  const maxSpent = Math.max(...byFeature.map((f) => f.spent), 0.0001);
+  container.innerHTML = byFeature
+    .map((f) => {
+      const pct = Math.max(4, Math.round((f.spent / maxSpent) * 100));
+      const icon = CREDITS_FEATURE_ICONS[f.feature] || "🔧";
+      return `<div class="d-flex align-items-center gap-2">
+        <div class="xx-small text-nowrap" style="width: 130px;">${icon} ${f.feature}</div>
+        <div class="flex-grow-1 bg-light rounded" style="height: 8px;">
+          <div class="bg-dark rounded" style="height: 8px; width: ${pct}%;"></div>
+        </div>
+        <div class="xx-small text-nowrap text-end" style="width: 100px;">$${f.spent.toFixed(3)} <span class="text-muted">(${f.callCount})</span></div>
+      </div>`;
+    })
+    .join("");
 }
 async function loadFalRealBalance() {
   const amountEl = document.getElementById("falRealBalanceAmount");
@@ -2131,6 +2466,7 @@ async function loadCreditsLedger(page = 1) {
         return `<tr>
           <td class="small text-nowrap">${timeLabel}</td>
           <td class="small">${t.endpoint}${t.frame_index != null ? ` #${t.frame_index + 1}` : ""}</td>
+          <td class="small">${CREDITS_FEATURE_ICONS[t.feature] || "🔧"} ${t.feature}</td>
           <td class="small">${t.model}</td>
           <td><span class="badge bg-${statusBadge}">${t.status}</span></td>
           <td class="text-end small">$${t.estimated_cost.toFixed(4)} <span class="text-muted">(₹${t.estimated_cost_inr.toFixed(2)})</span></td>
@@ -2163,16 +2499,16 @@ async function loadRealUsageHistory(append = false) {
       document.getElementById("realUsageNextBtn").classList.add("d-none");
       return;
     }
-    const rows = (data.items || data.records || [])
+    const rows = (data.items || [])
       .map(
         (r) => `<div class="d-flex justify-content-between border-bottom py-1 small">
-          <span>${r.timestamp ? new Date(r.timestamp).toLocaleString() : ""} — ${r.endpoint_id || r.endpoint || ""}</span>
-          <span>${r.unit_price != null ? `$${r.unit_price}` : ""} ${r.quantity != null ? `× ${r.quantity}` : ""}</span>
+          <span>${r.timestamp ? new Date(r.timestamp).toLocaleString() : ""} — ${r.endpoint_id || ""}</span>
+          <span>${r.cost_total != null ? `$${Number(r.cost_total).toFixed(4)}` : ""} ${r.quantity != null ? `(${r.quantity} ${r.unit || ""} × $${r.unit_price})` : ""}</span>
         </div>`,
       )
       .join("");
     if (append) bodyEl.insertAdjacentHTML("beforeend", rows);
-    else bodyEl.innerHTML = rows || `<div class="text-muted small p-2">No usage recorded yet.</div>`;
+    else bodyEl.innerHTML = rows || `<div class="text-muted small p-2">No usage recorded in the last 30 days.</div>`;
     realUsageCursor = data.next_cursor || data.cursor || null;
     document.getElementById("realUsageNextBtn").classList.toggle("d-none", !realUsageCursor);
   } catch (err) {
@@ -2229,11 +2565,12 @@ async function loadCampaignsList(page = 1) {
         .map((c) => {
           const time = new Date(c.created_at + "Z").toLocaleString();
           const desc = (c.product_description || "").slice(0, 90);
+          const spend = c.spend || { spent: 0, callCount: 0 };
           return `<div class="d-flex justify-content-between align-items-center border-bottom py-2">
             <div class="small">
               <div class="fw-semibold">${c.brand_name || "(no brand name)"}</div>
               <div class="text-muted">${desc}${desc.length === 90 ? "..." : ""}</div>
-              <div class="text-muted xx-small">${time}</div>
+              <div class="text-muted xx-small">${time} · 💳 $${spend.spent.toFixed(3)} <span class="text-muted">(${spend.callCount} call${spend.callCount === 1 ? "" : "s"})</span></div>
             </div>
             <button class="btn btn-sm btn-outline-primary" data-run-id="${c.run_id}">Load</button>
           </div>`;
@@ -2286,9 +2623,16 @@ async function loadCampaign(runId) {
         document.getElementById("campaignsModal"),
       );
       if (modalInstance) modalInstance.hide();
-      alert(
-        "Batch campaign loaded. Re-upload the same product photos (in the same order) before running Step 1 again.",
-      );
+      if (data.generatedItems?.length) {
+        renderBatchResults({ items: data.generatedItems, diagnostics: {} });
+        dom.batchResultsSection.classList.remove("d-none");
+        dom.batchResultsSection.scrollIntoView({ behavior: "smooth", block: "start" });
+        logActivity("info", `Batch campaign loaded — showing ${data.generatedItems.length} previously generated product(s).`);
+      } else {
+        alert(
+          "Batch campaign loaded. Re-upload the same product photos (in the same order) before running Step 1 again.",
+        );
+      }
       return;
     }
     // Single mode — switch back into Single Mode view too, in case Batch or Wizard Mode was showing
@@ -2323,9 +2667,21 @@ async function loadCampaign(runId) {
       document.getElementById("campaignsModal"),
     );
     if (modalInstance) modalInstance.hide();
-    alert(
-      "Campaign loaded. Upload the product photo (and reference photo, if used) before locking the set.",
-    );
+    // Real, confirmed gap fixed here: this used to only ever restore text
+    // fields and tell the person to re-upload/re-run everything, even
+    // though the actual generated images were sitting right there in
+    // run_items the whole time, already paid for.
+    if (data.generatedItems?.length) {
+      const imageUrls = data.generatedItems.map((i) => i.image);
+      const modelsUsed = data.generatedItems.map((i) => i.modelUsed);
+      renderFinalImageGrid(imageUrls, { framesRequested: imageUrls.length, framesSucceeded: imageUrls.length }, modelsUsed);
+      document.getElementById("photoshootResultsSection").scrollIntoView({ behavior: "smooth", block: "start" });
+      logActivity("info", `Campaign loaded — showing ${imageUrls.length} previously generated image(s).`);
+    } else {
+      alert(
+        "Campaign loaded. Upload the product photo (and reference photo, if used) before locking the set.",
+      );
+    }
   } catch (err) {
     alert(err.message);
   }
@@ -2422,6 +2778,11 @@ async function handleReferenceUpload(e) {
     return;
   }
   dom.matchReferenceOutfitRow.classList.remove("d-none");
+  // A fresh reference-photo upload is the natural "starting a shoot"
+  // moment — mint the run_id here (not consumed until Generate is
+  // actually clicked) so analyze-reference's cost lands under the same
+  // campaign as everything that follows, instead of as an orphaned row.
+  state.pendingShootRunId = crypto.randomUUID();
   const reader = new FileReader();
   reader.onload = async (event) => {
     state.modelReferenceBase64 = event.target.result;
@@ -2439,6 +2800,7 @@ async function handleReferenceUpload(e) {
           productDescription: document.getElementById("productDesc").value,
           creativeDirection: dom.creativeDirection.value,
           userApiKey: getUserKey(),
+          runId: state.pendingShootRunId,
         }),
       });
       toggleStatusView(false);
@@ -2504,6 +2866,10 @@ async function handleBatchReferenceUpload(e) {
     return;
   }
   dom.batchMatchReferenceOutfitRow.classList.remove("d-none");
+  // Same reasoning as Single Mode — a fresh reference-photo upload marks
+  // the start of this batch shoot, so mint the run_id here rather than
+  // letting this check's cost fall outside the campaign it belongs to.
+  state.pendingBatchRunId = crypto.randomUUID();
   const reader = new FileReader();
   reader.onload = async (event) => {
     state.batchModelReferenceBase64 = event.target.result;
@@ -2522,6 +2888,7 @@ async function handleBatchReferenceUpload(e) {
           creativeDirection: document.getElementById("batchCreativeDirection")
             .value,
           userApiKey: getUserKey(),
+          runId: state.pendingBatchRunId,
         }),
       });
       toggleStatusView(false);
@@ -2728,28 +3095,38 @@ dom.useOriginalToggleBtn.addEventListener("click", () => {
   dom.downloadBtn.href = activeImage;
   updateUseOriginalToggleUI();
 });
-dom.batchModeNavBtn.addEventListener("click", () => {
-  showAppMode(dom.batchModeRow.classList.contains("d-none") ? "batch" : "single");
-});
-dom.wizardModeNavBtn.addEventListener("click", () => {
-  showAppMode(dom.wizardModeRow.classList.contains("d-none") ? "wizard" : "single");
-});
+dom.batchModeNavBtn.addEventListener("click", () => showAppMode("batch"));
+dom.wizardModeNavBtn.addEventListener("click", () => showAppMode("wizard"));
 document.getElementById("flowModeNavBtn")?.addEventListener("click", () => {
-  showAppMode(document.getElementById("flowModeRow").classList.contains("d-none") ? "flow" : "single");
+  showAppMode("flow");
   populateFlowAudioModelSelects(); // real fix: this was defined but never actually called, so the narration/BGM dropdowns would have stayed empty
 });
-// Shared 4-way mode switcher (single/batch/wizard/flow) — only one
-// visible at a time, nav button labels reflect which mode you'd switch
-// TO next.
+// The new choice-screen landing view — each card is a one-way jump into
+// that mode; "Home" (nav button + brand link) is the one-way jump back,
+// replacing the old toggle-back-to-single-on-second-click behavior now
+// that there's an explicit home state to return to instead.
+document.querySelectorAll("[data-choice-mode]").forEach((card) => {
+  card.addEventListener("click", () => {
+    const mode = card.getAttribute("data-choice-mode");
+    showAppMode(mode);
+    if (mode === "flow") populateFlowAudioModelSelects();
+  });
+});
+document.getElementById("wizardFromHomeBtn")?.addEventListener("click", () => showAppMode("wizard"));
+document.getElementById("homeNavBtn")?.addEventListener("click", () => showAppMode("home"));
+document.getElementById("homeNavBrand")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  showAppMode("home");
+});
+// Shared 5-way mode switcher (home/single/batch/wizard/flow) — only one
+// visible at a time. "home" is the choice-screen landing view.
 function showAppMode(mode) {
+  document.getElementById("modeChoiceScreen")?.classList.toggle("d-none", mode !== "home");
   dom.singleProductRow.classList.toggle("d-none", mode !== "single");
   dom.batchModeRow.classList.toggle("d-none", mode !== "batch");
   dom.wizardModeRow.classList.toggle("d-none", mode !== "wizard");
   document.getElementById("flowModeRow")?.classList.toggle("d-none", mode !== "flow");
-  dom.batchModeNavBtn.innerText = mode === "batch" ? "🖼️ Single Product Mode" : "👗 Batch Mode";
-  dom.wizardModeNavBtn.innerText = mode === "wizard" ? "🖼️ Single Product Mode" : "✨ Smart Wizard";
-  const flowBtn = document.getElementById("flowModeNavBtn");
-  if (flowBtn) flowBtn.innerText = mode === "flow" ? "🖼️ Single Product Mode" : "🎬 Flow Studio";
+  if (mode !== "home") window.scrollTo({ top: 0, behavior: "smooth" });
 }
 // ============================================================
 // SMART WIZARD — third mode. Deliberately hands off into Single Product
@@ -3187,10 +3564,15 @@ document.getElementById("imageToolsInput")?.addEventListener("change", async (e)
       reader.onerror = reject;
       reader.readAsDataURL(file);
     });
+    // A fresh file chosen here is the start of a new tools "chain" (see
+    // imageToolsRunBtn below) — mint the run_id now so this suggestion
+    // check and the FIRST tool run on this file share one run_id, instead
+    // of the suggestion always landing as an orphaned row.
+    state.pendingToolsRunId = crypto.randomUUID();
     const { res, data } = await fetchJson("/api/tools/suggest", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ imageBase64, userApiKey: getUserKey() }),
+      body: JSON.stringify({ imageBase64, userApiKey: getUserKey(), runId: state.pendingToolsRunId }),
     });
     if (!res.ok || !data.tool) return;
     const toolLabels = { upscale: "📈 Upscale", extend: "🖼️ Extend", restore: "🎨 Restore & Colorize" };
@@ -3263,7 +3645,13 @@ document.getElementById("imageToolsRunBtn")?.addEventListener("click", async () 
   if (!fileInput.files[0] && !existingChain) return alert("Choose an image first.");
   const resultEl = document.getElementById("imageToolsResult");
   const btn = document.getElementById("imageToolsRunBtn");
-  const runId = crypto.randomUUID();
+  // A fresh file here means this run pairs with the tools/suggest check
+  // that just ran on it — reuse that pending run_id so they share one
+  // run. Continuing an existing chain (no new file) still gets its own
+  // fresh run_id per step, same as before.
+  const isFreshFile = !!fileInput.files[0];
+  const runId = isFreshFile ? (state.pendingToolsRunId || crypto.randomUUID()) : crypto.randomUUID();
+  if (isFreshFile) state.pendingToolsRunId = null;
   btn.disabled = true;
   toggleStatusView(true, `Running ${document.getElementById("imageToolSelect").selectedOptions[0].textContent}...`);
   startProgressPolling(runId);
@@ -3342,7 +3730,7 @@ function updateVoiceStudioModelOptions() {
   // model in it genuinely usable without guessing at its schema, since
   // the preview button lets it be tested before committing.
   selectEl.innerHTML = models.map((m) => `<option value="${m.id}">${escapeHtml(m.label)}${m.costPer1kChars ? ` — $${m.costPer1kChars}/1K chars` : ""}</option>`).join("")
-    + `<option value="${CUSTOM_MODEL_VALUE}">Custom model ID...</option>`;
+    + `<option value="${CUSTOM_MODEL_VALUE}" class="advanced-only">Custom model ID...</option>`;
   const getCurrentModelId = () => readModelSelectEl(selectEl);
   const updateVoiceDescription = () => {
     const model = models.find((m) => m.id === getCurrentModelId());
@@ -3446,6 +3834,12 @@ function updateVoiceStudioModelOptions() {
         : "";
     document.getElementById("voiceStudioLanguageRow").classList.toggle("d-none", !model?.confirmedLanguages);
     document.getElementById("voiceStudioEmotionPitchRow").classList.toggle("d-none", !model?.supportsEmotionPitchSpeed);
+    // Real, proactive fix for the exact "*confident* -> nothing" bug —
+    // shown BEFORE generation, using each model's own real, honest
+    // markupHint (see fal-models.js) instead of one generic static line
+    // that was the same regardless of which model actually supports what.
+    const markupHintEl = document.getElementById("voiceStudioMarkupHint");
+    if (markupHintEl) markupHintEl.textContent = model?.markupHint || "Use *text* for stage directions.";
     if (model?.autoDetectsLanguageFromText) {
       hintEl.textContent += (hintEl.textContent ? " " : "") + "🌐 Auto-detects the language directly from the text you type — write in Telugu/Tamil/etc. script directly, or use the translate toggle above.";
     }
@@ -3593,7 +3987,7 @@ document.getElementById("voiceStudioAutoTagBtn")?.addEventListener("click", asyn
     const { res, data } = await fetchJson("/api/voice/auto-tag-languages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ script, instruction, textModel: getTextModel(), userApiKey: getUserKey() }),
+      body: JSON.stringify({ script, instruction, textModel: getTextModel(), userApiKey: getUserKey(), runId: state.voiceStudioRunId }),
     });
     await refreshCreditsSummary();
     if (!res.ok) throw new Error(data.error || "Auto-tagging failed.");
@@ -3623,7 +4017,7 @@ document.getElementById("voiceStudioGenerateMultilingualBtn")?.addEventListener(
         modelId: readModelSelectEl(document.getElementById("voiceStudioModelSelect")),
         voiceId: readModelSelectEl(document.getElementById("voiceStudioVoiceId")) || document.getElementById("voiceStudioVoiceIdFreeform")?.value,
         baseLanguage: document.getElementById("voiceStudioMultilingualBase")?.value,
-        textModel: getTextModel(), userApiKey: getUserKey(),
+        textModel: getTextModel(), userApiKey: getUserKey(), runId: state.voiceStudioRunId,
       }),
     });
     await refreshCreditsSummary();
@@ -3655,7 +4049,7 @@ async function runVoiceTextPreparation() {
     const { res, data } = await fetchJson("/api/voice/prepare-text", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, targetLanguage, textModel: getTextModel(), userApiKey: getUserKey() }),
+      body: JSON.stringify({ text, targetLanguage, textModel: getTextModel(), userApiKey: getUserKey(), runId: state.voiceStudioRunId }),
     });
     await refreshCreditsSummary();
     if (!res.ok) throw new Error(data.error || "Preparation failed.");
@@ -3682,6 +4076,13 @@ document.getElementById("voiceStudioReprepareBtn")?.addEventListener("click", ru
 // Cache keyed by "modelId:voiceId" — a voice previewed once this session
 // is never regenerated (and never re-charged) if previewed again.
 state.voicePreviewCache = state.voicePreviewCache || {};
+// One shared run_id for this Voice Studio session, minted fresh every
+// time the modal opens — reused across prepare-text/auto-tag/generate
+// calls made while it's open, so "cost of this voiceover" is one real,
+// joinable number instead of several disconnected ledger rows.
+document.getElementById("voiceStudioModal")?.addEventListener("show.bs.modal", () => {
+  state.voiceStudioRunId = crypto.randomUUID();
+});
 document.getElementById("voiceStudioModal")?.addEventListener("show.bs.modal", async () => {
   const userKey = getUserKey();
   if (!userKey) return; // nothing to verify against without a key — the manual recheck button still explains this if they try it directly
@@ -4039,6 +4440,12 @@ document.getElementById("voiceStudioModal")?.addEventListener("show.bs.modal", r
 // ============================================================
 // SONG STUDIO
 // ============================================================
+// One shared run_id for this Song Studio session, minted fresh every
+// time the modal opens — reused across write-lyrics and generate so
+// "cost of this song" is one real number, not two disconnected rows.
+document.getElementById("songStudioModal")?.addEventListener("show.bs.modal", () => {
+  state.songStudioRunId = crypto.randomUUID();
+});
 document.getElementById("songStylePrompt")?.addEventListener("input", (e) => {
   document.getElementById("songStyleCount").textContent = `${e.target.value.length} / 300`;
 });
@@ -4069,7 +4476,7 @@ document.getElementById("songWriteLyricsBtn")?.addEventListener("click", async (
         storyPrompt, referenceNotes, emotionalFeel, vocalStyle, lyricalGenre,
         wantsVocals, wantsOwnVoice, prioritize,
         lyricLanguageStyle: document.getElementById("songLyricLanguageStyle")?.value,
-        textModel: getTextModel(), userApiKey: getUserKey(),
+        textModel: getTextModel(), userApiKey: getUserKey(), runId: state.songStudioRunId,
       }),
     });
     await refreshCreditsSummary();
@@ -4126,6 +4533,137 @@ document.getElementById("songWriteLyricsBtn")?.addEventListener("click", async (
   }
 });
 state.songStudioVersions = [];
+// ============================================================
+// AUDIO LIBRARY (Phase 11) — real, working browse/save/favorite/delete
+// for generated voice takes, songs, and SFX. saveToAudioLibrary is the
+// shared function both Voice Studio and Song Studio call — one save
+// path, not two parallel implementations.
+// ============================================================
+let audioLibraryFilter = "all";
+async function saveToAudioLibrary({ type, name, audioDataUri, modelUsed, voiceUsed, language, runId, metadata }) {
+  try {
+    const { res, data } = await fetchJson("/api/audio-library", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type, name, audioDataUri, modelUsed, voiceUsed, language, runId, metadata }),
+    });
+    if (!res.ok) throw new Error(data.error || "Failed to save.");
+    logActivity("success", `Saved "${name}" to your Audio Library.`);
+    return true;
+  } catch (err) {
+    alert("Couldn't save to Audio Library: " + err.message);
+    return false;
+  }
+}
+async function loadAudioLibrary() {
+  const listEl = document.getElementById("audioLibraryList");
+  if (!listEl) return;
+  listEl.innerHTML = `<div class="text-muted small">Loading...</div>`;
+  try {
+    const { res, data } = await fetchJson(`/api/audio-library${audioLibraryFilter !== "all" ? `?type=${audioLibraryFilter}` : ""}`);
+    if (!res.ok) throw new Error(data.error || "Failed to load.");
+    const items = data.items || [];
+    if (!items.length) {
+      listEl.innerHTML = `<p class="text-muted small mb-0">Nothing saved yet — use the "💾 Save to Library" button on a generated voice take, song, or sound effect.</p>`;
+      return;
+    }
+    const typeIcon = { voice: "🎙️", song: "🎵", sfx: "🔊" };
+    listEl.innerHTML = items.map((item) => `
+      <div class="border rounded p-2 mb-2" data-audio-item-id="${item.id}">
+        <div class="d-flex justify-content-between align-items-center">
+          <span class="fw-semibold small">${typeIcon[item.type] || ""} ${escapeHtml(item.name)}</span>
+          <div class="d-flex gap-1">
+            <button type="button" class="btn btn-sm p-0 border-0" data-audio-item-action="favorite" title="${item.favorite ? "Remove favorite" : "Add favorite"}">${item.favorite ? "⭐" : "☆"}</button>
+            <a href="${item.audio}" data-download-url="${item.audio}" data-download-filename="${escapeHtml(item.name).replace(/[^a-z0-9]+/gi, "-")}.mp3" class="btn btn-sm btn-outline-dark">⬇️</a>
+            <button type="button" class="btn btn-sm btn-outline-danger" data-audio-item-action="delete" title="Delete">✕</button>
+          </div>
+        </div>
+        <div class="xx-small text-muted">${item.modelUsed ? escapeHtml(item.modelUsed) : ""}${item.voiceUsed ? ` · ${escapeHtml(item.voiceUsed)}` : ""}${item.language ? ` · ${escapeHtml(item.language)}` : ""}</div>
+        <audio controls class="w-100 mt-1" src="${item.audio}"></audio>
+      </div>`).join("");
+  } catch (err) {
+    listEl.innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
+  }
+}
+document.getElementById("audioLibraryModal")?.addEventListener("show.bs.modal", loadAudioLibrary);
+document.querySelectorAll("[data-audio-library-filter]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("[data-audio-library-filter]").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    audioLibraryFilter = btn.getAttribute("data-audio-library-filter");
+    loadAudioLibrary();
+  });
+});
+document.getElementById("audioLibraryList")?.addEventListener("click", async (e) => {
+  const itemEl = e.target.closest("[data-audio-item-id]");
+  const action = e.target.closest("[data-audio-item-action]")?.getAttribute("data-audio-item-action");
+  if (!itemEl || !action) return;
+  const id = itemEl.getAttribute("data-audio-item-id");
+  if (action === "delete") {
+    if (!confirm("Delete this from your Audio Library? This can't be undone.")) return;
+    await fetchJson(`/api/audio-library/${id}`, { method: "DELETE" });
+    loadAudioLibrary();
+  } else if (action === "favorite") {
+    await fetchJson(`/api/audio-library/${id}/favorite`, { method: "POST" });
+    loadAudioLibrary();
+  }
+});
+
+document.getElementById("songGenerateVariationsBtn")?.addEventListener("click", async () => {
+  const style = document.getElementById("songStylePrompt")?.value?.trim();
+  const lyrics = document.getElementById("songLyricsPrompt")?.value?.trim();
+  const selectedModelId = readModelSelectEl(document.getElementById("songLyricsModelSelect"));
+  const selectedModel = (state.musicModels || []).find((m) => m.id === selectedModelId);
+  if (!style || style.length < 10) return alert("Style/mood description needs to be at least 10 characters.");
+  if (!selectedModel?.instrumentalOnly && (!lyrics || lyrics.length < 10)) return alert("Lyrics need to be at least 10 characters — write your own, use the lyric writer above, or pick an instrumental-only model if you don't want vocals.");
+  const btn = document.getElementById("songGenerateVariationsBtn");
+  const resultEl = document.getElementById("songVariationsResult");
+  const count = parseInt(document.getElementById("songVariationCount")?.value) || 3;
+  const runId = state.songStudioRunId || crypto.randomUUID();
+  state.songStudioRunId = runId;
+  btn.disabled = true;
+  resultEl.innerHTML = `<p class="text-muted small">Generating ${count} creative directions — this takes longer than one song, since each is a full real generation...</p>`;
+  try {
+    const { res, data } = await fetchJson("/api/music/generate-variations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        style, lyrics, modelId: selectedModelId, count, runId,
+        durationSeconds: selectedModel?.supportsDuration ? parseInt(document.getElementById("songDurationSlider")?.value) : undefined,
+        userApiKey: getUserKey(),
+      }),
+    });
+    await refreshCreditsSummary();
+    if (!res.ok) throw new Error(data.error || "Failed to generate creative directions.");
+    resultEl.innerHTML = (data.results || []).map((v, i) => `
+      <div class="border rounded p-2 mb-2" data-song-variation-index="${i}">
+        <div class="d-flex justify-content-between align-items-center">
+          <span class="fw-bold small">${escapeHtml(v.label)}</span>
+          <div class="d-flex gap-1">
+            ${v.audio ? `<button type="button" class="btn btn-sm btn-outline-success" data-song-variation-action="save" title="Save to Audio Library">💾</button><a href="${v.audio}" data-download-url="${v.audio}" data-download-filename="song-${v.label.replace(/[^a-z0-9]+/gi, "-")}-${Date.now()}.mp3" class="btn btn-sm btn-outline-dark">⬇️</a>` : ""}
+          </div>
+        </div>
+        ${v.reasoning ? `<div class="xx-small text-muted mb-1">${escapeHtml(v.reasoning)}</div>` : ""}
+        ${v.error ? `<div class="xx-small text-danger">Failed: ${escapeHtml(v.error)}</div>` : v.audio ? `<audio controls class="w-100 mt-1" src="${v.audio}"></audio>` : ""}
+      </div>`).join("") || `<p class="text-muted small">No results.</p>`;
+    state.lastSongVariations = data.results || [];
+    logActivity("success", `Generated ${data.results?.length || 0} creative direction(s) for your song.`);
+  } catch (err) {
+    resultEl.innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
+    logActivity("warning", `Song variation generation failed — ${err.message}`);
+  } finally {
+    btn.disabled = false;
+  }
+});
+document.getElementById("songVariationsResult")?.addEventListener("click", (e) => {
+  const itemEl = e.target.closest("[data-song-variation-index]");
+  const action = e.target.closest("[data-song-variation-action]")?.getAttribute("data-song-variation-action");
+  if (!itemEl || action !== "save") return;
+  const v = state.lastSongVariations?.[parseInt(itemEl.getAttribute("data-song-variation-index"))];
+  if (!v?.audio) return;
+  const name = prompt("Name this song version:", v.label);
+  if (name) saveToAudioLibrary({ type: "song", name, audioDataUri: v.audio, modelUsed: v.modelUsed, runId: state.songStudioRunId, metadata: { reasoning: v.reasoning, label: v.label } });
+});
 document.getElementById("songGenerateBtn")?.addEventListener("click", async () => {
   const style = document.getElementById("songStylePrompt")?.value?.trim();
   const lyrics = document.getElementById("songLyricsPrompt")?.value?.trim();
@@ -4135,7 +4673,7 @@ document.getElementById("songGenerateBtn")?.addEventListener("click", async () =
   if (!selectedModel?.instrumentalOnly && (!lyrics || lyrics.length < 10)) return alert("Lyrics need to be at least 10 characters — write your own, use the lyric writer above, or pick an instrumental-only model if you don't want vocals.");
   const btn = document.getElementById("songGenerateBtn");
   const resultEl = document.getElementById("songStudioResult");
-  const runId = crypto.randomUUID();
+  const runId = state.songStudioRunId || crypto.randomUUID();
   btn.disabled = true;
   toggleStatusView(true, "Composing your song — this can take a minute or two...");
   startProgressPolling(runId);
@@ -4244,7 +4782,7 @@ document.getElementById("songRefGenerateBtn")?.addEventListener("click", async (
   if (!state.songRefAudioBase64) return alert("Record or upload your voice clip first.");
   const btn = document.getElementById("songRefGenerateBtn");
   const resultEl = document.getElementById("songRefResult");
-  const runId = crypto.randomUUID();
+  const runId = state.songStudioRunId || crypto.randomUUID();
   btn.disabled = true;
   toggleStatusView(true, "Generating with your reference voice — this can take a minute or two...");
   startProgressPolling(runId);
@@ -4559,6 +5097,7 @@ function updateFlowTalkingBackgroundVisibility() {
   const modelId = readModelSelectEl(document.getElementById("flowTalkingModelSelect"));
   const model = (state.talkingAvatarModels || []).find((m) => m.id === modelId);
   document.getElementById("flowTalkingBackgroundSection")?.classList.toggle("d-none", !model?.supportsBackground);
+  document.getElementById("flowTalkingDeliverySection")?.classList.toggle("d-none", !model?.supportsDeliveryControls);
   // HeyGen-native voice option only makes sense when HeyGen is actually
   // selected — hides it otherwise rather than offering a choice that
   // would silently do nothing on a different model.
@@ -4617,10 +5156,43 @@ document.getElementById("flowTalkingCloneUpload")?.addEventListener("change", (e
 // Three real, distinct modes — switching between them shows/hides the
 // fields that actually apply, rather than one form trying to cover all
 // cases with ambiguous fields.
-document.getElementById("flowTalkingAudioMode")?.addEventListener("change", (e) => {
-  const isFinished = e.target.value === "finished";
-  document.getElementById("flowTalkingFinishedAudioSection")?.classList.toggle("d-none", !isFinished);
-  document.getElementById("flowTalkingGenerateSpeechSection")?.classList.toggle("d-none", isFinished);
+document.getElementById("flowTalkingAudioMode")?.addEventListener("change", async (e) => {
+  const mode = e.target.value;
+  document.getElementById("flowTalkingFinishedAudioSection")?.classList.toggle("d-none", mode !== "finished");
+  document.getElementById("flowTalkingLibraryAudioSection")?.classList.toggle("d-none", mode !== "library");
+  document.getElementById("flowTalkingGenerateSpeechSection")?.classList.toggle("d-none", mode !== "generate");
+  if (mode === "library") {
+    const selectEl = document.getElementById("flowTalkingLibrarySelect");
+    if (selectEl) {
+      selectEl.innerHTML = `<option value="">Loading...</option>`;
+      try {
+        const { res, data } = await fetchJson("/api/audio-library?type=voice");
+        if (!res.ok) throw new Error(data.error);
+        const items = data.items || [];
+        selectEl.innerHTML = items.length
+          ? `<option value="">Pick a saved clip...</option>` + items.map((it) => `<option value="${it.id}">${escapeHtml(it.name)}</option>`).join("")
+          : `<option value="">No saved voice clips yet — generate one in Voice Studio and save it first.</option>`;
+      } catch (err) {
+        selectEl.innerHTML = `<option value="">Couldn't load your library.</option>`;
+      }
+    }
+  }
+});
+document.getElementById("flowTalkingLibrarySelect")?.addEventListener("change", async (e) => {
+  const id = e.target.value;
+  const preview = document.getElementById("flowTalkingLibraryPreview");
+  if (!id) { preview?.classList.add("d-none"); flowTalkingAudioBase64 = null; return; }
+  try {
+    const { res, data } = await fetchJson("/api/audio-library?type=voice");
+    if (!res.ok) throw new Error(data.error);
+    const item = (data.items || []).find((it) => String(it.id) === id);
+    if (item) {
+      flowTalkingAudioBase64 = item.audio;
+      if (preview) { preview.src = item.audio; preview.classList.remove("d-none"); }
+    }
+  } catch (err) {
+    alert("Couldn't load that clip: " + err.message);
+  }
 });
 document.getElementById("flowTalkingVoiceMode")?.addEventListener("change", (e) => {
   document.getElementById("flowTalkingStandardVoiceSelect")?.classList.toggle("d-none", e.target.value !== "standard");
@@ -4638,6 +5210,7 @@ document.getElementById("flowTalkingGenerateBtn")?.addEventListener("click", asy
   const voiceMode = document.getElementById("flowTalkingVoiceMode")?.value;
   const text = document.getElementById("flowTalkingText")?.value?.trim();
   if (audioMode === "finished" && !flowTalkingAudioBase64) return alert("Upload a finished audio clip first.");
+  if (audioMode === "library" && !flowTalkingAudioBase64) return alert("Pick a saved clip from your Audio Library first.");
   if (audioMode === "generate" && !text) return alert("Type what should be said first.");
   if (audioMode === "generate" && voiceMode === "clone" && !flowTalkingCloneAudioBase64) return alert("Upload a reference clip to clone a voice from, or switch to a standard voice.");
   const modelId = readModelSelectEl(document.getElementById("flowTalkingModelSelect"));
@@ -4645,6 +5218,9 @@ document.getElementById("flowTalkingGenerateBtn")?.addEventListener("click", asy
   const background = document.getElementById("flowTalkingBackgroundSection")?.classList.contains("d-none")
     ? null
     : { type: backgroundType, value: backgroundType === "color" ? document.getElementById("flowTalkingBackgroundColor")?.value : document.getElementById("flowTalkingBackgroundUrl")?.value };
+  const deliveryVisible = !document.getElementById("flowTalkingDeliverySection")?.classList.contains("d-none");
+  const talkingStyle = deliveryVisible ? document.getElementById("flowTalkingStyle")?.value : null;
+  const aspectRatio = deliveryVisible ? document.getElementById("flowTalkingAspectRatio")?.value : null;
   const btn = document.getElementById("flowTalkingGenerateBtn");
   const resultEl = document.getElementById("flowStudioResult");
   const runId = crypto.randomUUID();
@@ -4658,7 +5234,7 @@ document.getElementById("flowTalkingGenerateBtn")?.addEventListener("click", asy
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         runId, imageBase64: flowTalkingImageBase64,
-        audioBase64: audioMode === "finished" ? flowTalkingAudioBase64 : null,
+        audioBase64: (audioMode === "finished" || audioMode === "library") ? flowTalkingAudioBase64 : null,
         text: audioMode === "generate" ? text : null,
         targetLanguage: document.getElementById("flowTalkingTargetLanguage")?.value,
         voiceMode, voiceModelId: resolvedTalkingVoice.voiceModel, voiceId: resolvedTalkingVoice.voiceId,
@@ -4666,6 +5242,7 @@ document.getElementById("flowTalkingGenerateBtn")?.addEventListener("click", asy
         useNativeHeygenVoice: voiceMode === "heygen-native",
         heygenVoiceName: document.getElementById("flowTalkingHeygenVoiceName")?.value?.trim() || null,
         background: background?.value ? background : null,
+        talkingStyle, aspectRatio,
         modelId, textModel: getTextModel(), userApiKey: getUserKey(),
       }),
     });
@@ -5435,6 +6012,241 @@ document.querySelectorAll('#voiceStudioSpeed, #voiceStudioPitch').forEach((slide
   });
 });
 document.getElementById("voiceStudioModal")?.addEventListener("show.bs.modal", updateVoiceStudioModelOptions);
+
+// ============================================================
+// VOICE SCRIPT EDITOR (Phase 7/8) — the actual replacement for the old
+// single-textbox flow. Every line has its own fully independent model/
+// voice/language/emotion controls (capability-gated per line, same
+// discipline as everywhere else in this app — never shows a control a
+// model doesn't really support), and can generate multiple AI-directed
+// takes via /api/voice/script/generate-variations.
+// ============================================================
+function newVoiceScriptLine() {
+  const defaultModel = state.voiceModels?.[0];
+  return {
+    id: "line-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7),
+    text: "",
+    modelId: defaultModel?.id || "",
+    voiceId: defaultModel?.confirmedVoiceIds?.[0]?.id || "",
+    language: "",
+    emotion: "neutral",
+    speed: 1.0,
+    pitch: 0,
+    variationCount: 4,
+    variations: [],
+    selectedVariationIndex: null,
+    cappedReason: null,
+    isGenerating: false,
+  };
+}
+function renderVoiceScriptLine(line, index) {
+  const model = (state.voiceModels || []).find((m) => m.id === line.modelId) || null;
+  const modelOptions = (state.voiceModels || [])
+    .map((m) => `<option value="${escapeHtml(m.id)}" ${m.id === line.modelId ? "selected" : ""}>${escapeHtml(m.label)}</option>`)
+    .join("");
+
+  let voiceControlHtml;
+  if (model?.voiceInputMode === "freeform" || (!model?.confirmedVoiceIds?.length && model)) {
+    voiceControlHtml = `<input type="text" class="form-control form-control-sm" data-line-field="voiceId" value="${escapeHtml(line.voiceId || "")}" placeholder="Voice name (this model has no fixed list)">`;
+  } else if (model?.confirmedVoiceIds?.length) {
+    const opts = model.confirmedVoiceIds
+      .map((v) => `<option value="${escapeHtml(v.id)}" ${v.id === line.voiceId ? "selected" : ""}>${escapeHtml(v.id)}${v.description ? ` — ${escapeHtml(v.description)}` : ""}</option>`)
+      .join("");
+    voiceControlHtml = `<select class="form-select form-select-sm" data-line-field="voiceId">${opts}</select>`;
+  } else {
+    voiceControlHtml = `<div class="form-control form-control-sm text-muted bg-light">Pick a model first</div>`;
+  }
+
+  const languageRowHtml = model?.confirmedLanguages?.length
+    ? `<select class="form-select form-select-sm mt-2" data-line-field="language">
+        <option value="">Auto / default</option>
+        ${model.confirmedLanguages.map((l) => `<option value="${escapeHtml(l)}" ${l === line.language ? "selected" : ""}>${escapeHtml(l)}</option>`).join("")}
+      </select>`
+    : "";
+
+  const emotionRowHtml = model?.supportsEmotionPitchSpeed
+    ? `<div class="row g-2 mt-2">
+        <div class="col-4"><label class="xx-small text-muted mb-0">Speed ${line.speed}</label><input type="range" class="form-range" data-line-field="speed" min="0.5" max="2.0" step="0.1" value="${line.speed}"></div>
+        <div class="col-4"><label class="xx-small text-muted mb-0">Pitch ${line.pitch}</label><input type="range" class="form-range" data-line-field="pitch" min="-12" max="12" step="1" value="${line.pitch}"></div>
+        <div class="col-4"><label class="xx-small text-muted mb-0">Emotion</label><select class="form-select form-select-sm" data-line-field="emotion">${(model.confirmedEmotions || []).map((e) => `<option value="${e}" ${e === line.emotion ? "selected" : ""}>${e}</option>`).join("")}</select></div>
+      </div>`
+    : "";
+
+  const variationsHtml = line.variations.length
+    ? `<div class="d-flex flex-column gap-2 mt-2">${line.variations
+        .map(
+          (v, i) => `
+      <div class="border rounded p-2 ${line.selectedVariationIndex === i ? "border-primary bg-light" : ""}" data-variation-index="${i}">
+        <div class="d-flex justify-content-between align-items-center">
+          <span class="small fw-semibold">${escapeHtml(v.label)}${line.selectedVariationIndex === i ? " ✅" : ""}</span>
+          <div class="d-flex gap-1">
+            ${v.audio ? `<button type="button" class="btn btn-sm btn-outline-primary" data-variation-action="use">Use this take</button><button type="button" class="btn btn-sm btn-outline-success" data-variation-action="save" title="Save to Audio Library">💾</button><button type="button" class="btn btn-sm btn-outline-secondary" data-variation-action="download">⬇️</button>` : ""}
+          </div>
+        </div>
+        ${v.reasoning ? `<div class="xx-small text-muted">${escapeHtml(v.reasoning)}</div>` : ""}
+        ${v.error ? `<div class="xx-small text-danger">Failed: ${escapeHtml(v.error)}</div>` : v.audio ? `<audio class="w-100 mt-1" controls src="${v.audio}"></audio>` : ""}
+        ${v.strippedMarkers?.length ? `<div class="xx-small text-warning">⚠️ "${v.strippedMarkers.join('", "')}" wasn't spoken by this model.</div>` : ""}
+      </div>`,
+        )
+        .join("")}</div>`
+    : "";
+  const cappedNote = line.cappedReason ? `<div class="alert alert-warning py-1 px-2 xx-small mt-2 mb-0">${escapeHtml(line.cappedReason)}</div>` : "";
+
+  return `
+  <div class="card border" data-line-id="${line.id}">
+    <div class="card-body p-3">
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <span class="fw-bold small">Line ${index + 1}</span>
+        <div class="d-flex gap-1">
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-line-action="moveUp" ${index === 0 ? "disabled" : ""} title="Move up">↑</button>
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-line-action="moveDown" title="Move down">↓</button>
+          <button type="button" class="btn btn-sm btn-outline-danger" data-line-action="delete" title="Delete line">✕</button>
+        </div>
+      </div>
+      <textarea class="form-control form-control-sm mb-1" rows="2" data-line-field="text" placeholder="Type this line...">${escapeHtml(line.text)}</textarea>
+      <small class="text-muted d-block mb-2">${escapeHtml(model?.markupHint || "Pick a model to see what stage-direction markup it supports.")}</small>
+      <div class="row g-2">
+        <div class="col-6"><select class="form-select form-select-sm" data-line-field="modelId">${modelOptions}</select></div>
+        <div class="col-6">${voiceControlHtml}</div>
+      </div>
+      ${languageRowHtml}
+      ${emotionRowHtml}
+      <div class="d-flex align-items-center gap-2 mt-2">
+        <label class="xx-small text-muted mb-0">Takes:</label>
+        <select class="form-select form-select-sm" style="width:auto" data-line-field="variationCount">
+          ${[1, 2, 4, 8].map((n) => `<option value="${n}" ${n === line.variationCount ? "selected" : ""}>${n}</option>`).join("")}
+        </select>
+        <button type="button" class="btn btn-sm btn-primary flex-grow-1" data-line-action="generate" ${line.isGenerating ? "disabled" : ""}>${line.isGenerating ? "Generating..." : "🎬 Generate Takes"}</button>
+      </div>
+      ${cappedNote}
+      ${variationsHtml}
+    </div>
+  </div>`;
+}
+function renderVoiceScript() {
+  const container = document.getElementById("voiceScriptLines");
+  if (!container) return;
+  if (!state.voiceScript.lines.length) {
+    container.innerHTML = `<p class="text-muted small mb-0">No lines yet — click "Add Line" below to start building your script.</p>`;
+    return;
+  }
+  container.innerHTML = state.voiceScript.lines.map((line, i) => renderVoiceScriptLine(line, i)).join("");
+}
+document.getElementById("voiceStudioModal")?.addEventListener("show.bs.modal", () => {
+  if (!state.voiceScript) state.voiceScript = { lines: [], runId: null };
+  if (!state.voiceScript.runId) state.voiceScript.runId = crypto.randomUUID();
+  if (!state.voiceScript.lines.length) state.voiceScript.lines.push(newVoiceScriptLine());
+  renderVoiceScript();
+});
+document.getElementById("voiceScriptAddLineBtn")?.addEventListener("click", () => {
+  state.voiceScript.lines.push(newVoiceScriptLine());
+  renderVoiceScript();
+});
+// Field edits — text/select/range inputs, delegated so it works for any
+// number of lines without binding listeners individually.
+document.getElementById("voiceScriptLines")?.addEventListener("input", (e) => {
+  const lineEl = e.target.closest("[data-line-id]");
+  const field = e.target.getAttribute("data-line-field");
+  if (!lineEl || !field) return;
+  const line = state.voiceScript.lines.find((l) => l.id === lineEl.getAttribute("data-line-id"));
+  if (!line) return;
+  if (field === "speed" || field === "pitch") line[field] = parseFloat(e.target.value);
+  else if (field === "variationCount") line[field] = parseInt(e.target.value);
+  else line[field] = e.target.value;
+  if (field === "modelId") {
+    // Model changed — voice/emotion/language options are model-specific,
+    // so reset to that model's own defaults and fully re-render this
+    // line's controls (a partial update can't safely swap control types).
+    const newModel = (state.voiceModels || []).find((m) => m.id === line.modelId);
+    line.voiceId = newModel?.confirmedVoiceIds?.[0]?.id || "";
+    line.emotion = "neutral";
+    line.language = "";
+    renderVoiceScript();
+  } else if (field === "speed" || field === "pitch") {
+    // Just update the displayed number live, don't re-render the whole
+    // list on every drag tick — same UX as the old single-line sliders.
+    const labelEl = lineEl.querySelector(`label:has(+ [data-line-field="${field}"])`);
+    if (labelEl) labelEl.textContent = `${field === "speed" ? "Speed" : "Pitch"} ${line[field]}`;
+  }
+});
+document.getElementById("voiceScriptLines")?.addEventListener("click", async (e) => {
+  const lineEl = e.target.closest("[data-line-id]");
+  if (!lineEl) return;
+  const lineId = lineEl.getAttribute("data-line-id");
+  const lineIndex = state.voiceScript.lines.findIndex((l) => l.id === lineId);
+  const line = state.voiceScript.lines[lineIndex];
+  if (!line) return;
+
+  const lineAction = e.target.closest("[data-line-action]")?.getAttribute("data-line-action");
+  if (lineAction === "delete") {
+    state.voiceScript.lines.splice(lineIndex, 1);
+    renderVoiceScript();
+    return;
+  }
+  if (lineAction === "moveUp" && lineIndex > 0) {
+    [state.voiceScript.lines[lineIndex - 1], state.voiceScript.lines[lineIndex]] = [state.voiceScript.lines[lineIndex], state.voiceScript.lines[lineIndex - 1]];
+    renderVoiceScript();
+    return;
+  }
+  if (lineAction === "moveDown" && lineIndex < state.voiceScript.lines.length - 1) {
+    [state.voiceScript.lines[lineIndex + 1], state.voiceScript.lines[lineIndex]] = [state.voiceScript.lines[lineIndex], state.voiceScript.lines[lineIndex + 1]];
+    renderVoiceScript();
+    return;
+  }
+  if (lineAction === "generate") {
+    if (!line.text?.trim()) return alert("Type something for this line first.");
+    line.isGenerating = true;
+    renderVoiceScript();
+    try {
+      const { res, data } = await fetchJson("/api/voice/script/generate-variations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lineText: line.text, modelId: line.modelId, count: line.variationCount, runId: state.voiceScript.runId, userApiKey: getUserKey() }),
+      });
+      if (!res.ok) throw new Error(data.error || "Failed to generate takes.");
+      line.variations = data.results || [];
+      line.cappedReason = data.cappedReason || null;
+      line.selectedVariationIndex = line.variations.findIndex((v) => v.audio && !v.error);
+      if (line.selectedVariationIndex === -1) line.selectedVariationIndex = null;
+      await refreshCreditsSummary();
+    } catch (err) {
+      alert("Couldn't generate takes: " + err.message);
+    } finally {
+      line.isGenerating = false;
+      renderVoiceScript();
+    }
+    return;
+  }
+
+  const variationEl = e.target.closest("[data-variation-index]");
+  const variationAction = e.target.closest("[data-variation-action]")?.getAttribute("data-variation-action");
+  if (variationEl && variationAction) {
+    const vIndex = parseInt(variationEl.getAttribute("data-variation-index"));
+    if (variationAction === "use") {
+      line.selectedVariationIndex = vIndex;
+      renderVoiceScript();
+    } else if (variationAction === "save") {
+      const v = line.variations[vIndex];
+      if (v?.audio) {
+        const name = prompt("Name this voice take:", `Line ${lineIndex + 1} — ${v.label}`);
+        if (name) {
+          saveToAudioLibrary({ type: "voice", name, audioDataUri: v.audio, modelUsed: v.modelUsed, voiceUsed: v.voiceId, runId: state.voiceScript.runId, metadata: { emotion: v.emotion, label: v.label } });
+        }
+      }
+    } else if (variationAction === "download") {
+      const v = line.variations[vIndex];
+      if (v?.audio) {
+        const a = document.createElement("a");
+        a.href = v.audio;
+        a.download = `line-${lineIndex + 1}-${(v.label || "take").replace(/[^a-z0-9]+/gi, "-")}.mp3`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }
+    }
+  }
+});
+
 document.getElementById("voiceStudioRunBtn")?.addEventListener("click", async () => {
   const text = document.getElementById("voiceStudioText")?.value?.trim();
   if (!text) return alert("Type something to speak first.");
@@ -5475,7 +6287,7 @@ async function runVoiceGeneration(text) {
   // top of it.
   const actualText = isPrepared ? document.getElementById("voiceStudioPreparedText")?.value?.trim() : text;
   if (!actualText) return alert("The prepared text is empty.");
-  const runId = crypto.randomUUID();
+  const runId = state.voiceStudioRunId || crypto.randomUUID();
   btn.disabled = true;
   toggleStatusView(true, "Generating speech...");
   startProgressPolling(runId);
@@ -5505,7 +6317,7 @@ async function runVoiceGeneration(text) {
     // New version goes on top, older ones stay listed below — nothing
     // gets silently overwritten if you try a different voice and want
     // to compare against what you already had.
-    state.voiceStudioVersions.unshift({ audio: data.audio, modelUsed: data.modelUsed, translatedText: isPrepared ? actualText : null, translateTo, finalSpokenText: data.finalSpokenText, ts: Date.now() });
+    state.voiceStudioVersions.unshift({ audio: data.audio, modelUsed: data.modelUsed, translatedText: isPrepared ? actualText : null, translateTo, finalSpokenText: data.finalSpokenText, deliveryNote: data.deliveryNote, strippedMarkersNote: data.strippedMarkersNote, ts: Date.now() });
     renderVoiceStudioResults(actualText);
     logActivity("success", `Voice generated with ${data.modelUsed}${isPrepared ? ` (prepared for ${translateTo})` : ""}.`);
   } catch (err) {
@@ -5531,6 +6343,8 @@ function renderVoiceStudioResults(sourceText) {
     <div class="border rounded p-2 mb-2 ${i === 0 ? "border-primary" : ""}">
       ${i === 0 ? `<div class="xx-small fw-bold text-primary mb-1">Latest</div>` : `<div class="xx-small text-muted mb-1">Earlier version</div>`}
       ${v.translatedText ? `<div class="alert alert-info py-2 px-3 small mb-2"><strong>Spoken as (${escapeHtml(v.translateTo)}):</strong> ${escapeHtml(v.translatedText)}</div>` : ""}
+      ${v.deliveryNote ? `<div class="xx-small text-muted mb-2">🎭 Delivery note detected and pulled out of the script: "${escapeHtml(v.deliveryNote)}"</div>` : ""}
+      ${v.strippedMarkersNote ? `<div class="alert alert-warning py-2 px-3 small mb-2">⚠️ ${escapeHtml(v.strippedMarkersNote)}</div>` : ""}
       ${v.finalSpokenText ? `<p class="xx-small text-muted mb-2"><strong>Actually sent to the model</strong> (markers converted): ${escapeHtml(v.finalSpokenText)}</p>` : ""}
       <audio controls class="w-100 mb-2" src="${v.audio}"></audio>
       <div class="d-flex gap-2">
@@ -5717,7 +6531,13 @@ dom.batchForm.addEventListener("submit", async (e) => {
   const readyItems = state.batchGarments.filter((g) => getActiveBatchImage(g));
   if (readyItems.length === 0)
     return alert("Add at least one product photo and wait for background removal to finish.");
-  const runId = (state.batchRunId = crypto.randomUUID());
+  // Reuse the run_id minted when the reference photo was analyzed (if
+  // any), so this campaign's row and its pre-flight analysis/moderation
+  // costs share one run_id — then clear it immediately so a LATER,
+  // unrelated batch submit (without a fresh reference upload) doesn't
+  // silently reuse a stale id and overwrite this campaign's saved row.
+  const runId = (state.batchRunId = state.pendingBatchRunId || crypto.randomUUID());
+  state.pendingBatchRunId = null;
   try {
     warnIfReliabilityIssues();
     toggleStatusView(true, `Analyzing ${readyItems.length} product(s) and planning the shoot...`);
@@ -5864,6 +6684,7 @@ async function launchBatchPhotoshoot() {
       modelTier: getBatchModelTier(),
       skipCanonicalRender: dom.batchSkipCanonicalRender ? dom.batchSkipCanonicalRender.checked : false,
       userApiKey: getUserKey(),
+      seed: document.getElementById("globalBatchSeedInput")?.value ? parseInt(document.getElementById("globalBatchSeedInput").value) : null,
     };
     const { res, data } = await fetchJson("/api/generate-batch-images", {
       method: "POST",
@@ -5911,10 +6732,31 @@ function buildBatchPreflightSummary() {
   return { rows, proCount, liteCount, narrativeCount, blockedCount, estimatedCost, totalItems: items.length };
 }
 const DEFAULT_IMAGE_TIER_PLACEHOLDER = "";
-function showBatchPreflight() {
+// Soft-warn banner for the preflight modals — checks the app's own
+// SELF-SET budget (not the real Fal balance; that's a hard block handled
+// server-side instead, see fal-client.js's withConcurrencyLimit) and
+// returns a warning banner HTML string if this run's estimated cost
+// would push total spend over it. Never blocks anything itself — the
+// existing "confirm" click in these modals is already the natural
+// soft-warn checkpoint, this just makes sure the person actually sees
+// the number before clicking it.
+async function buildBudgetWarningBanner(estimatedCost) {
+  try {
+    const { res, data } = await fetchJson("/api/credits/summary");
+    if (!res.ok || data.budget == null) return "";
+    const projectedRemaining = data.remaining - estimatedCost;
+    if (projectedRemaining >= 0) return "";
+    return `<div class="alert alert-warning py-2 px-3 small">⚠️ This run's estimated cost ($${estimatedCost.toFixed(2)}) would put you $${Math.abs(projectedRemaining).toFixed(2)} over your set budget of $${data.budget.toFixed(2)} (spent so far: $${data.totalSpent.toFixed(2)}). You can still proceed — this is just a heads up.</div>`;
+  } catch (err) {
+    return ""; // budget check itself failing shouldn't block seeing the preflight at all
+  }
+}
+async function showBatchPreflight() {
   const summary = buildBatchPreflightSummary();
+  const budgetBanner = await buildBudgetWarningBanner(summary.estimatedCost);
   const bodyEl = document.getElementById("preflightBody");
   bodyEl.innerHTML = `
+    ${budgetBanner}
     <div class="row g-2 text-center mb-3">
       <div class="col-4"><div class="border rounded p-2 bg-light"><div class="small text-muted">Products</div><div class="fw-bold fs-5">${summary.totalItems}</div></div></div>
       <div class="col-4"><div class="border rounded p-2 bg-light"><div class="small text-muted">Est. Cost</div><div class="fw-bold fs-5">$${summary.estimatedCost.toFixed(2)}</div></div></div>
@@ -6063,6 +6905,9 @@ function renderBatchResults(data) {
             resolution: getGlobalBatchImageResolution(),
             cardId: batchCardId,
             cardEl: batchCardEl,
+            itemType: "batch_item",
+            itemKey: itemIdx,
+            shotIndex: idx,
           });
         });
       }
@@ -6083,6 +6928,9 @@ function renderBatchResults(data) {
             resolution: getGlobalBatchImageResolution(),
             cardId: batchCardId,
             cardEl,
+            itemType: "batch_item",
+            itemKey: itemIdx,
+            shotIndex: idx,
           });
           if (newUrl) {
             if (editInput) editInput.value = "";
@@ -6106,7 +6954,13 @@ dom.studioForm.addEventListener("submit", async (e) => {
   if (overCap) return alert("Shot Mix total cannot exceed 10.");
   if (total < 1) return alert("Request at least 1 frame.");
   const apiKey = getUserKey();
-  const runId = (state.runId = crypto.randomUUID());
+  // Reuse the run_id minted when the reference photo was analyzed (if
+  // any), so this campaign's row and its pre-flight analysis/moderation
+  // costs share one run_id — then clear it immediately so a LATER,
+  // unrelated submit (without a fresh reference upload) doesn't silently
+  // reuse a stale id and overwrite this campaign's saved row.
+  const runId = (state.runId = state.pendingShootRunId || crypto.randomUUID());
+  state.pendingShootRunId = null;
   try {
     warnIfReliabilityIssues();
     toggleStatusView(
@@ -6420,6 +7274,7 @@ subjectSelectionNote: state.subjectSelectionNote,
       matchReferenceOutfit: dom.matchReferenceOutfit.checked,
       modelTier: getModelTier(),
       skipCanonicalRender: dom.skipCanonicalRender ? dom.skipCanonicalRender.checked : false,
+      seed: document.getElementById("globalSeedInput")?.value ? parseInt(document.getElementById("globalSeedInput").value) : null,
     };
     const { res: imgRes, data: imgData } = await fetchJson(
       "/api/generate-images",
@@ -6438,6 +7293,7 @@ subjectSelectionNote: state.subjectSelectionNote,
         imgData.diagnostics,
         imgData.modelsUsed,
       );
+      if (imgData.replacementNote) logActivity("warning", `🔄 ${imgData.replacementNote}`);
       logActivity("success", `Photoshoot complete: ${imgData.diagnostics?.framesSucceeded ?? imgData.images.length} of ${imgData.diagnostics?.framesRequested ?? imgData.images.length} frame(s) rendered.`);
       if (!imgData.diagnostics?.frameErrors?.length) clearActiveRun();
     } else {
@@ -6450,7 +7306,7 @@ subjectSelectionNote: state.subjectSelectionNote,
     toggleStatusView(false);
   }
 }
-function showSinglePreflight() {
+async function showSinglePreflight() {
   const frameCount = state.generatedPrompts.length;
   const tier = state.classification?.modelTierRecommendation;
   const reasoning = state.classification?.modelTierReasoning;
@@ -6458,8 +7314,10 @@ function showSinglePreflight() {
   const model = state.imageModels.find((m) => m.id === modelId);
   const perImageCost = model?.costPerImage ?? 0.1;
   const estimatedCost = perImageCost * frameCount;
+  const budgetBanner = await buildBudgetWarningBanner(estimatedCost);
   const bodyEl = document.getElementById("preflightBody");
   bodyEl.innerHTML = `
+    ${budgetBanner}
     <div class="row g-2 text-center mb-3">
       <div class="col-4"><div class="border rounded p-2 bg-light"><div class="small text-muted">Frames</div><div class="fw-bold fs-5">${frameCount}</div></div></div>
       <div class="col-4"><div class="border rounded p-2 bg-light"><div class="small text-muted">Est. Cost</div><div class="fw-bold fs-5">$${estimatedCost.toFixed(2)}</div></div></div>
@@ -6574,6 +7432,8 @@ function renderFinalImageGrid(imageUrls, diagnostics, modelsUsed, { gridId = "fi
         resolution: getGlobalImageResolution(),
         cardId,
         cardEl: col,
+        itemType: "frame",
+        itemKey: index,
       });
     });
     col.querySelector(`[data-edit-idx="${index}"]`).addEventListener("click", async () => {
@@ -6589,6 +7449,8 @@ function renderFinalImageGrid(imageUrls, diagnostics, modelsUsed, { gridId = "fi
         resolution: getGlobalImageResolution(),
         cardId,
         cardEl: col,
+        itemType: "frame",
+        itemKey: index,
       });
       if (newUrl) {
         if (editInput) editInput.value = "";
@@ -6672,7 +7534,7 @@ function refreshCarouselNav(cardId, cardEl) {
   }
 }
 
-async function regenerateFrameWithModel({ imgEl, prompt, referenceImages, aspectRatio, model, runId, resolution, cardId, cardEl }) {
+async function regenerateFrameWithModel({ imgEl, prompt, referenceImages, aspectRatio, model, runId, resolution, cardId, cardEl, itemType, itemKey, shotIndex }) {
   if (!model) return alert("Pick a model from the dropdown first.");
   const originalSrc = imgEl.src;
   imgEl.style.opacity = "0.4";
@@ -6681,7 +7543,7 @@ async function regenerateFrameWithModel({ imgEl, prompt, referenceImages, aspect
     const { res, data } = await fetchJson("/api/regenerate-frame", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, referenceImages, aspectRatio, imageModel: model, imageResolution: resolution, runId, userApiKey: getUserKey() }),
+      body: JSON.stringify({ prompt, referenceImages, aspectRatio, imageModel: model, imageResolution: resolution, runId, itemType, itemKey, shotIndex, userApiKey: getUserKey() }),
     });
     await refreshCreditsSummary();
     if (!res.ok) throw new Error(data.error || "Regeneration failed.");
@@ -6726,7 +7588,7 @@ function editControlHtml(cardIndex, groupAttr) {
     <button type="button" class="btn btn-sm btn-outline-primary px-2 py-1" data-edit-idx="${cardIndex}" title="Edit this exact image with the instruction typed above">✏️</button>
   </div>`;
 }
-async function editFrameWithInstruction({ imgEl, editInstruction, model, aspectRatio, runId, resolution, cardId, cardEl }) {
+async function editFrameWithInstruction({ imgEl, editInstruction, model, aspectRatio, runId, resolution, cardId, cardEl, itemType, itemKey, shotIndex }) {
   if (!editInstruction || !editInstruction.trim()) return alert("Type what you'd like changed first.");
   if (!model) return alert("Pick a model from the dropdown first — edit needs a model too.");
   return regenerateFrameWithModel({
@@ -6739,6 +7601,9 @@ async function editFrameWithInstruction({ imgEl, editInstruction, model, aspectR
     resolution,
     cardId,
     cardEl,
+    itemType,
+    itemKey,
+    shotIndex,
   });
 }
 // ============================================================

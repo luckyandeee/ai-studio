@@ -32,6 +32,7 @@ const IMAGE_MODELS = [
     tier: "fast",
     costPerImage: 0.039, // confirmed directly from Fal's own pricing
     textToImageOnly: true,
+    supportsSeed: true, // confirmed directly from fal.ai/models/fal-ai/nano-banana/edit/api's own real schema
   },
   {
     id: "fal-ai/nano-banana-pro/edit",
@@ -40,6 +41,7 @@ const IMAGE_MODELS = [
     maxReferenceImages: 14,
     costPerImage: 0.15,
     supportsResolutionParam: true, // confirmed: accepts resolution: "1K"/"2K"/"4K"
+    supportsSeed: true, // confirmed directly from fal.ai/models/fal-ai/nano-banana-pro/edit/api — real "seed" field for reproducible generation
   },
   {
     // Confirmed via fal.ai/models/fal-ai/nano-banana-2/edit — the genuine
@@ -56,6 +58,7 @@ const IMAGE_MODELS = [
     maxReferenceImages: 14,
     costPerImage: 0.045, // placeholder — verify current price on your dashboard
     supportsResolutionParam: true, // same Google schema family as Pro — confirmed to support 1K/2K/4K
+    supportsSeed: true, // confirmed directly from fal.ai/models/fal-ai/nano-banana-2/edit/api — real "seed" field, same Google schema family as Pro
   },
   {
     id: "fal-ai/flux-2-pro/edit",
@@ -63,6 +66,15 @@ const IMAGE_MODELS = [
     tier: "fast",
     maxReferenceImages: 9,
     costPerMegapixel: 0.03,
+    supportsSeed: true, // confirmed directly from this exact endpoint's own real example payload on fal.ai's docs — same reproducible-seed behavior as Nano Banana Pro/2
+    // Confirmed via this exact endpoint's COMPLETE real input schema
+    // (fal.ai/models/fal-ai/flux-2-pro/edit/api) — there is no
+    // aspect_ratio field at all, only image_size (an enum of preset
+    // shapes: auto/square_hd/square/portrait_4_3/portrait_16_9/
+    // landscape_4_3/landscape_16_9). This app was unconditionally
+    // sending aspect_ratio to every model regardless — real, confirmed
+    // gap, now gated in buildFalImageInput.
+    usesImageSizeConvention: true,
   },
   {
     id: "openai/gpt-image-2/edit",
@@ -244,11 +256,21 @@ const VIDEO_MODELS = [
     // separately-pasted "options" list claimed a structured `elements`
     // array with frontal_image_url/reference_image_urls sub-fields —
     // that specific structure never appeared in any real usage example
-    // checked, so it's not wired. UPDATE: camera_control genuinely IS a
-    // real field on Kling (confirmed via v3 Standard's schema, type
-    // "Enum") — just without confirmed valid values yet, so still not
-    // wired as a UI control until those are verified (a dropdown with
-    // guessed options would be worse than no dropdown).
+    // checked, so it's not wired.
+    // CORRECTION to an earlier note here: camera_control (horizontal/
+    // vertical/pan/tilt/roll/zoom) is NOT actually a field on this
+    // endpoint — directly re-checked against fal.ai's real API reference
+    // for fal-ai/kling-video/v3/pro/image-to-video specifically. That
+    // field belongs to a genuinely different Kling product line, the
+    // "Motion Control" video-to-video endpoints (e.g. fal-ai/kling-video/
+    // v2.6/standard/motion-control) — a prior version of this comment
+    // conflated the two. What's actually confirmed real on THIS endpoint
+    // instead: negative_prompt (default "blur, distort, and low
+    // quality"), cfg_scale (default 0.5), aspect_ratio (16:9/9:16/1:1),
+    // and generate_audio — negative_prompt/cfg_scale are already picked
+    // up automatically by buildFalVideoInput's live schema detection
+    // (see server.js), aspect_ratio isn't yet exposed as a Kling-specific
+    // control in the video UI.
     id: "fal-ai/kling-video/o3/pro/image-to-video",
     label: "Kling O3 Pro — newer than v3, reference-based multi-element combine",
     tier: "alt",
@@ -412,18 +434,32 @@ function estimateVideoCost(modelId, durationSeconds) {
 // enum-type models (Veo), clamped into range for range-type models
 // (Kling), or clamped to a generic 1-30s window for unrecognized/custom
 // model IDs where the real constraint isn't known.
-function resolveVideoDuration(modelId, requestedSeconds) {
+function resolveVideoDuration(modelId, requestedSeconds, liveCapabilities = null) {
   const requested = parseInt(requestedSeconds) || DEFAULT_VIDEO_DURATION;
   const m = getVideoModel(modelId);
   const constraint = m?.duration;
-  if (!constraint) return Math.max(1, Math.min(30, requested));
-  if (constraint.type === "enum") {
-    return constraint.options.reduce((closest, v) => (Math.abs(v - requested) < Math.abs(closest - requested) ? v : closest), constraint.options[0]);
+  if (constraint) {
+    if (constraint.type === "enum") {
+      return constraint.options.reduce((closest, v) => (Math.abs(v - requested) < Math.abs(closest - requested) ? v : closest), constraint.options[0]);
+    }
+    if (constraint.type === "range") {
+      return Math.max(constraint.min, Math.min(constraint.max, Math.round(requested)));
+    }
+    return requested;
   }
-  if (constraint.type === "range") {
-    return Math.max(constraint.min, Math.min(constraint.max, Math.round(requested)));
+  // Real, confirmed gap fixed here: a model NOT in the curated registry
+  // (an auto-discovered one) always fell through to a generic 1-30s
+  // clamp, even when its real schema — already read by the ongoing
+  // catalog check — has an actual duration enum or min/max range that's
+  // more accurate than that generic guess.
+  if (liveCapabilities?.durationEnum?.length) {
+    const options = liveCapabilities.durationEnum.map((v) => parseInt(v)).filter((v) => !isNaN(v));
+    if (options.length) return options.reduce((closest, v) => (Math.abs(v - requested) < Math.abs(closest - requested) ? v : closest), options[0]);
   }
-  return requested;
+  if (liveCapabilities?.durationMin != null && liveCapabilities?.durationMax != null) {
+    return Math.max(liveCapabilities.durationMin, Math.min(liveCapabilities.durationMax, Math.round(requested)));
+  }
+  return Math.max(1, Math.min(30, requested));
 }
 
 // ============================================================
@@ -528,6 +564,42 @@ const UTILITY_MODELS = {
       bestFor: "photos that are already in color and just need scratch/damage cleanup, not colorization",
     },
   ],
+  // Post-hoc background editing on an ALREADY-GENERATED video — a
+  // genuinely new capability, not something this app could do before.
+  // Distinct from HeyGen Avatar 4's background param (fal-models.js
+  // TALKING_AVATAR_MODELS below), which sets the background AT
+  // generation time — this instead re-processes a finished clip.
+  videoBackground: [
+    {
+      // Confirmed via fal.ai/models/bria/video/background-removal/v3/api
+      // — real schema (video_url, background_color enum, preserve_audio,
+      // output_container_and_codec). Real constraint, also confirmed:
+      // input must be under 4000x4000 and under 30 SECONDS — for a
+      // longer video, this has to run per-scene before stitching (see
+      // video-stitcher.js), not on the whole thing at once.
+      // Only produces a solid color or transparent background directly —
+      // compositing onto a fully custom background image/video is a
+      // second step (transparent output + ffmpeg overlay), not one call.
+      // PRICE UNCONFIRMED: Fal's own model page showed $0.14/sec at the
+      // time this was checked, but a third-party review cited
+      // $0.0042/sec — a 33x difference that couldn't be reconciled from
+      // available sources. Verify the real rate on your own dashboard
+      // before relying on this estimate for budgeting.
+      id: "bria/video/background-removal/v3",
+      label: "Bria VRMBG 3.0 — remove/replace video background, keeps audio",
+      videoField: "video_url",
+      costPerSecond: 0.14, // UNCONFIRMED — see note above, verify before relying on this
+      maxDurationSeconds: 30,
+      bestFor: "cleanly removing a video's background (solid color or transparent) to recomposite it elsewhere, or to simplify a busy background — works on talking-avatar clips, product videos, and general footage alike",
+      backgroundColorOptions: ["Transparent", "Black", "White", "Gray", "Red", "Green", "Blue", "Yellow", "Cyan", "Magenta", "Orange"],
+      buildInput: (videoUrl, opts = {}) => ({
+        video_url: videoUrl,
+        background_color: opts.backgroundColor || "Transparent",
+        preserve_audio: opts.preserveAudio !== false,
+        output_container_and_codec: opts.outputCodec || "mp4_h264",
+      }),
+    },
+  ],
 };
 
 // ============================================================
@@ -629,12 +701,23 @@ function prepareProductionScript(text) {
   return { text: converted.join("\n"), deliveryNote };
 }
 function translateScriptMarkers(text, { wrapInterjection, wrapPause } = {}) {
+  // Real, confirmed bug fixed here: when a marker like *confident* didn't
+  // map to anything a model actually supports, it was silently deleted —
+  // not just the tag, the WORD itself vanished with zero trace or
+  // explanation. Confirmed directly: "once a wise man said *pause*
+  // *confident* nothing!!!" sent to MiniMax became "once a wise man said
+  // <#1#> nothing!!!" — "confident" just gone. Now tracked and returned
+  // so a caller can actually tell the person what happened instead of
+  // them wondering why a word disappeared.
+  const strippedMarkers = [];
   let replaced = text.replace(/\*([^*]+)\*/g, (_, inner) => {
     const trimmed = inner.trim();
     if (wrapPause && PAUSE_KEYWORDS.test(trimmed)) {
       return wrapPause(parsePauseSeconds(trimmed));
     }
-    return wrapInterjection(trimmed);
+    const wrapped = wrapInterjection(trimmed);
+    if (!wrapped) strippedMarkers.push(trimmed);
+    return wrapped;
   });
   // MiniMax's own docs confirm pause markers "cannot be used
   // consecutively" — if an interjection between two pauses gets
@@ -652,7 +735,20 @@ function translateScriptMarkers(text, { wrapInterjection, wrapPause } = {}) {
   replaced = replaced.replace(/(\[pause\])(\s*)\1+/g, "$1");
   // Clean up doubled-up whitespace left behind wherever a marker was
   // stripped entirely, so it doesn't read as an odd, unnatural gap.
-  return replaced.replace(/[ \t]+/g, " ").replace(/ +\n/g, "\n").trim();
+  const finalText = replaced.replace(/[ \t]+/g, " ").replace(/ +\n/g, "\n").trim();
+  return { text: finalText, strippedMarkers };
+}
+// Wraps a voice model's buildInput so the real translateScriptMarkers
+// object above (text + strippedMarkers) still produces a plain request-
+// input object safe to send to Fal as-is (existing call sites are
+// untouched), while attaching strippedMarkers as a non-enumerable
+// property — invisible to JSON.stringify/Object.keys/the actual API
+// call, but readable by any NEW code that explicitly checks for it.
+function withStrippedMarkersMeta(input, strippedMarkers) {
+  if (strippedMarkers?.length) {
+    Object.defineProperty(input, "__strippedMarkers", { value: strippedMarkers, enumerable: false });
+  }
+  return input;
 }
 const VOICE_MODELS = [
   {
@@ -664,6 +760,11 @@ const VOICE_MODELS = [
     label: "MiniMax Speech-02 HD — 300+ voices, 30+ languages, emotion control",
     costPer1kChars: 0.10,
     bestFor: "narration, voiceover, dialogue — the default choice for most voice needs",
+    // Real, proactive version of the fix for the *confident* bug — tells
+    // someone what actually works BEFORE they generate, not just after a
+    // word silently vanishes. Lists the exact 8 confirmed tags, not a
+    // vague "some sounds are supported."
+    markupHint: "Type *laughs*, *sighs*, *coughs*, *clears throat*, *gasps*, *sniffs*, *groans*, *yawns*, or *3 second pause* — these are the only stage directions this model actually supports. A descriptive word like *confident* isn't a real sound cue and won't be spoken.",
     supportsEmotionPitchSpeed: true,
     modelFamily: "minimax", // matches VOICE_CLONE_MODELS' modelFamily, so custom cloned voices show up here
     // Confirmed real enum from the voice_setting.emotion field's schema —
@@ -717,8 +818,8 @@ const VOICE_MODELS = [
       "Portuguese", "German", "Turkish", "Dutch", "Ukrainian", "Vietnamese", "Indonesian",
       "Japanese", "Italian", "Korean", "Thai", "Polish", "Romanian", "Greek", "Czech", "Finnish",
     ],
-    buildInput: (text, { voiceId, speed, pitch, emotion, language } = {}) => ({
-      text: translateScriptMarkers(text, {
+    buildInput: (text, { voiceId, speed, pitch, emotion, language } = {}) => {
+      const prepared = translateScriptMarkers(text, {
         // Only these 8 exact tags are confirmed real for this model —
         // mapToMinimaxInterjection matches common phrasings to them and
         // strips anything that doesn't genuinely map, rather than
@@ -726,24 +827,28 @@ const VOICE_MODELS = [
         wrapInterjection: mapToMinimaxInterjection,
         // Confirmed real: <#x#> for timed pauses (0.01-99.99s, from Fal's own docs page).
         wrapPause: (seconds) => `<#${seconds}#>`,
-      }),
-      voice_setting: {
-        voice_id: voiceId || "Wise_Woman",
-        speed: speed ?? 1.0,
-        vol: 1.0,
-        pitch: pitch ?? 0,
-        emotion: emotion || "neutral",
-        english_normalization: false,
-      },
-      ...(language && language !== "auto" ? { language_boost: language } : {}),
-      // Confirmed directly from a real 422 validation error returned by
-      // Fal's own API: output_format only accepts 'url' or 'hex', NOT a
-      // file-extension-style value like 'mp3' — an earlier search result
-      // showing "mp3" was misapplied from different context. 'url' is
-      // used here since it matches the audio.url response shape this
-      // code already reads.
-      output_format: "url",
-    }),
+      });
+      const input = {
+        text: prepared.text,
+        voice_setting: {
+          voice_id: voiceId || "Wise_Woman",
+          speed: speed ?? 1.0,
+          vol: 1.0,
+          pitch: pitch ?? 0,
+          emotion: emotion || "neutral",
+          english_normalization: false,
+        },
+        ...(language && language !== "auto" ? { language_boost: language } : {}),
+        // Confirmed directly from a real 422 validation error returned by
+        // Fal's own API: output_format only accepts 'url' or 'hex', NOT a
+        // file-extension-style value like 'mp3' — an earlier search result
+        // showing "mp3" was misapplied from different context. 'url' is
+        // used here since it matches the audio.url response shape this
+        // code already reads.
+        output_format: "url",
+      };
+      return withStrippedMarkersMeta(input, prepared.strippedMarkers);
+    },
   },
   {
     // Confirmed directly from fal.ai/models/fal-ai/elevenlabs/tts/eleven-v3
@@ -758,6 +863,7 @@ const VOICE_MODELS = [
     label: "ElevenLabs Eleven v3 — expressive delivery, 70+ languages including Telugu/Tamil/Kannada",
     costPer1kChars: 0.10,
     bestFor: "expressive dialogue, character voices, or Indian-language speech (Telugu/Tamil/Kannada/Malayalam/Marathi/Gujarati/Punjabi/Hindi/Urdu all confirmed) — the right pick when local-language coverage matters",
+    markupHint: "Type any descriptive cue in *asterisks* — *confident*, *whispers*, *excited*, *pause*, *sarcastic*, anything — this model reads bracket-style delivery tags directly, so nothing gets silently dropped.",
     supportsEmotionPitchSpeed: false,
     // Model-level, not repeated per-voice — same real, confirmed fact
     // (ElevenLabs' own docs: all Default voices expire Dec 31 2026
@@ -803,26 +909,52 @@ const VOICE_MODELS = [
     voiceInputMode: "dropdown-with-custom",
     voiceInputHint: "Every name above is a real, currently-working ElevenLabs Default voice — all of them retire Dec 31 2026 together, so this is a \"works now, plan ahead\" list. For anything else from their 10,000+ voice library, or ElevenLabs' own newer replacement voices, pick \"Custom voice...\" and paste a name from the link below.",
     voiceListUrl: "https://elevenlabs.io/app/voice-library",
-    // CORRECTED from an earlier, incomplete claim — confirmed directly
-    // from ElevenLabs' own docs (elevenlabs.io/docs/overview/models) and
-    // help center, consistent across both: Eleven v3 supports 70+
-    // languages, including Telugu, Tamil, Kannada, Malayalam, Marathi,
-    // Gujarati, Punjabi, Sindhi, Urdu, and Hindi — genuinely broad
-    // Indian-language coverage, unlike the MiniMax model above. No
-    // separate language parameter needed: this model auto-detects the
-    // language directly from the input text's script, confirmed from
-    // the same docs ("automatically uses the appropriate language of
-    // the input text").
-    confirmedLanguages: null, // no language_boost-style parameter exists for this model — language is auto-detected from the text itself
+    // Real, confirmed bug fixed here: this field used to be duplicated —
+    // an earlier `confirmedLanguages: [...]` array (with genuinely
+    // accurate data, confirmed directly against ElevenLabs' own official
+    // docs: elevenlabs.io/docs, help.elevenlabs.io "What languages do
+    // you support?", 74 languages including Telugu, Tamil, Kannada,
+    // Malayalam, Marathi, Gujarati, Punjabi, Sindhi, Urdu, and Hindi)
+    // sat earlier in this same object, then got silently overwritten by
+    // THIS null further down — a duplicate object key, where JS keeps
+    // only the last value assigned. The array was real and correct; it
+    // just never actually took effect, so anything reading it directly
+    // (recommendVoiceModel in server.js, the frontend's Voice Studio
+    // suggestion banner) would have silently missed this model. Genuinely
+    // set to null here on purpose, not by mistake: this model auto-
+    // detects language directly from the input text's script rather than
+    // taking a separate language parameter, so a fixed array to check
+    // against isn't the right shape for it in the first place — see
+    // autoDetectsLanguageFromText below, which is what code should
+    // actually check instead.
+    confirmedLanguages: null,
     autoDetectsLanguageFromText: true,
+    // The actual checkable version of the language list described in the
+    // comment above — kept deliberately separate from confirmedLanguages
+    // (which stays null, correctly meaning "no explicit language
+    // parameter") so code can still verify real language coverage
+    // (recommendVoiceModel in server.js) without conflating "confirmed to
+    // work" with "takes this as a parameter value," which are genuinely
+    // different things for an auto-detecting model.
+    autoDetectedLanguagesSupported: [
+      "Afrikaans", "Arabic", "Armenian", "Assamese", "Azerbaijani", "Belarusian", "Bengali", "Bosnian",
+      "Bulgarian", "Catalan", "Cebuano", "Chichewa", "Croatian", "Czech", "Danish", "Dutch", "English",
+      "Estonian", "Filipino", "Finnish", "French", "Galician", "Georgian", "German", "Greek", "Gujarati",
+      "Hausa", "Hebrew", "Hindi", "Hungarian", "Icelandic", "Indonesian", "Irish", "Italian", "Japanese",
+      "Javanese", "Kannada", "Kazakh", "Kirghiz", "Korean", "Latvian", "Lingala", "Lithuanian",
+      "Luxembourgish", "Macedonian", "Malay", "Malayalam", "Mandarin Chinese", "Marathi", "Nepali",
+      "Norwegian", "Pashto", "Persian", "Polish", "Portuguese", "Punjabi", "Romanian", "Russian", "Serbian",
+      "Sindhi", "Slovak", "Slovenian", "Somali", "Spanish", "Swahili", "Swedish", "Tamil", "Telugu", "Thai",
+      "Turkish", "Ukrainian", "Urdu", "Vietnamese", "Welsh",
+    ],
     // No confirmed emotion/pitch/speed parameters for this model —
     // unlike MiniMax, expressiveness is driven by bracketed tags in the
     // text itself (confirmed: "[excited] Welcome to Eleven v3!"), so
     // those UI controls are simply not sent for this model rather than
     // sending unconfirmed fields that might be silently ignored or
     // rejected.
-    buildInput: (text, { voiceId } = {}) => ({
-      text: translateScriptMarkers(text, {
+    buildInput: (text, { voiceId } = {}) => {
+      const prepared = translateScriptMarkers(text, {
         // Confirmed real usage pattern for this model: square-bracket
         // audio tags for delivery/emotion cues, e.g. "[excited]",
         // "[whispers]". No separately-confirmed pause-tag mechanism for
@@ -832,9 +964,9 @@ const VOICE_MODELS = [
         // though not independently confirmed the way MiniMax's <#x#> is.
         wrapInterjection: (s) => `[${s}]`,
         wrapPause: () => `[pause]`,
-      }),
-      voice: voiceId || "Sarah",
-    }),
+      });
+      return withStrippedMarkersMeta({ text: prepared.text, voice: voiceId || "Sarah" }, prepared.strippedMarkers);
+    },
   },
   {
     // Confirmed directly from Fal's own complete API schema page
@@ -855,6 +987,7 @@ const VOICE_MODELS = [
     // confirmed Fal rate.
     costPer1kChars: 0.10,
     bestFor: "Indian-language narration with genuine language selection (not auto-detect), or multi-speaker dialogue — supports real speaker-alias prefixes like 'Alice: ... Bob: ...' for two-person scenes",
+    markupHint: "Type any descriptive cue in *asterisks* — *confident*, *slowly*, *whispering*, *excited*, anything — this model reads inline style markers directly, so nothing gets silently dropped.",
     supportsEmotionPitchSpeed: false,
     // All 30 real descriptions below are sourced directly from Google's
     // own official Gemini API docs (ai.google.dev/gemini-api/docs/
@@ -904,10 +1037,10 @@ const VOICE_MODELS = [
       "Odia (India)", "Sindhi (India)", "Konkani (India)", "Bangla (Bangladesh)",
       "English (India)", "English (US)", "Urdu (Pakistan)",
     ],
-    buildInput: (text, { voiceId, language } = {}) => ({
+    buildInput: (text, { voiceId, language } = {}) => {
       // Confirmed real field name: "prompt", not "text" — this model's
       // schema is genuinely different from the others here.
-      prompt: translateScriptMarkers(text, {
+      const prepared = translateScriptMarkers(text, {
         // No confirmed dedicated pause syntax for this model — but Fal's
         // own docs confirm real inline style markers like [slowly],
         // [whispering], [excited] work directly in the prompt text, so
@@ -916,12 +1049,16 @@ const VOICE_MODELS = [
         // markers entirely.
         wrapInterjection: (s) => `[${s}]`,
         wrapPause: () => `[slowly]`,
-      }),
-      voice: voiceId || "Kore",
-      model: "gemini-2.5-flash-tts",
-      ...(language && language !== "auto" ? { language_code: language } : {}),
-      output_format: "mp3",
-    }),
+      });
+      const input = {
+        prompt: prepared.text,
+        voice: voiceId || "Kore",
+        model: "gemini-2.5-flash-tts",
+        ...(language && language !== "auto" ? { language_code: language } : {}),
+        output_format: "mp3",
+      };
+      return withStrippedMarkersMeta(input, prepared.strippedMarkers);
+    },
   },
   {
     // Confirmed directly on Fal's own sandbox page
@@ -935,6 +1072,7 @@ const VOICE_MODELS = [
     label: "Kokoro TTS (Hindi) — dedicated Hindi model, cheapest confirmed option",
     costPer1kChars: 0.02,
     bestFor: "Hindi narration specifically — purpose-built for one language rather than general multilingual coverage, and the cheapest real option available",
+    markupHint: "No confirmed stage-direction or tone-tag support for this model — anything in *asterisks* will be removed entirely, not spoken. Switch to MiniMax (sound cues) or ElevenLabs/Gemini TTS (descriptive tags) if you need expressive markup.",
     supportsEmotionPitchSpeed: false,
     // Confirmed real voice ID from a live Fal example ("hf_alpha" — "h"
     // for Hindi, "f" for female). Kokoro's broader voice set (per its
@@ -956,17 +1094,17 @@ const VOICE_MODELS = [
     confirmedLanguages: null,
     // Schema confirmed from Fal's own live example: {prompt, voice} —
     // notably "prompt", not "text", unlike every other model here.
-    buildInput: (text, { voiceId } = {}) => ({
-      prompt: translateScriptMarkers(text, {
+    buildInput: (text, { voiceId } = {}) => {
+      const prepared = translateScriptMarkers(text, {
         // Not confirmed whether this model supports any interjection or
         // pause syntax at all — safest honest choice is to strip stage
         // directions entirely rather than guess at a format that might
         // just get read aloud literally, same mistake as before.
         wrapInterjection: () => "",
         wrapPause: () => "",
-      }),
-      voice: voiceId || "hf_alpha",
-    }),
+      });
+      return withStrippedMarkersMeta({ prompt: prepared.text, voice: voiceId || "hf_alpha" }, prepared.strippedMarkers);
+    },
   },
   {
     // Confirmed directly from fal.ai/models/fal-ai/inworld-tts/api — real
@@ -978,6 +1116,7 @@ const VOICE_MODELS = [
     label: "Inworld TTS-1.5 Max — lowest confirmed cost, low-latency, 15 languages",
     costPer1kChars: 0.01,
     bestFor: "cost-sensitive narration at real scale — cheapest confirmed option here while still rated competitively on naturalness",
+    markupHint: "No confirmed stage-direction or tone-tag support for this model — anything in *asterisks* will be removed entirely, not spoken. Switch to MiniMax (sound cues) or ElevenLabs/Gemini TTS (descriptive tags) if you need expressive markup.",
     supportsEmotionPitchSpeed: false,
     // HONEST, deliberately conservative: "Craig (en)" is the only voice
     // name directly confirmed in Fal's own real example payload for
@@ -991,17 +1130,17 @@ const VOICE_MODELS = [
     confirmedVoiceIds: [{ id: "Craig (en)", description: "The one voice name directly confirmed in Fal's own real example payload for this endpoint" }],
     voiceInputMode: "dropdown-with-custom",
     voiceInputHint: "Only \"Craig (en)\" is directly confirmed for this exact Fal endpoint. Inworld's real voice set is larger (their own docs mention Alex, Ashley, Deborah, and others) but those weren't independently verified against this specific endpoint — try \"Custom voice...\" and confirm with Preview before relying on one.",
-    buildInput: (text, { voiceId } = {}) => ({
-      text: translateScriptMarkers(text, {
+    buildInput: (text, { voiceId } = {}) => {
+      const prepared = translateScriptMarkers(text, {
         // Not confirmed whether this model supports any stage-direction
         // syntax — stripped rather than guessed, same honest standard
         // as Kokoro above.
         wrapInterjection: () => "",
         wrapPause: () => "",
-      }),
-      voice: voiceId || "Craig (en)",
-      sample_rate_hertz: 48000,
-    }),
+      });
+      const input = { text: prepared.text, voice: voiceId || "Craig (en)", sample_rate_hertz: 48000 };
+      return withStrippedMarkersMeta(input, prepared.strippedMarkers);
+    },
   },
   {
     // Confirmed directly from fal.ai/models/xai/tts/v1/api — real,
@@ -1014,16 +1153,18 @@ const VOICE_MODELS = [
     label: "xAI TTS v1 — expressive real-time dialogue, inline speech tags",
     costPer1kChars: null, // not confirmed — Fal's own page didn't show a per-character rate in what was retrieved
     bestFor: "expressive, real-time-feeling dialogue with inline delivery control",
+    markupHint: "No confirmed stage-direction or tone-tag support for this specific Fal endpoint — anything in *asterisks* will be removed entirely, not spoken. Switch to MiniMax (sound cues) or ElevenLabs/Gemini TTS (descriptive tags) if you need expressive markup.",
     supportsEmotionPitchSpeed: false,
     voiceInputMode: "freeform",
     voiceInputHint: "This model supports 5 expressive voices per Fal's own page, but the exact names weren't independently confirmed here — type a voice name and verify with Preview, or leave blank for the model's default.",
-    buildInput: (text, { voiceId } = {}) => ({
-      text: translateScriptMarkers(text, {
+    buildInput: (text, { voiceId } = {}) => {
+      const prepared = translateScriptMarkers(text, {
         wrapInterjection: () => "",
         wrapPause: () => "",
-      }),
-      ...(voiceId ? { voice: voiceId } : {}),
-    }),
+      });
+      const input = { text: prepared.text, ...(voiceId ? { voice: voiceId } : {}) };
+      return withStrippedMarkersMeta(input, prepared.strippedMarkers);
+    },
   },
 ];
 
@@ -1150,6 +1291,7 @@ const MUSIC_MODELS = [
     costPerGeneration: null, // priced per output length on Fal's own billing, not a flat confirmed rate
     bestFor: "high-quality instrumental or ambient background music with precise negative prompting (e.g. explicitly excluding vocals or a certain tempo) — NOT for songs with vocals, no lyrics field exists",
     instrumentalOnly: true,
+    supportsNegativePrompt: true,
     buildInput: (stylePrompt, negativePrompt) => ({
       prompt: stylePrompt,
       ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
@@ -1265,6 +1407,13 @@ const TALKING_AVATAR_MODELS = [
     costPerSecond: 0.10,
     supportsNativeText: true, // honest flag — the other two models here don't have this
     supportsBackground: true,
+    // Confirmed directly from Fal's own docs for this exact model: real
+    // enum values "stable"/"expressive" for talking_style, and
+    // "16:9"/"9:16"/"1:1" for aspect_ratio. Kept as a distinct flag from
+    // supportsBackground on purpose — they happen to both be true only
+    // for this one model today, but they're genuinely different
+    // controls, not the same capability.
+    supportsDeliveryControls: true,
     buildInput: (imageUrl, audioUrlOrNull, opts = {}) => ({
       image_url: imageUrl,
       ...(audioUrlOrNull ? { audio_url: audioUrlOrNull } : { prompt: opts.text, voice: opts.voice || "Ivy" }),
