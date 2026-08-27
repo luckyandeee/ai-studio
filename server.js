@@ -43,6 +43,8 @@ const {
   TALKING_AVATAR_MODELS,
   MUSIC_INSTRUMENTS,
   MUSIC_GENRE_PRESETS,
+  COMMON_VOICEOVER_LANGUAGES,
+  SCRIPT_RANGE_SOURCES,
 } = require("./fal-models");
 const {
   refreshModelLiveStatus,
@@ -4190,6 +4192,8 @@ app.get("/api/models", (req, res) => {
     musicModels: MUSIC_MODELS,
     musicInstruments: MUSIC_INSTRUMENTS,
     musicGenrePresets: MUSIC_GENRE_PRESETS,
+    voiceoverLanguages: COMMON_VOICEOVER_LANGUAGES,
+    scriptRanges: SCRIPT_RANGE_SOURCES,
     talkingAvatarModels: TALKING_AVATAR_MODELS,
     customVoices: db.listCustomVoices("minimax"),
     imageResolutions: IMAGE_RESOLUTIONS,
@@ -4626,19 +4630,50 @@ app.post("/api/tools/process", async (req, res) => {
 // English for Telugu while correctly translating Hindi. Only languages
 // with a genuinely distinct non-Latin script can be validated this way;
 // languages that share Latin script (Spanish, French, etc.) are skipped.
-const TARGET_LANGUAGE_SCRIPT_RANGES = {
-  Hindi: /[\u0900-\u097F]/, Marathi: /[\u0900-\u097F]/,
-  Telugu: /[\u0C00-\u0C7F]/, Tamil: /[\u0B80-\u0BFF]/, Kannada: /[\u0C80-\u0CFF]/,
-  Malayalam: /[\u0D00-\u0D7F]/, Bengali: /[\u0980-\u09FF]/, Gujarati: /[\u0A80-\u0AFF]/,
-  Punjabi: /[\u0A00-\u0A7F]/, Odia: /[\u0B00-\u0B7F]/, Urdu: /[\u0600-\u06FF]/,
-  Arabic: /[\u0600-\u06FF]/, Chinese: /[\u4E00-\u9FFF]/, Japanese: /[\u3040-\u30FF\u4E00-\u9FFF]/,
-};
+// Built from fal-models.js's SCRIPT_RANGE_SOURCES so this can never
+// drift from what the frontend's mismatch warning checks against — see
+// that file for the full reasoning.
+const TARGET_LANGUAGE_SCRIPT_RANGES = Object.fromEntries(
+  Object.entries(SCRIPT_RANGE_SOURCES).map(([lang, src]) => [lang, new RegExp(src)]),
+);
+// REAL BUG FIXED HERE: a manually-typed tag like [telugu] (lowercase,
+// exactly as someone would naturally type it) never matched the
+// capitalized "Telugu" key above — meaning script validation/retry/
+// transliteration-detection silently never ran for it at all, so
+// romanized text like "ela vunaru" inside [telugu]...[/telugu] passed
+// straight through unconverted. Case-insensitive lookup fixes this
+// regardless of how the tag was capitalized.
+function getScriptCheckForLanguage(targetLanguage) {
+  const norm = (targetLanguage || "").trim().toLowerCase();
+  const key = Object.keys(TARGET_LANGUAGE_SCRIPT_RANGES).find((k) => k.toLowerCase() === norm);
+  return key ? TARGET_LANGUAGE_SCRIPT_RANGES[key] : null;
+}
+// REAL BUG FIXED HERE: [telugu] (lowercase, the natural way to type a
+// tag) silently disabled the whole script-validation/retry safety net,
+// because TARGET_LANGUAGE_SCRIPT_RANGES's keys are capitalized
+// ("Telugu") and the lookup was a case-SENSITIVE exact match —
+// "telugu" !== "Telugu" so scriptCheck came back undefined and
+// translation proceeded with zero verification that it actually
+// produced real script instead of staying transliterated. Case-
+// insensitive lookup + returns the CANONICAL capitalized name so every
+// downstream use (script check, buildInput's language param, display
+// text) is consistent regardless of how the tag was typed.
+function normalizeLanguageName(raw) {
+  if (!raw) return raw;
+  const match = Object.keys(TARGET_LANGUAGE_SCRIPT_RANGES).find((k) => k.toLowerCase() === raw.trim().toLowerCase());
+  return match || raw.trim();
+}
 // Extracted so both /api/voice/prepare-text and the new narration-script
 // writer share the exact same proven logic — anti-transliteration
 // guidance, casual-register instruction, script validation with a
 // forceful retry, and a second-opinion transliteration check — rather
 // than a second, weaker copy of hard-won prompt engineering.
 async function prepareTextForLanguage(text, targetLanguage, { apiKey, textModel, costMeta = null }) {
+  // Case-insensitive from the start — "telugu", "Telugu", "TELUGU" all
+  // resolve to the same canonical name and the same script-check regex,
+  // so the safety net can't silently disable itself based on how the
+  // language name happened to be typed or came out of a [tag].
+  targetLanguage = normalizeLanguageName(targetLanguage);
   const buildPrompt = (forceful) => `You are a professional human translator preparing text to be spoken aloud in ${targetLanguage} by a text-to-speech engine. The input text could be any of these — figure out which, automatically, without being told:
 1. Plain English that needs REAL TRANSLATION into ${targetLanguage} — actual ${targetLanguage} words that carry the same meaning, the words a native ${targetLanguage} speaker would naturally use.
 2. ${targetLanguage} already written in Latin/English letters instead of native script (very common when typing on a phone without native keyboard support) — e.g. Telugu written as "nenu ardam avutundi" instead of "నేను అర్థం అవుతుంది". Convert this to proper native ${targetLanguage} script — do NOT translate it as if it were English, since it already means something in ${targetLanguage}.
@@ -4652,7 +4687,7 @@ Preserve the speaker's actual meaning and natural tone — don't make it more fo
 ${forceful ? `\nIMPORTANT — YOUR PREVIOUS ATTEMPT FAILED: it produced transliteration (English words spelled out in ${targetLanguage} script) instead of real translation, or stayed in English. Try again using genuine, natural ${targetLanguage} vocabulary that a native speaker would actually use — not a phonetic rendering of the English words.\n` : ""}
 Return ONLY the prepared text, ready to be read aloud — no explanation, no quotes, no preamble.
 INPUT TEXT: ${text.trim()}`;
-  const scriptCheck = TARGET_LANGUAGE_SCRIPT_RANGES[targetLanguage.trim()];
+  const scriptCheck = getScriptCheckForLanguage(targetLanguage);
   let preparedText = (await falTextRequest(buildPrompt(false), {
     model: textModel || DEFAULT_TEXT_MODEL, apiKey, temperature: 0.3,
     costMeta: { ...costMeta, endpoint: "prepare-text-language" },
@@ -4746,7 +4781,7 @@ function parseMultilingualSegments(text, baseLanguage) {
 app.post("/api/voice/generate-multilingual", async (req, res) => {
   let runId;
   try {
-    const { text, modelId, voiceId, baseLanguage, textModel, userApiKey, runId: clientRunId } = req.body;
+    const { text, modelId, voiceId, baseLanguage, speed, pitch, emotion, textModel, userApiKey, runId: clientRunId } = req.body;
     if (!text || !text.trim()) return res.status(400).json({ error: "Missing script text." });
     const model = VOICE_MODELS.find((m) => m.id === modelId) || VOICE_MODELS[0];
     const apiKey = userApiKey || process.env.FAL_KEY;
@@ -4757,6 +4792,7 @@ app.post("/api/voice/generate-multilingual", async (req, res) => {
     if (segments.length > 20) return res.status(400).json({ error: "Too many segments (max 20) — combine some tagged sections." });
     const segmentAudioUrls = [];
     const segmentDetails = [];
+    let totalDurationMs = 0;
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
       progress.startProgress(runId, "translating", `Preparing segment ${i + 1}/${segments.length} (${seg.language})...`);
@@ -4778,9 +4814,23 @@ app.post("/api/voice/generate-multilingual", async (req, res) => {
         }
       }
       progress.startProgress(runId, "generating-voice", `Generating segment ${i + 1}/${segments.length}...`);
-      const result = await falVoiceRequest(model.id, model.buildInput(finalText, { voiceId }), {
+      // REAL FIX, same bug class already found and fixed in
+      // /api/voice/script/generate-variations: speed/pitch/emotion were
+      // never sent here either — every code-switched segment silently
+      // generated at default settings regardless of the line's own
+      // configured voice performance. Language per segment is
+      // intentionally NOT passed to buildInput here — each segment's
+      // language IS what it was just translated/prepared into, and the
+      // model reads the resulting native-script text directly; passing a
+      // separate language_boost/language_code per segment on top of
+      // already-native-script text isn't confirmed necessary and risks
+      // reintroducing the exact conflicting-signal problem the script-
+      // mismatch guard exists to catch elsewhere.
+      const result = await falVoiceRequest(model.id, model.buildInput(finalText, { voiceId, speed, pitch, emotion }), {
         apiKey, costMeta: { runId, endpoint: "voice-multilingual-segment" }, costPer1kChars: model.costPer1kChars,
       });
+      totalDurationMs += result.durationMs || 0;
+      try { if (voiceId) db.touchCustomVoiceLastUsed(voiceId); } catch {} // same keep-alive fix as generate-variations above
       segmentAudioUrls.push(result.url);
       segmentDetails.push({ language: seg.language, originalText: seg.text, finalText, note: prepNote });
     }
@@ -4792,7 +4842,10 @@ app.post("/api/voice/generate-multilingual", async (req, res) => {
     }
     progress.finishProgress(runId);
     const dataUri = await downloadImageAsDataUri(finalUrl);
-    res.json({ audio: dataUri, modelUsed: model.id, segments: segmentDetails });
+    // durationMs is a sum of the individual segment durations — real
+    // per-segment numbers from Fal's own responses, not a guess — used
+    // by the SAME anomaly-flagging the single-language path already has.
+    res.json({ audio: dataUri, modelUsed: model.id, segments: segmentDetails, durationMs: totalDurationMs || null });
   } catch (error) {
     if (runId) progress.finishProgress(runId);
     console.error(`[Voice] Multilingual generation failed: ${error.message}`);
@@ -5376,6 +5429,12 @@ app.post("/api/voice/script/generate-variations", async (req, res) => {
             costMeta: { runId, endpoint: "voice-variation", frameIndex: i },
           });
           const dataUri = await downloadImageAsDataUri(result.url);
+          // REAL FIX: a cloned voice used here never reset MiniMax's
+          // 7-day auto-deletion clock — only the orphaned single-
+          // generate route did this, so a custom voice used exclusively
+          // through the active per-line UI could silently get deleted
+          // out from under someone despite active use.
+          try { if (voiceId) db.touchCustomVoiceLastUsed(voiceId); } catch {}
           // REAL FIX: durationMs was computed by falVoiceRequest but
           // discarded here — so there was no way to see how long a take
           // actually ran, which matters directly for dialogue pacing.

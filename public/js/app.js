@@ -1270,6 +1270,8 @@ async function loadModelRegistry() {
     state.musicModels = data.musicModels || [];
     state.musicInstruments = data.musicInstruments || { indian: [], western: [] };
     state.musicGenrePresets = data.musicGenrePresets || [];
+    state.voiceoverLanguages = data.voiceoverLanguages || [];
+    state.scriptRanges = data.scriptRanges || {};
     state.talkingAvatarModels = data.talkingAvatarModels || [];
     populateMusicModelSelects();
     renderSongArchitect();
@@ -6361,6 +6363,20 @@ function newVoiceScriptLine() {
     modelId: defaultModel?.id || "",
     voiceId: defaultModel?.confirmedVoiceIds?.[0]?.id || "",
     language: "",
+    translateTargetLanguage: "",
+    translateStatus: null,
+    isTranslating: false,
+    // Multi-language code-switching within ONE line (e.g. "Welcome!
+    // [Hindi]कैसे हो आप[/Hindi] friend.") — a genuinely different mode
+    // from the single translateTargetLanguage above: that translates
+    // the WHOLE line into one language; this mixes several within it,
+    // each segment generated and translated separately then stitched
+    // together. Real backend already existed for this
+    // (/api/voice/generate-multilingual) but had no reachable UI.
+    multilingualMode: false,
+    multilingualBaseLanguage: "english",
+    multilingualAutoTagInstruction: "",
+    isAutoTagging: false,
     emotion: "neutral",
     speed: 1.0,
     pitch: 0,
@@ -6371,15 +6387,88 @@ function newVoiceScriptLine() {
     isGenerating: false,
   };
 }
+// Rough, honestly-labeled estimate — real speaking rate varies by
+// language, speaker, and content, so this is a planning aid (get a
+// sense of pacing/duration BEFORE spending a real generation on it),
+// not a guarantee. ~2.5 words/second is a typical average conversational
+// pace at 1.0x; the line's own speed multiplier scales it directly,
+// same lever that actually reaches the model now (see the real
+// speed-passthrough fix in server.js).
+function estimateSpeechDurationSeconds(text, speed) {
+  const wordCount = (text || "").trim().split(/\s+/).filter(Boolean).length;
+  if (!wordCount) return 0;
+  return wordCount / (2.5 * (speed || 1.0));
+}
+// REAL BUG THIS CATCHES: the language dropdown only sets the model's
+// pronunciation/language_code parameter — it does NOT translate
+// anything. Picking "Hindi" there while the text is still plain English
+// sends a model conflicting signals ("read this AS Hindi" + English-
+// script text), which is exactly what produced broken/truncated output
+// (e.g. Gemini only vocalizing one recognizable word from the whole
+// line) with zero warning beforehand. Matches against
+// state.scriptRanges — the exact same source of truth server-side
+// translation validation uses, so this can't quietly drift from it.
+function languageScriptMismatch(text, language) {
+  if (!text?.trim() || !language) return null;
+  const baseLang = language.replace(/\s*\(.+\)\s*$/, "").trim(); // "Hindi (India)" -> "Hindi"
+  const pattern = state.scriptRanges?.[baseLang];
+  if (!pattern) return null; // no known script check for this language (e.g. English/auto) — nothing to warn about
+  const re = new RegExp(pattern);
+  return re.test(text) ? null : baseLang;
+}
+function buildScriptMismatchHtml(mismatchLang) {
+  if (!mismatchLang) return "";
+  return `<div class="alert alert-warning py-1 px-2 xx-small mt-1 mb-0" data-line-mismatch-warning>⚠️ You picked ${escapeHtml(mismatchLang)} but this text has no ${escapeHtml(mismatchLang)} script in it yet — the model will get conflicting signals (real broken output, not a hypothetical). <button type="button" class="btn btn-link btn-sm p-0 xx-small" data-line-action="quick-translate">Translate it now →</button></div>`;
+}
+function renderLineMismatchWarning(lineEl, line) {
+  const container = lineEl.querySelector("[data-line-mismatch-container]");
+  if (!container) return;
+  container.innerHTML = buildScriptMismatchHtml(languageScriptMismatch(line.text, line.language));
+}
+// Shared by both the normal Translate button and the mismatch warning's
+// "Translate it now" quick-fix — one real code path, not two that could
+// drift apart.
+async function translateLine(line, targetLanguage) {
+  line.isTranslating = true;
+  renderVoiceScript();
+  try {
+    const { res, data } = await fetchJson("/api/voice/prepare-text", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: line.text, targetLanguage, textModel: getTextModel(), userApiKey: getUserKey(), runId: state.voiceScript.runId }),
+    });
+    if (!res.ok) throw new Error(data.error || "Translation failed.");
+    line.text = data.preparedText;
+    if (data.scriptValidationFailed) {
+      line.translateStatus = { warn: true, text: `Couldn't confirm real ${targetLanguage} script even after retrying — check the result before generating.` };
+    } else if (data.transliterationDetected) {
+      line.translateStatus = { warn: true, text: `This came out as transliteration on the first pass and was retried — double-check it reads as real ${targetLanguage}, not English words spelled out phonetically.` };
+    } else {
+      line.translateStatus = { warn: false, text: `Translated to ${targetLanguage}.` };
+    }
+    // Auto-align the model's own language parameter (a DIFFERENT
+    // setting — see languageRowHtml) with what was just translated
+    // into, when the current model actually has a matching option.
+    const currentModel = (state.voiceModels || []).find((m) => m.id === line.modelId);
+    const match = (currentModel?.confirmedLanguages || []).find((l) => l.toLowerCase().startsWith(targetLanguage.toLowerCase()));
+    if (match) line.language = match;
+  } catch (err) {
+    line.translateStatus = { warn: true, text: "Translation failed: " + err.message };
+  } finally {
+    line.isTranslating = false;
+    renderVoiceScript();
+  }
+}
 function renderVoiceScriptLine(line, index) {
   const model = (state.voiceModels || []).find((m) => m.id === line.modelId) || null;
-  // 🇮🇳 badge is a real signal, not decoration — models are pre-sorted
-  // server-side (fal-voice-catalog.js) so Indian-language-capable ones
-  // lead the list; the badge just makes that sort visible instead of
-  // silent.
+  // 🇮🇳 = Indian-language-capable (server-sorted first). 🎯 = a model
+  // BUILT for one specific language, not a generalist that happens to
+  // cover it as one of 30 — a real, useful distinction someone asking
+  // for "local/regional voice models" actually wants visible, not
+  // buried in a label string.
   const modelOptions = (state.voiceModels || [])
     .map((m) => {
-      const badge = m.indianLanguageCoverage?.length ? "🇮🇳 " : "";
+      const badge = `${m.indianLanguageCoverage?.length ? "🇮🇳 " : ""}${m.isDedicatedRegionalModel ? "🎯 " : ""}`;
       return `<option value="${escapeHtml(m.id)}" ${m.id === line.modelId ? "selected" : ""}>${badge}${escapeHtml(m.label)}</option>`;
     })
     .join("");
@@ -6401,30 +6490,82 @@ function renderVoiceScriptLine(line, index) {
         return `<option value="${escapeHtml(v.id)}" data-search="${escapeHtml(searchKey)}" ${v.id === line.voiceId ? "selected" : ""}>${escapeHtml(label)}</option>`;
       })
       .join("");
+    // REAL GAP FIXED: cloned voices (see the Voice Clone section) were
+    // saved and usable via the backend the whole time, but never
+    // appeared anywhere in this picker — matched by modelFamily since a
+    // clone is only usable on the same family it was made for (MiniMax's
+    // clone endpoint outputs a MiniMax-compatible voice_id).
+    const matchingCustomVoices = model.modelFamily
+      ? (state.customVoices || []).filter((cv) => cv.model_family === model.modelFamily)
+      : [];
+    const customOpts = matchingCustomVoices
+      .map((cv) => `<option value="${escapeHtml(cv.custom_voice_id)}" data-search="${escapeHtml(cv.name.toLowerCase())}" ${cv.custom_voice_id === line.voiceId ? "selected" : ""}>🎙️ ${escapeHtml(cv.name)} (your cloned voice)</option>`)
+      .join("");
+    const totalVoicesWithCustom = totalVoices + matchingCustomVoices.length;
     // A native <select> stops being usable once a model's real voice
     // count climbs into the dozens/hundreds (MiniMax alone lists 300+ on
     // its own page) — this is the direct, concrete cost of the dynamic
     // load actually working, so a filter box earns its place here
     // rather than being decoration.
-    const searchHtml = totalVoices > 10
-      ? `<input type="text" class="form-control form-control-sm mb-1" data-line-field="voiceSearch" placeholder="🔎 Search ${totalVoices} voices...">`
+    const searchHtml = totalVoicesWithCustom > 10
+      ? `<input type="text" class="form-control form-control-sm mb-1" data-line-field="voiceSearch" placeholder="🔎 Search ${totalVoicesWithCustom} voices...">`
       : "";
     const discovery = model.voiceDiscovery;
     const discoveryNote = discovery?.liveDiscoveredVoiceCount > 0
       ? `<div class="xx-small text-muted mt-1">${discovery.curatedVoiceCount} known + ${discovery.liveDiscoveredVoiceCount} newly discovered live from Fal 🆕</div>`
       : "";
-    voiceControlHtml = `${searchHtml}<select class="form-select form-select-sm" data-line-field="voiceId">${opts}</select>${discoveryNote}`;
+    voiceControlHtml = `${searchHtml}<div class="d-flex gap-1"><select class="form-select form-select-sm" data-line-field="voiceId">${customOpts}${opts}</select><button type="button" class="btn btn-sm btn-outline-secondary text-nowrap" data-line-action="preview-voice" title="Hear a short sample of this exact voice — cached, so repeat previews are free">🔊</button></div>${discoveryNote}`;
   } else {
     voiceControlHtml = `<div class="form-control form-control-sm text-muted bg-light">Pick a model first</div>`;
   }
 
   const indianLangSet = new Set((model?.indianLanguageCoverage || []).map((l) => l.toLowerCase()));
-  const languageRowHtml = model?.confirmedLanguages?.length
+  const languageRowHtml = model?.confirmedLanguages?.length && !line.multilingualMode
     ? `<select class="form-select form-select-sm mt-2" data-line-field="language">
         <option value="">Auto / default</option>
         ${model.confirmedLanguages.map((l) => `<option value="${escapeHtml(l)}" ${l === line.language ? "selected" : ""}>${indianLangSet.has(l.toLowerCase()) ? "🇮🇳 " : ""}${escapeHtml(l)}</option>`).join("")}
       </select>`
     : "";
+  const scriptMismatch = line.multilingualMode ? null : languageScriptMismatch(line.text, line.language);
+  const scriptMismatchHtml = buildScriptMismatchHtml(scriptMismatch);
+
+  // Translation, wired to the REAL, already-tested backend
+  // (/api/voice/prepare-text — real transliteration detection + native-
+  // script validation with retry) that existed but had no reachable UI
+  // anywhere in the active Voice Studio. Deliberately independent of
+  // whether the model has its own confirmedLanguages parameter — a
+  // model like ElevenLabs Eleven v3 has NO language field at all and
+  // only auto-detects from the text's own script, which makes
+  // translating into real native script BEFORE generation the only way
+  // Indian-language output happens correctly on it at all, not optional
+  // polish.
+  const translateToolbarHtml = `
+    <div class="d-flex gap-1 align-items-center mt-1 mb-1">
+      <select class="form-select form-select-sm" style="max-width:160px;" data-line-field="translateTargetLanguage" ${line.multilingualMode ? "disabled" : ""}>
+        <option value="">Translate to...</option>
+        ${(state.voiceoverLanguages || []).map((l) => `<option value="${escapeHtml(l)}" ${l === line.translateTargetLanguage ? "selected" : ""}>${escapeHtml(l)}</option>`).join("")}
+      </select>
+      <button type="button" class="btn btn-sm btn-outline-primary" data-line-action="translate" ${line.isTranslating || !line.translateTargetLanguage || line.multilingualMode ? "disabled" : ""}>${line.isTranslating ? "🌐 Translating..." : "🌐 Translate"}</button>
+      <div class="form-check form-switch mb-0 ms-2">
+        <input class="form-check-input" type="checkbox" data-line-field="multilingualMode" id="multilingualToggle-${line.id}" ${line.multilingualMode ? "checked" : ""}>
+        <label class="form-check-label xx-small" for="multilingualToggle-${line.id}">Mix languages in this line</label>
+      </div>
+    </div>
+    ${line.translateStatus && !line.multilingualMode ? `<div class="xx-small ${line.translateStatus.warn ? "text-warning" : "text-success"} mb-1">${escapeHtml(line.translateStatus.text)}</div>` : ""}
+    ${line.multilingualMode ? `
+      <div class="border rounded p-2 mb-1 bg-light">
+        <div class="xx-small text-muted mb-1">Wrap the parts that should switch language: <code>Welcome! [Hindi]कैसे हो आप[/Hindi] friend.</code> — everything else is spoken as the base language below.</div>
+        <div class="d-flex gap-1 mb-1">
+          <select class="form-select form-select-sm" style="max-width:140px;" data-line-field="multilingualBaseLanguage">
+            <option value="english" ${line.multilingualBaseLanguage === "english" ? "selected" : ""}>Base: English</option>
+            ${(state.voiceoverLanguages || []).map((l) => `<option value="${escapeHtml(l)}" ${l === line.multilingualBaseLanguage ? "selected" : ""}>Base: ${escapeHtml(l)}</option>`).join("")}
+          </select>
+          <input type="text" class="form-control form-control-sm" data-line-field="multilingualAutoTagInstruction" placeholder="e.g. make the greeting Hindi" value="${escapeHtml(line.multilingualAutoTagInstruction)}">
+          <button type="button" class="btn btn-sm btn-outline-primary text-nowrap" data-line-action="auto-tag" ${line.isAutoTagging || !line.multilingualAutoTagInstruction?.trim() ? "disabled" : ""}>${line.isAutoTagging ? "✨..." : "✨ Auto-tag"}</button>
+        </div>
+      </div>
+    ` : ""}
+  `;
 
   const emotionRowHtml = model?.supportsEmotionPitchSpeed
     ? `<div class="row g-2 mt-2">
@@ -6433,23 +6574,43 @@ function renderVoiceScriptLine(line, index) {
         <div class="col-4"><label class="xx-small text-muted mb-0">Emotion</label><select class="form-select form-select-sm" data-line-field="emotion">${(model.confirmedEmotions || []).map((e) => `<option value="${e}" ${e === line.emotion ? "selected" : ""}>${e}</option>`).join("")}</select></div>
       </div>`
     : "";
+  // Real, honestly-labeled planning estimate — see estimateSpeechDurationSeconds.
+  // Recomputed live as text/speed change (see the input listener below),
+  // not just at render time, so it stays accurate while typing.
+  const durationEstimateHtml = `<div class="xx-small text-muted mt-1" data-line-duration-estimate>≈${estimateSpeechDurationSeconds(line.text, line.speed).toFixed(1)}s estimated (rough — actual pace varies by model/language)</div>`;
 
+  const estimatedSecondsNow = estimateSpeechDurationSeconds(line.text, line.speed);
   const variationsHtml = line.variations.length
     ? `<div class="d-flex flex-column gap-2 mt-2">${line.variations
         .map(
-          (v, i) => `
+          (v, i) => {
+            // Real anomaly flag, not decoration: when actual duration is
+            // wildly off from the estimate (>2.5x longer or <0.4x
+            // shorter), that's a genuine signal something went wrong in
+            // generation — most commonly a language/script mismatch (see
+            // languageScriptMismatch above) or a model padding/extending
+            // a very short input unpredictably. Surfaced right on the
+            // take instead of leaving a bad clip looking identical to a
+            // good one.
+            const actualSeconds = v.durationMs ? v.durationMs / 1000 : null;
+            const isAnomalous = actualSeconds && estimatedSecondsNow > 0.5 &&
+              (actualSeconds > estimatedSecondsNow * 2.5 || actualSeconds < estimatedSecondsNow * 0.4);
+            return `
       <div class="border rounded p-2 ${line.selectedVariationIndex === i ? "border-primary bg-light" : ""}" data-variation-index="${i}">
         <div class="d-flex justify-content-between align-items-center">
           <span class="small fw-semibold">${escapeHtml(v.label)}${line.selectedVariationIndex === i ? " ✅" : ""}</span>
           <div class="d-flex align-items-center gap-1">
-            ${v.durationMs ? `<span class="xx-small text-muted">${(v.durationMs / 1000).toFixed(1)}s</span>` : ""}
+            ${v.audio ? (v.durationMs ? `<span class="xx-small ${isAnomalous ? "text-danger fw-semibold" : "text-muted"}">${actualSeconds.toFixed(1)}s${isAnomalous ? " ⚠️" : ""}</span>` : `<span class="xx-small text-muted fst-italic" title="This model's API response doesn't include a duration field">duration n/a</span>`) : ""}
             ${v.audio ? `<button type="button" class="btn btn-sm btn-outline-primary" data-variation-action="use">Use this take</button><button type="button" class="btn btn-sm btn-outline-secondary" data-variation-action="download">⬇️</button>` : ""}
           </div>
         </div>
+        ${isAnomalous ? `<div class="xx-small text-danger">⚠️ ${actualSeconds.toFixed(1)}s actual vs ~${estimatedSecondsNow.toFixed(1)}s expected — often a language/script mismatch (see the warning above if present) or a model adding unexpected silence/padding on a short line. Listen before using this take.</div>` : ""}
         ${v.reasoning ? `<div class="xx-small text-muted">${escapeHtml(v.reasoning)}</div>` : ""}
         ${v.error ? `<div class="xx-small text-danger">Failed: ${escapeHtml(v.error)}</div>` : v.audio ? `<audio class="w-100 mt-1" controls src="${v.audio}"></audio>` : ""}
         ${v.strippedMarkers?.length ? `<div class="xx-small text-warning">⚠️ "${v.strippedMarkers.join('", "')}" wasn't spoken by this model.</div>` : ""}
-      </div>`,
+        ${v.segments?.length ? `<div class="xx-small text-muted mt-1">${v.segments.map((s) => `<span class="badge bg-secondary me-1">${escapeHtml(s.language)}</span>${escapeHtml(s.finalText)}${s.note ? ` <span class="text-warning">(${escapeHtml(s.note)})</span>` : ""}`).join("<br>")}</div>` : ""}
+      </div>`;
+          },
         )
         .join("")}</div>`
     : "";
@@ -6467,6 +6628,8 @@ function renderVoiceScriptLine(line, index) {
         </div>
       </div>
       <textarea class="form-control form-control-sm mb-1" rows="2" data-line-field="text" placeholder="Type this line...">${escapeHtml(line.text)}</textarea>
+      ${durationEstimateHtml}
+      ${translateToolbarHtml}
       ${buildVoiceMarkupToolbarHtml(model)}
       <small class="text-muted d-block mb-2">${escapeHtml(model?.markupHint || "Pick a model to see what stage-direction markup it supports.")}</small>
       <div class="row g-2">
@@ -6474,13 +6637,15 @@ function renderVoiceScriptLine(line, index) {
         <div class="col-6">${voiceControlHtml}</div>
       </div>
       ${languageRowHtml}
+      <div data-line-mismatch-container>${scriptMismatchHtml}</div>
       ${emotionRowHtml}
       <div class="d-flex align-items-center gap-2 mt-2">
+        ${line.multilingualMode ? "" : `
         <label class="xx-small text-muted mb-0">Takes:</label>
         <select class="form-select form-select-sm" style="width:auto" data-line-field="variationCount">
           ${[1, 2, 4, 8].map((n) => `<option value="${n}" ${n === line.variationCount ? "selected" : ""}>${n}</option>`).join("")}
-        </select>
-        <button type="button" class="btn btn-sm btn-primary flex-grow-1" data-line-action="generate" ${line.isGenerating ? "disabled" : ""}>${line.isGenerating ? "Generating..." : "🎬 Generate Takes"}</button>
+        </select>`}
+        <button type="button" class="btn btn-sm btn-primary flex-grow-1" data-line-action="generate" ${line.isGenerating ? "disabled" : ""}>${line.isGenerating ? "Generating..." : line.multilingualMode ? "🌐 Generate Multi-language Take" : "🎬 Generate Takes"}</button>
       </div>
       ${cappedNote}
       ${variationsHtml}
@@ -6540,6 +6705,7 @@ document.getElementById("voiceScriptLines")?.addEventListener("input", (e) => {
   }
   if (field === "speed" || field === "pitch") line[field] = parseFloat(e.target.value);
   else if (field === "variationCount") line[field] = parseInt(e.target.value);
+  else if (field === "multilingualMode") line[field] = e.target.checked;
   else line[field] = e.target.value;
   if (field === "modelId") {
     // Model changed — voice/emotion/language options are model-specific,
@@ -6550,11 +6716,39 @@ document.getElementById("voiceScriptLines")?.addEventListener("input", (e) => {
     line.emotion = "neutral";
     line.language = "";
     renderVoiceScript();
+  } else if (field === "multilingualMode") {
+    // Toggling this changes several parts of the line's own controls
+    // (language row hidden, multilingual box shown, Generate button
+    // label/behavior, Takes selector hidden) — needs a full re-render,
+    // same reasoning as a model change above.
+    renderVoiceScript();
   } else if (field === "speed" || field === "pitch") {
     // Just update the displayed number live, don't re-render the whole
     // list on every drag tick — same UX as the old single-line sliders.
     const labelEl = lineEl.querySelector(`label:has(+ [data-line-field="${field}"])`);
     if (labelEl) labelEl.textContent = `${field === "speed" ? "Speed" : "Pitch"} ${line[field]}`;
+  }
+  if (field === "text" || field === "speed") {
+    // Live duration estimate — recomputed on every keystroke/speed drag
+    // without a full re-render, same reasoning as the speed/pitch label
+    // above: this needs to feel instant, not wait for a render cycle.
+    const estEl = lineEl.querySelector("[data-line-duration-estimate]");
+    if (estEl) estEl.textContent = `≈${estimateSpeechDurationSeconds(line.text, line.speed).toFixed(1)}s estimated (rough — actual pace varies by model/language)`;
+  }
+  if (field === "text" || field === "language") {
+    // Live script-mismatch check — same non-destructive-update pattern.
+    // A full render here would be fine too (language is a <select>, not
+    // continuous typing) but keeping it consistent with the text-typing
+    // case above means one code path handles both triggers.
+    renderLineMismatchWarning(lineEl, line);
+  }
+  if (field === "translateTargetLanguage") {
+    // Enables/disables the Translate button live, without a full
+    // re-render — same non-destructive-update reasoning as the search
+    // filter above (a re-render mid-selection would just be jarring here
+    // for no benefit).
+    const btn = lineEl.querySelector('[data-line-action="translate"]');
+    if (btn) btn.disabled = !line.translateTargetLanguage;
   }
 });
 document.getElementById("voiceScriptLines")?.addEventListener("click", async (e) => {
@@ -6601,6 +6795,92 @@ document.getElementById("voiceScriptLines")?.addEventListener("click", async (e)
     return;
   }
 
+  // Translate action — real backend (/api/voice/prepare-text), reused
+  // here for the first time in a reachable UI. Replaces the line's text
+  // with genuinely translated (not transliterated) native-script text,
+  // and — nice, honest bonus — if the target model has that exact
+  // language in its own confirmedLanguages, auto-selects it there too,
+  // so translation and the model's own pronunciation setting don't end
+  // up pointing at two different languages by accident.
+  if (e.target.closest('[data-line-action="translate"]')) {
+    if (!line.text?.trim()) return alert("Type something for this line first.");
+    if (!line.translateTargetLanguage) return;
+    await translateLine(line, line.translateTargetLanguage);
+    return;
+  }
+  // Quick-fix path from the mismatch warning itself — reuses the exact
+  // same translateLine function, just sourcing the target language from
+  // the line's already-selected model-language dropdown instead of
+  // requiring a second, separate pick in the translate row.
+  if (e.target.closest('[data-line-action="quick-translate"]')) {
+    const baseLang = (line.language || "").replace(/\s*\(.+\)\s*$/, "").trim();
+    if (!baseLang) return;
+    line.translateTargetLanguage = baseLang;
+    await translateLine(line, baseLang);
+    return;
+  }
+  // Voice preview — real backend (isPreview flag on /api/voice/generate,
+  // with its own persisted server-side cache) that already existed but
+  // had no reachable trigger anywhere in the active UI. Cached client-
+  // side too (state.voicePreviewCache, same key convention as before)
+  // so repeat previews of the same model+voice within this session are
+  // instant and free, not a second billed call.
+  if (e.target.closest('[data-line-action="preview-voice"]')) {
+    const btn = e.target.closest('[data-line-action="preview-voice"]');
+    if (!line.modelId || !line.voiceId) return alert("Pick a model and voice first.");
+    const cacheKey = `${line.modelId}:${line.voiceId}`;
+    if (state.voicePreviewCache[cacheKey]) {
+      new Audio(state.voicePreviewCache[cacheKey]).play();
+      return;
+    }
+    const originalLabel = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = "...";
+    try {
+      const { res, data } = await fetchJson("/api/voice/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: "Hello, this is a preview of this voice.", modelId: line.modelId, voiceId: line.voiceId,
+          isPreview: true, runId: crypto.randomUUID(), userApiKey: getUserKey(),
+        }),
+      });
+      if (!res.ok) throw new Error(data.error || "Preview failed.");
+      state.voicePreviewCache[cacheKey] = data.audio;
+      new Audio(data.audio).play();
+    } catch (err) {
+      alert("Voice preview failed: " + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = originalLabel;
+    }
+    return;
+  }
+  // only reachable from the old, now-removed single-textbox UI. Wraps
+  // the parts matching the instruction in [Language]...[/Language]
+  // tags, ready for the multi-language generation path below.
+  if (e.target.closest('[data-line-action="auto-tag"]')) {
+    if (!line.text?.trim()) return alert("Type something for this line first.");
+    if (!line.multilingualAutoTagInstruction?.trim()) return;
+    line.isAutoTagging = true;
+    renderVoiceScript();
+    try {
+      const { res, data } = await fetchJson("/api/voice/auto-tag-languages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ script: line.text, instruction: line.multilingualAutoTagInstruction, textModel: getTextModel(), userApiKey: getUserKey(), runId: state.voiceScript.runId }),
+      });
+      if (!res.ok) throw new Error(data.error || "Auto-tagging failed.");
+      line.text = data.taggedScript;
+    } catch (err) {
+      alert("Auto-tag failed: " + err.message);
+    } finally {
+      line.isAutoTagging = false;
+      renderVoiceScript();
+    }
+    return;
+  }
+
   const lineAction = e.target.closest("[data-line-action]")?.getAttribute("data-line-action");
   if (lineAction === "delete") {
     state.voiceScript.lines.splice(lineIndex, 1);
@@ -6619,29 +6899,65 @@ document.getElementById("voiceScriptLines")?.addEventListener("click", async (e)
   }
   if (lineAction === "generate") {
     if (!line.text?.trim()) return alert("Type something for this line first.");
+    // Real gate, not a nag: this is the exact scenario that produced
+    // broken/truncated output with zero warning — don't let a real,
+    // billed generation run against a known language/script mismatch
+    // without at least a chance to cancel and translate first. Doesn't
+    // apply in multilingual mode — mixed-language text is the whole
+    // point there, so a single-language script check would be a false
+    // positive by design.
+    const mismatch = line.multilingualMode ? null : languageScriptMismatch(line.text, line.language);
+    if (mismatch && !confirm(`This text has no ${mismatch} script in it yet, but ${mismatch} is selected as the language — the model may produce broken or truncated output. Generate anyway?`)) {
+      return;
+    }
     line.isGenerating = true;
     renderVoiceScript();
     try {
-      const { res, data } = await fetchJson("/api/voice/script/generate-variations", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        // REAL FIX: voiceId/language/speed/pitch/emotion used to be
-        // silently dropped here — the dropdowns updated `line.*` in
-        // local state, but none of it ever reached the backend, so
-        // picking a specific voice or language had zero effect on the
-        // actual generated audio. All five now go through.
-        body: JSON.stringify({
-          lineText: line.text, modelId: line.modelId, count: line.variationCount,
-          voiceId: line.voiceId, language: line.language || undefined,
-          speed: line.speed, pitch: line.pitch, emotion: line.emotion,
-          runId: state.voiceScript.runId, userApiKey: getUserKey(),
-        }),
-      });
-      if (!res.ok) throw new Error(data.error || "Failed to generate takes.");
-      line.variations = data.results || [];
-      line.cappedReason = data.cappedReason || null;
-      line.selectedVariationIndex = line.variations.findIndex((v) => v.audio && !v.error);
-      if (line.selectedVariationIndex === -1) line.selectedVariationIndex = null;
+      if (line.multilingualMode) {
+        // Multi-language path — real backend (/api/voice/generate-
+        // multilingual), previously unreachable from any live UI.
+        // Produces exactly ONE stitched result, not N creative-direction
+        // takes — directing multiple simultaneous variations across a
+        // multi-segment stitched clip isn't a coherent concept the way
+        // "different takes of one voice" is for a single-language line.
+        const { res, data } = await fetchJson("/api/voice/generate-multilingual", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: line.text, modelId: line.modelId, voiceId: line.voiceId,
+            baseLanguage: line.multilingualBaseLanguage, speed: line.speed, pitch: line.pitch, emotion: line.emotion,
+            textModel: getTextModel(), runId: state.voiceScript.runId, userApiKey: getUserKey(),
+          }),
+        });
+        if (!res.ok) throw new Error(data.error || "Multi-language generation failed.");
+        line.variations = [{
+          label: "Multi-language", audio: data.audio, durationMs: data.durationMs, modelUsed: data.modelUsed,
+          error: null, segments: data.segments || [],
+        }];
+        line.cappedReason = null;
+        line.selectedVariationIndex = 0;
+      } else {
+        const { res, data } = await fetchJson("/api/voice/script/generate-variations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          // REAL FIX: voiceId/language/speed/pitch/emotion used to be
+          // silently dropped here — the dropdowns updated `line.*` in
+          // local state, but none of it ever reached the backend, so
+          // picking a specific voice or language had zero effect on the
+          // actual generated audio. All five now go through.
+          body: JSON.stringify({
+            lineText: line.text, modelId: line.modelId, count: line.variationCount,
+            voiceId: line.voiceId, language: line.language || undefined,
+            speed: line.speed, pitch: line.pitch, emotion: line.emotion,
+            runId: state.voiceScript.runId, userApiKey: getUserKey(),
+          }),
+        });
+        if (!res.ok) throw new Error(data.error || "Failed to generate takes.");
+        line.variations = data.results || [];
+        line.cappedReason = data.cappedReason || null;
+        line.selectedVariationIndex = line.variations.findIndex((v) => v.audio && !v.error);
+        if (line.selectedVariationIndex === -1) line.selectedVariationIndex = null;
+      }
       // Auto-save every successful take to the Audio Library, matching
       // how the Video Library already auto-persists everything
       // generated — no manual "save" click required to keep it.

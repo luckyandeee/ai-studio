@@ -48,6 +48,49 @@ function isIndianLanguage(rawName) {
   return INDIAN_LANGUAGE_NAMES.some((lang) => name === lang || name.startsWith(`${lang} `) || name.startsWith(`${lang}(`) || name.startsWith(`${lang}-`));
 }
 
+// ============================================================
+// TRANSLATION TARGET LANGUAGES — a curated list for the per-line
+// "Translate" action (see /api/voice/prepare-text and its real
+// transliteration-detection logic in server.js). Deliberately separate
+// from any one model's confirmedLanguages: translation converts the
+// TEXT ITSELF into native script BEFORE it reaches any model, so it
+// applies even to a model like ElevenLabs Eleven v3 that has no
+// language parameter at all and only auto-detects from the text's own
+// script — for that model, translating first isn't optional polish,
+// it's the only way native-script Indian-language output happens at
+// all. Indian languages first, per the actual real need.
+// ============================================================
+const COMMON_VOICEOVER_LANGUAGES = [
+  "Hindi", "Telugu", "Tamil", "Kannada", "Malayalam", "Marathi", "Gujarati",
+  "Punjabi", "Bengali", "Odia", "Urdu", "Assamese",
+  "Spanish", "French", "German", "Portuguese", "Japanese", "Korean", "Arabic", "Chinese",
+];
+
+// ============================================================
+// SCRIPT RANGES — single shared source of truth for "does this text
+// actually look like language X's real script," used in two places
+// that must never drift apart: /api/voice/prepare-text's translation
+// validation (server-side, after a translation attempt), and the
+// per-line mismatch warning in Voice Studio (client-side, BEFORE
+// generation) that catches the actual real bug this exists to prevent
+// — picking a language in the dropdown (which only sets the model's
+// pronunciation/language_code parameter) while the text itself is
+// still in English or transliterated, silently sending a model
+// conflicting signals ("say this AS Hindi" + English-script text) and
+// getting broken/truncated output back, with zero warning beforehand.
+// Stored as regex SOURCE strings (not RegExp objects) so this can be
+// serialized straight over JSON to the frontend without a second,
+// hand-copied table that could quietly go stale.
+// ============================================================
+const SCRIPT_RANGE_SOURCES = {
+  Hindi: "[\\u0900-\\u097F]", Marathi: "[\\u0900-\\u097F]",
+  Telugu: "[\\u0C00-\\u0C7F]", Tamil: "[\\u0B80-\\u0BFF]", Kannada: "[\\u0C80-\\u0CFF]",
+  Malayalam: "[\\u0D00-\\u0D7F]", Bengali: "[\\u0980-\\u09FF]", Gujarati: "[\\u0A80-\\u0AFF]",
+  Punjabi: "[\\u0A00-\\u0A7F]", Odia: "[\\u0B00-\\u0B7F]", Urdu: "[\\u0600-\\u06FF]",
+  Arabic: "[\\u0600-\\u06FF]", Chinese: "[\\u4E00-\\u9FFF]", Japanese: "[\\u3040-\\u30FF\\u4E00-\\u9FFF]",
+  Assamese: "[\\u0980-\\u09FF]",
+};
+
 const IMAGE_MODELS = [
   {
     // Confirmed via fal.ai/models/fal-ai/nano-banana/api — a genuinely
@@ -1292,6 +1335,11 @@ const VOICE_MODELS = [
     // confirmed option of any voice model in this app, 5x cheaper than
     // MiniMax or ElevenLabs.
     id: "fal-ai/kokoro/hindi",
+    // A real, honest distinction from every other voice model here: this
+    // one is BUILT for exactly one language, not a generalist model that
+    // happens to support it as one of 30 — worth surfacing directly
+    // rather than leaving someone to infer it from the label text alone.
+    isDedicatedRegionalModel: true,
     // "unsupported" = wrapInterjection/wrapPause both strip everything
     // for this model (see buildInput below) — a toolbar should disable
     // itself entirely here rather than offer buttons that do nothing.
@@ -1953,4 +2001,6 @@ module.exports = {
   INDIAN_LANGUAGE_NAMES,
   MUSIC_INSTRUMENTS,
   MUSIC_GENRE_PRESETS,
+  COMMON_VOICEOVER_LANGUAGES,
+  SCRIPT_RANGE_SOURCES,
 };
