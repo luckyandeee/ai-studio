@@ -1166,7 +1166,7 @@
                             <option value="Kannada">Primarily Kannada, with natural English mixing</option>
                             <option value="Malayalam">Primarily Malayalam, with natural English mixing</option>
                         </select>
-                        <div class="alert alert-warning py-2 px-3 xx-small mb-2">Honest limit: none of the real, verified music models here have confirmed non-English <em>vocal singing</em> — this language setting shapes the written lyrics text, but the model singing it may not pronounce non-English words correctly. Real Telugu/Hindi/etc. speech is solid elsewhere in this app (Voice Studio); sung vocals in those languages aren't yet confirmed anywhere.</div>
+                        <div class="alert alert-warning py-2 px-3 xx-small mb-2" id="songVocalLanguageGapNote"></div>
                         <div class="row g-2 mb-2">
                             <div class="col-6">
                                 <div class="form-check form-switch">
@@ -1205,6 +1205,30 @@
                             <span class="small fw-semibold" id="songDurationValue" style="min-width:48px;">60s</span>
                         </div>
                     </div>
+                    <hr class="my-4">
+                    <button type="button" class="btn btn-outline-dark w-100 text-start d-flex justify-content-between align-items-center mb-3" data-bs-toggle="collapse" data-bs-target="#songArchitectSection">
+                        <span>🎼 Build your style from real instruments &amp; genres</span>
+                        <span>▾</span>
+                    </button>
+                    <div class="collapse mb-3" id="songArchitectSection">
+                        <div class="alert alert-info py-2 px-3 xx-small mb-2">Honest ceiling: no music model here exposes real per-instrument tracks or mixing — every one of them takes a single text description and infers instrumentation from it. This compiles your picks into a well-formed style prompt, which is the actual, real lever every model responds to.</div>
+                        <label class="form-label xx-small fw-semibold mb-1" for="songArchitectGenre">Genre preset</label>
+                        <select class="form-select form-select-sm mb-2" id="songArchitectGenre">
+                            <option value="">Custom — pick instruments below</option>
+                            <optgroup label="🇮🇳 Indian" id="songArchitectGenreIndianGroup"></optgroup>
+                            <optgroup label="Western" id="songArchitectGenreWesternGroup"></optgroup>
+                        </select>
+                        <label class="form-label xx-small fw-semibold mb-1">Instruments <span class="text-muted fw-normal">(click to toggle)</span></label>
+                        <div class="xx-small text-muted fw-semibold mb-1">Indian</div>
+                        <div class="d-flex flex-wrap gap-1 mb-2" id="songArchitectInstrumentsIndian"></div>
+                        <div class="xx-small text-muted fw-semibold mb-1">Western</div>
+                        <div class="d-flex flex-wrap gap-1 mb-2" id="songArchitectInstrumentsWestern"></div>
+                        <label class="form-label xx-small fw-semibold mb-1" for="songArchitectMood">Mood / energy <span class="text-muted fw-normal">(optional, free text)</span></label>
+                        <input type="text" class="form-control form-control-sm mb-2" id="songArchitectMood" placeholder="e.g. joyful and triumphant, 120 BPM">
+                        <div class="xx-small text-muted mb-2" id="songArchitectFormatNote"></div>
+                        <button type="button" class="btn btn-sm btn-primary w-100" id="songArchitectApplyBtn">⬇ Apply to Style Prompt</button>
+                        <div class="xx-small mt-2" id="songArchitectVocalNote"></div>
+                    </div>
                     <div class="mb-3">
                         <label class="form-label small fw-semibold mb-1" for="songStylePrompt">Style / mood / genre <span class="text-muted fw-normal">(10-300 characters)</span></label>
                         <input type="text" class="form-control form-control-sm" id="songStylePrompt" placeholder="e.g. Upbeat pop, saxophone, energetic, romantic, 110 BPM" maxlength="300">
@@ -1212,6 +1236,7 @@
                     </div>
                     <div class="mb-3">
                         <label class="form-label small fw-semibold mb-1" for="songLyricsPrompt">Lyrics <span class="text-muted fw-normal">(use [Verse], [Chorus], [Bridge], [Intro], [Outro] tags)</span></label>
+                        <div class="d-flex flex-wrap gap-1 mb-1" id="songLyricsMarkupToolbar"></div>
                         <textarea class="form-control" id="songLyricsPrompt" rows="10" placeholder="[Verse]&#10;...&#10;[Chorus]&#10;..." maxlength="3000"></textarea>
                         <small class="text-muted" id="songLyricsCount">0 / 3000</small>
                     </div>

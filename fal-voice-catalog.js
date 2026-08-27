@@ -18,7 +18,9 @@
 // ============================================================
 const db = require("./db");
 const { falVoiceRequest } = require("./fal-client");
-const { VOICE_MODELS } = require("./fal-models");
+const { VOICE_MODELS, isIndianLanguage } = require("./fal-models");
+// No circular dependency: fal-catalog.js never requires this file back.
+const { getLiveStatus } = require("./fal-catalog");
 
 const CACHE_KEY = "voice_catalog_verification_cache";
 const FRESHNESS_MS = 14 * 24 * 60 * 60 * 1000; // 14 days — voices don't change as often as the broader model catalog
@@ -162,19 +164,120 @@ function recordVoiceFailure(modelId, voiceId, errorMessage) {
   console.warn(`[Voice Catalog] "${voiceId}" on ${modelId} failed a REAL generation attempt — marked broken immediately, hidden from now on.`);
 }
 
-// Used by GET /api/models — returns only the voices actually confirmed
+// ============================================================
+// LIVE SCHEMA MERGE — the actual fix for "voices loaded dynamically,"
+// not just newly-discovered MODELS. server.js now includes VOICE_MODELS
+// in the same free, real OpenAPI-schema refresh every image/video model
+// already goes through (see curatedModelIds in server.js) — that pulls
+// each model's REAL, CURRENT voice_id/language/emotion enum straight
+// from Fal's own schema (generic enum extraction, see
+// fal-schema-utils.js's detectSchema). This is genuinely free: it's a
+// metadata/schema fetch, not a paid generation, so it's safe to run on
+// every server-side refresh cycle regardless of whether anyone has a
+// personal Fal key loaded yet.
+//
+// Merged NON-DESTRUCTIVELY on top of the hand-curated list — curated
+// entries keep their real, human-written descriptions (richer and more
+// useful than a bare ID), and anything the live schema has that curated
+// doesn't gets APPENDED, not swapped in wholesale. That way a live-check
+// hiccup (network blip, Fal's schema temporarily unexpandable, etc.)
+// can never make a previously-working, previously-curated voice vanish
+// — worst case, it just doesn't get any NEW voices added that cycle.
+//
+// Deliberately does NOT run a real paid test-generation against every
+// newly-discovered voice (a model like MiniMax genuinely has 300+
+// voices per its own listing — verifying all of them for real on every
+// refresh would be real, nontrivial cost for voices nobody may ever
+// pick). Instead: a live-discovered voice is offered immediately,
+// honestly labeled as "just discovered, not yet individually verified
+// in this app" — and if it turns out broken, the EXISTING
+// recordVoiceFailure mechanism (fires from a real generation error in
+// server.js's /api/voice/generate) hides it from then on, exactly the
+// same honest "confirmed failure only" standard curated voices already
+// get, just proven lazily instead of all up front.
+// ============================================================
+function mergeVoiceIds(curated, liveIds) {
+  const curatedList = curated || [];
+  const seen = new Set(curatedList.map((v) => String(v.id).toLowerCase()));
+  const extras = (liveIds || [])
+    .filter((id) => id != null && String(id).trim() && !seen.has(String(id).toLowerCase()))
+    .map((id) => ({
+      id: String(id),
+      description: null,
+      source: "live",
+      note: "Just discovered from Fal's own live schema for this model — not yet individually confirmed in this app. Preview it before relying on it; a real failure hides it automatically from then on.",
+    }));
+  return extras.length ? [...curatedList, ...extras] : curatedList;
+}
+function mergeStringList(curated, live) {
+  const curatedList = curated || [];
+  const seen = new Set(curatedList.map((s) => String(s).toLowerCase()));
+  const extras = (live || []).filter((s) => s != null && String(s).trim() && !seen.has(String(s).toLowerCase()));
+  return extras.length ? [...curatedList, ...extras] : curatedList;
+}
+
+// Attaches whatever the live schema refresh found for this model, on
+// top of curated data. IMPORTANT: indianLanguageCoverage (used to SORT
+// the whole list — see getVerifiedVoiceModels below) is computed
+// unconditionally, from curated data alone when no live schema is
+// cached yet. A fresh server (or a model the background refresh simply
+// hasn't reached this cycle, or one Fal's schema endpoint rate-limited)
+// would otherwise report NO Indian coverage at all for models that
+// obviously have it in their own hand-curated confirmedLanguages array
+// — sorting would then look broken/random for however long the live
+// refresh takes to catch up, which defeats the actual point of sorting
+// Indian-capable models first in the first place.
+function withLiveDiscoveredData(model) {
+  const live = getLiveStatus(model.id);
+  const caps = live?.capabilities?.detected ? live.capabilities : null;
+  const curatedVoiceCount = model.confirmedVoiceIds?.length || 0;
+  const curatedLanguageCount = model.confirmedLanguages?.length || 0;
+  const mergedVoiceIds = caps && model.confirmedVoiceIds ? mergeVoiceIds(model.confirmedVoiceIds, caps.voiceOptions?.options) : model.confirmedVoiceIds;
+  const mergedLanguages = caps && model.confirmedLanguages ? mergeStringList(model.confirmedLanguages, caps.languageOptions?.options) : model.confirmedLanguages;
+  const mergedEmotions = caps && model.confirmedEmotions ? mergeStringList(model.confirmedEmotions, caps.emotionOptions?.options) : model.confirmedEmotions;
+  // Real, per-model Indian-language coverage — computed fresh against
+  // whichever languages this model ACTUALLY confirms (curated, plus
+  // live if available), not a single hand-set flag that only one model
+  // ever had. Falls back to autoDetectedLanguagesSupported for a model
+  // like ElevenLabs Eleven v3 that has no explicit language parameter
+  // at all (confirmedLanguages is null there on purpose — see
+  // fal-models.js).
+  const languagePool = mergedLanguages || model.autoDetectedLanguagesSupported || [];
+  const indianLanguageCoverage = languagePool.filter(isIndianLanguage);
+  if (!caps) return { ...model, indianLanguageCoverage };
+  return {
+    ...model,
+    confirmedVoiceIds: mergedVoiceIds,
+    confirmedLanguages: mergedLanguages,
+    confirmedEmotions: mergedEmotions,
+    indianLanguageCoverage,
+    voiceDiscovery: {
+      curatedVoiceCount,
+      liveDiscoveredVoiceCount: (mergedVoiceIds?.length || 0) - curatedVoiceCount,
+      curatedLanguageCount,
+      liveDiscoveredLanguageCount: (mergedLanguages?.length || 0) - curatedLanguageCount,
+      schemaCheckedAt: live.checkedAt || null,
+    },
+  };
+}
+
+// Used by GET /api/models — merges in whatever the live schema refresh
+// has discovered, then returns only the voices actually confirmed
 // working (or not yet checked, shown as-is rather than hidden, since an
 // unchecked voice hasn't been proven broken either — only a confirmed
-// failure removes it).
+// failure removes it). Indian-language-capable models are sorted first
+// so the picker leads with them, per the actual real ask, rather than
+// leaving that entirely to alphabetical/registry-insertion order.
 function getVerifiedVoiceModels() {
-  return VOICE_MODELS.map((model) => {
+  return VOICE_MODELS.map((rawModel) => {
+    const model = withLiveDiscoveredData(rawModel);
     if (!model.confirmedVoiceIds?.length) return model;
     const filtered = model.confirmedVoiceIds.filter((voice) => {
       const result = verifiedVoices.get(`${model.id}::${voice.id}`);
       return !result || result.working !== false; // keep if unchecked or working; drop only on confirmed failure
     });
     return { ...model, confirmedVoiceIds: filtered };
-  });
+  }).sort((a, b) => (b.indianLanguageCoverage?.length || 0) - (a.indianLanguageCoverage?.length || 0));
 }
 
 // Real, specific entries — not just a count — for surfacing in the
@@ -211,4 +314,10 @@ function clearCache() {
   console.log(`[Voice Catalog] Cache cleared — next check will re-verify every voice from scratch.`);
 }
 
-module.exports = { loadPersistedCache, verifyAllVoices, getVerifiedVoiceModels, getVoiceCatalogStatus, getVoiceVerificationDetails, recordVoiceFailure, clearCache };
+module.exports = {
+  loadPersistedCache, verifyAllVoices, getVerifiedVoiceModels, getVoiceCatalogStatus,
+  getVoiceVerificationDetails, recordVoiceFailure, clearCache,
+  // Exported so provider-adapter.js's discoverVoices() can share the exact
+  // same curated+live merge logic instead of a second, drifting copy.
+  mergeVoiceIds, mergeStringList, withLiveDiscoveredData,
+};

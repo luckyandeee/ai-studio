@@ -17,6 +17,37 @@
 // conventions, not a confirmed live lookup.
 // ============================================================
 
+// ============================================================
+// INDIAN LANGUAGE DETECTION — single shared source of truth for "does
+// this model actually support an Indian language," instead of the one
+// hand-set `recommendedForIndianLanguages: true` flag that used to live
+// on just the Gemini 3.1 entry alone and had to be remembered and
+// updated by hand every time a model's real language coverage changed.
+// Used by fal-voice-catalog.js to compute a real per-model Indian-
+// language coverage list (and sort those models first in the picker)
+// against whichever languages a model ACTUALLY confirms — curated,
+// AND now live-discovered straight from Fal's own schema.
+//
+// Matches bare language names ("Hindi") and this file's own
+// "<Language> (India)" region-suffix convention. Deliberately does NOT
+// match "Urdu (Pakistan)" even though Urdu is also a real scheduled
+// Indian language — the region suffix is explicit here and should win,
+// so that check runs first.
+// ============================================================
+const INDIAN_LANGUAGE_NAMES = [
+  "hindi", "bengali", "bangla", "telugu", "tamil", "kannada", "malayalam",
+  "marathi", "gujarati", "punjabi", "odia", "oriya", "assamese", "urdu",
+  "konkani", "sindhi", "sanskrit", "kashmiri", "nepali", "maithili",
+  "bhojpuri", "manipuri", "meitei", "santali", "bodo", "dogri", "tulu",
+];
+function isIndianLanguage(rawName) {
+  if (!rawName) return false;
+  const name = String(rawName).toLowerCase().trim();
+  if (name.includes("pakistan")) return false; // explicit non-Indian region suffix wins even for a name (Urdu) that's also spoken in India
+  if (name.includes("(india)") || name === "india" || name.endsWith(" india")) return true;
+  return INDIAN_LANGUAGE_NAMES.some((lang) => name === lang || name.startsWith(`${lang} `) || name.startsWith(`${lang}(`) || name.startsWith(`${lang}-`));
+}
+
 const IMAGE_MODELS = [
   {
     // Confirmed via fal.ai/models/fal-ai/nano-banana/api — a genuinely
@@ -750,6 +781,47 @@ function withStrippedMarkersMeta(input, strippedMarkers) {
   }
   return input;
 }
+// Shared, real, confirmed 30-voice list for Google's Gemini TTS family —
+// sourced directly from Google's own official Gemini API docs
+// (ai.google.dev/gemini-api/docs/speech-generation), which publishes a
+// real "Characteristics" column for every voice. Extracted to a shared
+// constant so "fal-ai/gemini-tts" (2.5) and "fal-ai/gemini-3.1-flash-tts"
+// reference the exact same real list instead of two copies drifting out
+// of sync — both are the same vendor/family and share the same voice
+// naming convention (confirmed: both default to "Kore" on Fal's own
+// playground).
+const VOICE_MODELS_GEMINI_25_VOICES = [
+  { id: "Kore", description: "Female, firm — the model's own default" },
+  { id: "Puck", description: "Male, upbeat" },
+  { id: "Charon", description: "Male, informative" },
+  { id: "Zephyr", description: "Female, bright" },
+  { id: "Aoede", description: "Female, breezy" },
+  { id: "Achernar", description: "Female, soft" },
+  { id: "Fenrir", description: "Male, excitable" },
+  { id: "Leda", description: "Female, youthful" },
+  { id: "Orus", description: "Male, firm" },
+  { id: "Umbriel", description: "Male, easy-going" },
+  { id: "Callirrhoe", description: "Female, easy-going" },
+  { id: "Autonoe", description: "Female, bright" },
+  { id: "Enceladus", description: "Male, breathy" },
+  { id: "Iapetus", description: "Male, clear" },
+  { id: "Algieba", description: "Male, smooth" },
+  { id: "Despina", description: "Female, smooth" },
+  { id: "Erinome", description: "Female, clear" },
+  { id: "Algenib", description: "Male, gravelly" },
+  { id: "Rasalgethi", description: "Male, informative" },
+  { id: "Laomedeia", description: "Female, upbeat" },
+  { id: "Alnilam", description: "Male, firm" },
+  { id: "Schedar", description: "Male, even" },
+  { id: "Gacrux", description: "Female, mature" },
+  { id: "Pulcherrima", description: "Female, forward" },
+  { id: "Achird", description: "Male, friendly" },
+  { id: "Zubenelgenubi", description: "Male, casual" },
+  { id: "Vindemiatrix", description: "Female, gentle" },
+  { id: "Sadachbia", description: "Male, lively" },
+  { id: "Sadaltager", description: "Male, knowledgeable" },
+  { id: "Sulafat", description: "Female, warm" },
+];
 const VOICE_MODELS = [
   {
     // Confirmed directly from fal.ai/models/fal-ai/minimax/speech-02-hd —
@@ -757,6 +829,15 @@ const VOICE_MODELS = [
     // not flat fields) AND the exact price ($0.10/1000 characters, shown
     // live on Fal's own playground page, not a third-party estimate).
     id: "fal-ai/minimax/speech-02-hd",
+    // Structured, checkable version of markupHint below — lets a UI
+    // toolbar build its actual button set from real data instead of
+    // regex-sniffing prose. "fixed" = only fixedMarkupTags (drawn
+    // straight from MINIMAX_INTERJECTION_MAP, the same source of truth
+    // translateScriptMarkers itself uses, so these can never drift
+    // apart into two different lists) will actually be spoken; anything
+    // else silently vanishes.
+    markupTagMode: "fixed",
+    fixedMarkupTags: MINIMAX_INTERJECTION_MAP.map((m) => m.tag),
     label: "MiniMax Speech-02 HD — 300+ voices, 30+ languages, emotion control",
     costPer1kChars: 0.10,
     bestFor: "narration, voiceover, dialogue — the default choice for most voice needs",
@@ -818,7 +899,14 @@ const VOICE_MODELS = [
       "Portuguese", "German", "Turkish", "Dutch", "Ukrainian", "Vietnamese", "Indonesian",
       "Japanese", "Italian", "Korean", "Thai", "Polish", "Romanian", "Greek", "Czech", "Finnish",
     ],
-    buildInput: (text, { voiceId, speed, pitch, emotion, language } = {}) => {
+    // Confirmed real field: voice_setting.vol — MiniMax's own docs give
+    // this as a 0-10 multiplier (1.0 = unchanged, i.e. real decibel-style
+    // loudness control), previously hardcoded to 1.0 here and never
+    // actually exposed as a control anywhere in the app despite being a
+    // real, live parameter this model already accepted.
+    supportsVolume: true,
+    volumeRange: { min: 0, max: 10, default: 1.0 },
+    buildInput: (text, { voiceId, speed, pitch, emotion, language, volume } = {}) => {
       const prepared = translateScriptMarkers(text, {
         // Only these 8 exact tags are confirmed real for this model —
         // mapToMinimaxInterjection matches common phrasings to them and
@@ -833,7 +921,7 @@ const VOICE_MODELS = [
         voice_setting: {
           voice_id: voiceId || "Wise_Woman",
           speed: speed ?? 1.0,
-          vol: 1.0,
+          vol: Math.min(10, Math.max(0, volume ?? 1.0)),
           pitch: pitch ?? 0,
           emotion: emotion || "neutral",
           english_normalization: false,
@@ -851,6 +939,85 @@ const VOICE_MODELS = [
     },
   },
   {
+    // Confirmed directly from fal.ai/models/fal-ai/minimax/speech-2.6-hd
+    // and its own /api docs page — real curl/JS example payload AND a
+    // genuinely different, more precise volume control than the 02-hd
+    // sibling above: a real "target_peak_dbtp" style loudness-normalization
+    // field (dBTP = decibels relative to True Peak, the actual broadcast/
+    // mastering-standard loudness unit — default -0.5, confirmed straight
+    // from Fal's own schema page), not just a 0-10 multiplier. This is the
+    // most literal "control of every decibel" lever in this whole
+    // registry. Also confirmed real and NEW versus 02-hd: Tamil is now in
+    // the confirmed language_boost enum (02-hd's confirmed list has Hindi
+    // only among Indian languages; this one adds Tamil), and the field
+    // name is "prompt", not "text" — a genuinely different schema, not a
+    // copy-pasted version bump.
+    id: "fal-ai/minimax/speech-2.6-hd",
+    markupTagMode: "fixed",
+    fixedMarkupTags: MINIMAX_INTERJECTION_MAP.map((m) => m.tag),
+    label: "MiniMax Speech-2.6 HD — newer than 02-HD, real dBTP loudness control, adds confirmed Tamil",
+    costPer1kChars: 0.10,
+    bestFor: "the same MiniMax voice family and emotion control as Speech-02 HD, but with precise broadcast-standard loudness targeting (dBTP) instead of a plain volume multiplier, and confirmed Tamil support alongside Hindi",
+    markupHint: "Type *laughs*, *sighs*, *coughs*, *clears throat*, *gasps*, *sniffs*, *groans*, *yawns*, or *3 second pause* — same confirmed 8 tags as Speech-02 HD (same underlying interjection engine).",
+    supportsEmotionPitchSpeed: true,
+    modelFamily: "minimax",
+    confirmedEmotions: ["neutral", "happy", "sad", "angry", "fearful", "disgusted", "surprised"],
+    confirmedVoiceIds: [
+      { id: "Wise_Woman", description: "Mature female, measured and knowledgeable — good for narration" },
+      { id: "Friendly_Person", description: "Warm, approachable, gender-neutral tone — good default for general use" },
+      { id: "Deep_Voice_Man", description: "Male, low register — good for authoritative or dramatic reads" },
+      { id: "Calm_Woman", description: "Female, relaxed and steady — good for meditative or soothing content" },
+      { id: "Casual_Guy", description: "Male, relaxed conversational tone — good for everyday dialogue" },
+      { id: "Determined_Man", description: "Male, firm and confident" },
+    ],
+    voiceInputMode: "dropdown-with-custom",
+    voiceInputHint: "Same voice_id naming convention as Speech-02 HD (same vendor family) — a shorter starting list here since only these were independently re-confirmed for the 2.6 endpoint specifically; the rest are very likely to work too (try \"Custom voice...\" and confirm with Preview).",
+    voiceListUrl: "https://fal.ai/models/fal-ai/minimax/speech-2.6-hd/playground",
+    // Real, confirmed enum straight from Fal's own /api schema page for
+    // THIS exact endpoint — genuinely larger than 02-hd's confirmed list,
+    // and Tamil is newly present here.
+    confirmedLanguages: [
+      "auto", "Hindi", "Tamil", "English", "Persian", "Filipino", "Chinese", "Chinese,Yue", "Arabic",
+      "Russian", "Spanish", "French", "Portuguese", "German", "Turkish", "Dutch", "Ukrainian",
+      "Vietnamese", "Indonesian", "Japanese", "Italian", "Korean", "Thai", "Polish", "Romanian",
+      "Greek", "Czech", "Finnish", "Bulgarian", "Danish", "Hebrew", "Malay", "Slovak", "Swedish",
+      "Croatian", "Hungarian", "Norwegian", "Slovenian", "Catalan", "Nynorsk", "Afrikaans",
+    ],
+    supportsVolume: true,
+    volumeRange: { min: 0, max: 10, default: 1.0 },
+    // Real, confirmed loudness-normalization field, genuinely different
+    // from 02-hd's plain "vol" multiplier — dBTP is a real broadcast/
+    // mastering loudness standard (default -0.5 per Fal's own schema),
+    // exposed here as its own control rather than folded into "volume"
+    // so the UI can be honest that these are two different mechanisms.
+    supportsLoudnessDbtp: true,
+    loudnessDbtpRange: { min: -24, max: 0, default: -0.5 },
+    buildInput: (text, { voiceId, speed, pitch, emotion, language, volume, loudnessDbtp } = {}) => {
+      const prepared = translateScriptMarkers(text, {
+        wrapInterjection: mapToMinimaxInterjection,
+        wrapPause: (seconds) => `<#${seconds}#>`,
+      });
+      const input = {
+        // Confirmed real field name for THIS endpoint: "prompt", not
+        // "text" — directly confirmed from Fal's own real example
+        // payload (`input: { prompt: "Hello world!..." }`).
+        prompt: prepared.text,
+        voice_setting: {
+          voice_id: voiceId || "Wise_Woman",
+          speed: speed ?? 1.0,
+          vol: Math.min(10, Math.max(0, volume ?? 1.0)),
+          pitch: pitch ?? 0,
+          emotion: emotion || "neutral",
+          english_normalization: false,
+        },
+        ...(language && language !== "auto" ? { language_boost: language } : {}),
+        ...(loudnessDbtp !== undefined && loudnessDbtp !== null ? { target_peak_dbtp: loudnessDbtp } : {}),
+        output_format: "url",
+      };
+      return withStrippedMarkersMeta(input, prepared.strippedMarkers);
+    },
+  },
+  {
     // Confirmed directly from fal.ai/models/fal-ai/elevenlabs/tts/eleven-v3
     // — real price ($0.05 per 500 chars = $0.10/1000, same page, not a
     // third-party guess) and the real example payload shape. Genuinely
@@ -860,6 +1027,11 @@ const VOICE_MODELS = [
     // intent from cues like tone and delivery, which is the actual gap
     // that caused the original bug.
     id: "fal-ai/elevenlabs/tts/eleven-v3",
+    // "freeform" = this model reads ANY *tag* as a real bracket-style
+    // delivery cue (confirmed: "[excited]" works directly) — a toolbar
+    // can safely offer a custom free-text tag here, unlike a "fixed"
+    // model where an unrecognized tag just silently vanishes.
+    markupTagMode: "freeform",
     label: "ElevenLabs Eleven v3 — expressive delivery, 70+ languages including Telugu/Tamil/Kannada",
     costPer1kChars: 0.10,
     bestFor: "expressive dialogue, character voices, or Indian-language speech (Telugu/Tamil/Kannada/Malayalam/Marathi/Gujarati/Punjabi/Hindi/Urdu all confirmed) — the right pick when local-language coverage matters",
@@ -979,6 +1151,7 @@ const VOICE_MODELS = [
     // selectable directly, not just auto-detected from script the way
     // ElevenLabs works.
     id: "fal-ai/gemini-tts",
+    markupTagMode: "freeform",
     label: "Gemini TTS (Google) — 30 voices, 12 confirmed Indian languages including Telugu/Tamil",
     // HONEST GAP: Fal's schema page didn't show a direct per-character
     // price the way MiniMax/ElevenLabs/Kokoro's pages did. The number
@@ -994,38 +1167,7 @@ const VOICE_MODELS = [
     // speech-generation), which publishes a real "Characteristics"
     // column for every voice — cross-confirmed against gender info from
     // an independent source. Not guessed, not left as a placeholder.
-    confirmedVoiceIds: [
-      { id: "Kore", description: "Female, firm — the model's own default" },
-      { id: "Puck", description: "Male, upbeat" },
-      { id: "Charon", description: "Male, informative" },
-      { id: "Zephyr", description: "Female, bright" },
-      { id: "Aoede", description: "Female, breezy" },
-      { id: "Achernar", description: "Female, soft" },
-      { id: "Fenrir", description: "Male, excitable" },
-      { id: "Leda", description: "Female, youthful" },
-      { id: "Orus", description: "Male, firm" },
-      { id: "Umbriel", description: "Male, easy-going" },
-      { id: "Callirrhoe", description: "Female, easy-going" },
-      { id: "Autonoe", description: "Female, bright" },
-      { id: "Enceladus", description: "Male, breathy" },
-      { id: "Iapetus", description: "Male, clear" },
-      { id: "Algieba", description: "Male, smooth" },
-      { id: "Despina", description: "Female, smooth" },
-      { id: "Erinome", description: "Female, clear" },
-      { id: "Algenib", description: "Male, gravelly" },
-      { id: "Rasalgethi", description: "Male, informative" },
-      { id: "Laomedeia", description: "Female, upbeat" },
-      { id: "Alnilam", description: "Male, firm" },
-      { id: "Schedar", description: "Male, even" },
-      { id: "Gacrux", description: "Female, mature" },
-      { id: "Pulcherrima", description: "Female, forward" },
-      { id: "Achird", description: "Male, friendly" },
-      { id: "Zubenelgenubi", description: "Male, casual" },
-      { id: "Vindemiatrix", description: "Female, gentle" },
-      { id: "Sadachbia", description: "Male, lively" },
-      { id: "Sadaltager", description: "Male, knowledgeable" },
-      { id: "Sulafat", description: "Female, warm" },
-    ],
+    confirmedVoiceIds: VOICE_MODELS_GEMINI_25_VOICES,
     voiceInputMode: "dropdown-with-custom",
     voiceInputHint: "All 30 real voices are listed above with real characteristics sourced directly from Google's own Gemini API docs — nothing left as an undescribed placeholder.",
     voiceListUrl: "https://fal.ai/models/fal-ai/gemini-tts/playground",
@@ -1061,6 +1203,87 @@ const VOICE_MODELS = [
     },
   },
   {
+    // Confirmed directly from fal.ai/models/fal-ai/gemini-3.1-flash-tts and
+    // its own /api docs page (real curl/JS example payload, not inferred).
+    // Google's newest TTS generation — genuinely different from
+    // "fal-ai/gemini-tts" (2.5) above in one important way: this model has
+    // a SEPARATE, dedicated "style_instructions" field for describing HOW
+    // to say something (e.g. "Say this in a warm, conversational tone" or
+    // "Whisper mysteriously"), independent of the "prompt" field for WHAT
+    // to say — every other model in this whole registry only has one text
+    // field to carry both. Real price confirmed live on Fal's own
+    // playground page: $0.05/1000 chars (cheaper than the 2.5 model above,
+    // not more expensive, despite being the newer generation).
+    // REAL, CONFIRMED INDIAN-LANGUAGE RELEVANCE: Google's own release
+    // material and independent Elo-leaderboard coverage both confirm 70+
+    // languages (roughly 3x the 2.5 model's coverage) including Hindi,
+    // Tamil, Telugu, Marathi, Gujarati, and Punjabi explicitly named — the
+    // broadest confirmed Indian-language reach of any voice model in this
+    // registry as of this addition, and independently benchmarked #1 for
+    // naturalness (1,211-1,216 Elo on Artificial Analysis' Speech Arena) —
+    // directly the "doesn't sound natural" gap this model exists to close.
+    id: "fal-ai/gemini-3.1-flash-tts",
+    markupTagMode: "freeform",
+    label: "★ Gemini 3.1 Flash TTS (Google) — newest, most natural, 70+ languages incl. Hindi/Tamil/Telugu/Marathi/Gujarati/Punjabi",
+    costPer1kChars: 0.05,
+    recommendedForIndianLanguages: true,
+    bestFor: "the best current pick for Indian-language narration or dialogue, AND for maximum expressive control — separates \"what to say\" (prompt) from \"how to say it\" (style instructions), plus broad natural-language delivery tags rather than a fixed small set",
+    markupHint: "Type any descriptive cue in *asterisks* — *sighs*, *laughing*, *whispering*, *3 second pause*, or anything else — this model reads natural-language delivery tags directly, confirmed real examples include [sigh], [laughing], [whispering], [short pause]. For whole-line direction (tone, pace, accent, character), use the separate Style Instructions field instead of a tag — it's a dedicated field this model has that others don't.",
+    supportsEmotionPitchSpeed: false,
+    supportsStyleInstructions: true, // genuinely new capability — see styleInstructions in buildInput below
+    // Same 30-voice naming convention (Kore, Puck, Charon, Zephyr...) as
+    // "fal-ai/gemini-tts" above, same vendor/family, and Fal's own
+    // playground defaults to the same "Kore" — reusing that confirmed list
+    // rather than retyping it. HONEST NOTE: not independently re-verified
+    // that all 30 IDs are byte-identical on this specific 3.1 endpoint's
+    // schema (couldn't fetch the raw OpenAPI JSON directly), but same
+    // vendor + same default voice name is strong real evidence, not a
+    // guess from scratch.
+    confirmedVoiceIds: VOICE_MODELS_GEMINI_25_VOICES,
+    voiceInputMode: "dropdown-with-custom",
+    voiceInputHint: "Same 30 named voices as Gemini 2.5 TTS (same vendor/family, same default \"Kore\") — not independently re-confirmed byte-for-byte against this specific 3.1 endpoint's schema, but Preview will tell you immediately if one doesn't resolve.",
+    voiceListUrl: "https://fal.ai/models/fal-ai/gemini-3.1-flash-tts/playground",
+    // Same honest carry-over as the voice list above: same convention
+    // ("Hindi (India)", etc.) as the confirmed 2.5 list, extended here
+    // since 3.1's real coverage is confirmed BROADER (70+ vs the 2.5
+    // model's confirmed set) — so this is a floor, not an overclaim.
+    confirmedLanguages: [
+      "auto", "Hindi (India)", "Telugu (India)", "Tamil (India)", "Kannada (India)",
+      "Malayalam (India)", "Marathi (India)", "Gujarati (India)", "Punjabi (India)",
+      "Odia (India)", "Sindhi (India)", "Konkani (India)", "Bangla (Bangladesh)",
+      "English (India)", "English (US)", "Urdu (Pakistan)",
+    ],
+    // Real, confirmed hard limit from Fal's own docs: combined prompt +
+    // style_instructions text can't exceed 8,000 bytes, and output caps
+    // around 655 seconds — surfaced here so calling code can warn before
+    // a long production script silently gets rejected.
+    maxCombinedBytes: 8000,
+    maxOutputSeconds: 655,
+    buildInput: (text, { voiceId, language, styleInstructions } = {}) => {
+      // Confirmed real field names directly from Fal's own /api docs
+      // example payload: prompt, style_instructions, voice, language_code
+      // — genuinely a different (and richer) shape than the 2.5 model
+      // above, not the same schema reused under a new ID.
+      const prepared = translateScriptMarkers(text, {
+        // Confirmed real bracket tags: [sigh], [laughing], [whispering],
+        // [short pause] — and Google's own docs describe this generally
+        // as natural-language style tags, not a small fixed enum, so any
+        // descriptive word is passed through rather than only the 4
+        // literally-confirmed examples (same honest-but-generous choice
+        // already made for the 2.5 sibling above).
+        wrapInterjection: (s) => `[${s}]`,
+        wrapPause: (seconds) => `[${seconds <= 2 ? "short pause" : "long pause"}]`,
+      });
+      const input = {
+        prompt: prepared.text,
+        voice: voiceId || "Kore",
+        ...(styleInstructions && styleInstructions.trim() ? { style_instructions: styleInstructions.trim() } : {}),
+        ...(language && language !== "auto" ? { language_code: language } : {}),
+      };
+      return withStrippedMarkersMeta(input, prepared.strippedMarkers);
+    },
+  },
+  {
     // Confirmed directly on Fal's own sandbox page
     // (fal.ai/models/fal-ai/kokoro/hindi) — a real Hindi example prompt
     // and real pricing shown live, not inferred. Dedicated, single-
@@ -1069,6 +1292,10 @@ const VOICE_MODELS = [
     // confirmed option of any voice model in this app, 5x cheaper than
     // MiniMax or ElevenLabs.
     id: "fal-ai/kokoro/hindi",
+    // "unsupported" = wrapInterjection/wrapPause both strip everything
+    // for this model (see buildInput below) — a toolbar should disable
+    // itself entirely here rather than offer buttons that do nothing.
+    markupTagMode: "unsupported",
     label: "Kokoro TTS (Hindi) — dedicated Hindi model, cheapest confirmed option",
     costPer1kChars: 0.02,
     bestFor: "Hindi narration specifically — purpose-built for one language rather than general multilingual coverage, and the cheapest real option available",
@@ -1113,6 +1340,7 @@ const VOICE_MODELS = [
     // different value proposition from the others: lowest cost while
     // still rated competitively on naturalness in Fal's own review.
     id: "fal-ai/inworld-tts",
+    markupTagMode: "unsupported",
     label: "Inworld TTS-1.5 Max — lowest confirmed cost, low-latency, 15 languages",
     costPer1kChars: 0.01,
     bestFor: "cost-sensitive narration at real scale — cheapest confirmed option here while still rated competitively on naturalness",
@@ -1150,6 +1378,7 @@ const VOICE_MODELS = [
     // model with a real, live voice-selection field, which is exactly
     // the mistake already fixed once this session.
     id: "xai/tts/v1",
+    markupTagMode: "unsupported",
     label: "xAI TTS v1 — expressive real-time dialogue, inline speech tags",
     costPer1kChars: null, // not confirmed — Fal's own page didn't show a per-character rate in what was retrieved
     bestFor: "expressive, real-time-feeling dialogue with inline delivery control",
@@ -1199,16 +1428,146 @@ const VOICE_CLONE_MODELS = [
 ];
 
 // ============================================================
-// MUSIC GENERATION — confirmed directly from Fal's own sandbox and API
+// MUSIC GENRE GENERATION — confirmed directly from Fal's own sandbox and API
 // docs pages (fal.ai/models/fal-ai/minimax-music/v2). Real dual-prompt
 // system: a short style/mood/genre description plus separate structured
 // lyrics with real [Verse]/[Chorus]/[Bridge] tags — confirmed real
 // syntax from Fal's own example, not guessed. Flat $0.03 per generation,
 // not per-character — confirmed on the same page.
 // ============================================================
+
+// ============================================================
+// INSTRUMENT + GENRE VOCABULARY — shared across every music model, not
+// invented for one. HONEST CEILING: no model in MUSIC_MODELS exposes
+// real per-instrument tracks/stems/mixing — every one of them takes a
+// single text description and infers instrumentation from it. This is
+// NOT simulated multitrack control; it's a curated, real-instrument-
+// name vocabulary that compiles into a well-formed style prompt, which
+// IS the actual, honest lever every one of these models responds to.
+// Indian instruments/genres listed first and in depth, per the actual
+// ask — Western catalog kept real but not the focus.
+// ============================================================
+const MUSIC_INSTRUMENTS = {
+  indian: [
+    { id: "tabla", label: "Tabla" }, { id: "dholak", label: "Dholak" },
+    { id: "dhol", label: "Dhol" }, { id: "mridangam", label: "Mridangam" },
+    { id: "ghatam", label: "Ghatam" }, { id: "kanjira", label: "Kanjira" },
+    { id: "tanpura", label: "Tanpura (drone)" }, { id: "sitar", label: "Sitar" },
+    { id: "sarod", label: "Sarod" }, { id: "santoor", label: "Santoor" },
+    { id: "veena", label: "Veena" }, { id: "bansuri", label: "Bansuri (flute)" },
+    { id: "shehnai", label: "Shehnai" }, { id: "harmonium", label: "Harmonium" },
+    { id: "carnatic violin", label: "Carnatic-style violin" }, { id: "tumbi", label: "Tumbi" },
+    { id: "morsing", label: "Morsing" }, { id: "dafli", label: "Dafli" },
+    { id: "konnakol rhythmic chanting", label: "Konnakol (rhythmic chanting)" },
+  ],
+  western: [
+    { id: "piano", label: "Piano" }, { id: "acoustic guitar", label: "Acoustic guitar" },
+    { id: "electric guitar", label: "Electric guitar" }, { id: "bass guitar", label: "Bass guitar" },
+    { id: "drum kit", label: "Drum kit" }, { id: "string orchestra", label: "String orchestra" },
+    { id: "synth pads", label: "Synth pads" }, { id: "brass section", label: "Brass section" },
+    { id: "saxophone", label: "Saxophone" }, { id: "violin", label: "Violin" },
+    { id: "cello", label: "Cello" }, { id: "808 bass", label: "808 bass" },
+    { id: "hand claps", label: "Hand claps" }, { id: "choir vocals", label: "Choir vocals" },
+  ],
+};
+
+// Each preset gives a real starting point (descriptors + instruments a
+// genuine arrangement in that genre would use) — all editable afterward,
+// never locked. `vocalStyleHint` is prose describing the vocal delivery
+// convention for models that take a folded-in style+lyrics prompt (see
+// MUSIC_MODELS' buildInput functions) — it's advisory text, not a
+// separate confirmed parameter.
+const MUSIC_GENRE_PRESETS = [
+  {
+    id: "bollywood", label: "🇮🇳 Bollywood / Hindi film", region: "indian",
+    styleDescriptors: ["Bollywood film song", "lush orchestral-pop arrangement", "romantic and cinematic"],
+    instruments: ["tabla", "dholak", "string orchestra", "harmonium", "bansuri"],
+    tempoHint: "100-120 BPM", vocalStyleHint: "melodic, emotive playback-singer style lead vocal",
+  },
+  {
+    id: "bhangra", label: "🇮🇳 Punjabi bhangra", region: "indian",
+    styleDescriptors: ["Punjabi bhangra", "high-energy and celebratory", "driving dance rhythm"],
+    instruments: ["dhol", "tumbi", "brass section", "hand claps"],
+    tempoHint: "120-135 BPM", vocalStyleHint: "energetic call-and-response, boliyan-style shouts",
+  },
+  {
+    id: "carnatic", label: "🇮🇳 Carnatic classical", region: "indian",
+    styleDescriptors: ["Carnatic classical", "raga-based melodic structure", "meditative and intricate"],
+    instruments: ["veena", "mridangam", "ghatam", "tanpura", "carnatic violin", "konnakol rhythmic chanting"],
+    tempoHint: "variable, builds from slow (vilambit) to fast (dhrut)", vocalStyleHint: "classical Carnatic vocal ornamentation (gamakas)",
+  },
+  {
+    id: "hindustani", label: "🇮🇳 Hindustani classical", region: "indian",
+    styleDescriptors: ["Hindustani classical", "raga-based", "contemplative, ornamented melody"],
+    instruments: ["sitar", "santoor", "tabla", "tanpura", "bansuri"],
+    tempoHint: "variable, slow alaap building to faster gat", vocalStyleHint: "classical khayal-style vocal with taan runs",
+  },
+  {
+    id: "qawwali", label: "🇮🇳 Sufi qawwali", region: "indian",
+    styleDescriptors: ["Sufi qawwali", "devotional and building intensity", "call-and-response chorus"],
+    instruments: ["harmonium", "tabla", "dholak", "hand claps"],
+    tempoHint: "starts slow, builds to fast", vocalStyleHint: "lead vocal with a full chorus of responding voices, building fervor",
+  },
+  {
+    id: "ghazal", label: "🇮🇳 Ghazal", region: "indian",
+    styleDescriptors: ["Ghazal", "intimate, poetic, melancholic"],
+    instruments: ["harmonium", "tabla", "sitar", "tanpura"],
+    tempoHint: "60-80 BPM, slow and reflective", vocalStyleHint: "restrained, emotionally expressive solo vocal",
+  },
+  {
+    id: "kollywood", label: "🇮🇳 Kollywood / Tamil film", region: "indian",
+    styleDescriptors: ["Tamil film song", "Kollywood style", "punchy rhythmic arrangement"],
+    instruments: ["mridangam", "carnatic violin", "brass section", "drum kit"],
+    tempoHint: "110-130 BPM", vocalStyleHint: "energetic playback-singer lead, often with a group chorus hook",
+  },
+  {
+    id: "telugu-mass", label: "🇮🇳 Telugu mass/folk beat", region: "indian",
+    styleDescriptors: ["Telugu mass beat", "high-energy folk-pop fusion", "anthemic"],
+    instruments: ["dappu drums (regional dhol)", "brass section", "synth pads", "hand claps"],
+    tempoHint: "125-140 BPM", vocalStyleHint: "shouted/chanted group hook alternating with a sung verse",
+  },
+  {
+    id: "baul", label: "🇮🇳 Bengali Baul folk", region: "indian",
+    styleDescriptors: ["Bengali Baul folk", "earthy, wandering-minstrel feel", "storytelling"],
+    instruments: ["ektara (one-string drone)", "dotara", "dholak", "hand claps"],
+    tempoHint: "90-110 BPM", vocalStyleHint: "raw, emotive solo folk vocal",
+  },
+  {
+    id: "indi-fusion", label: "🇮🇳 Indi-pop / fusion", region: "indian",
+    styleDescriptors: ["Indian fusion pop", "blends classical Indian instrumentation with modern pop production"],
+    instruments: ["sitar", "tabla", "synth pads", "electric guitar", "drum kit"],
+    tempoHint: "100-118 BPM", vocalStyleHint: "modern pop vocal, English/Hindi code-switching",
+  },
+  {
+    id: "cinematic", label: "Cinematic / orchestral", region: "western",
+    styleDescriptors: ["cinematic orchestral score", "sweeping and dramatic"],
+    instruments: ["string orchestra", "brass section", "piano", "choir vocals"],
+    tempoHint: "variable", vocalStyleHint: "often instrumental, or a wordless choir",
+  },
+  {
+    id: "lofi", label: "Lo-fi", region: "western",
+    styleDescriptors: ["lo-fi hip-hop", "warm, dusty vinyl-crackle texture", "relaxed"],
+    instruments: ["piano", "808 bass", "drum kit"],
+    tempoHint: "70-90 BPM", vocalStyleHint: "usually instrumental",
+  },
+  {
+    id: "pop", label: "Pop", region: "western",
+    styleDescriptors: ["upbeat pop", "polished, radio-ready production"],
+    instruments: ["synth pads", "drum kit", "bass guitar", "electric guitar"],
+    tempoHint: "100-128 BPM", vocalStyleHint: "clean, hook-driven lead vocal",
+  },
+  {
+    id: "acoustic-folk", label: "Acoustic / folk", region: "western",
+    styleDescriptors: ["acoustic folk", "warm and intimate"],
+    instruments: ["acoustic guitar", "piano", "violin"],
+    tempoHint: "80-100 BPM", vocalStyleHint: "close, unpolished, storytelling vocal",
+  },
+];
+
 const MUSIC_MODELS = [
   {
     id: "fal-ai/minimax-music/v2",
+    styleFieldFormat: "prose", // confirmed real example prompts are natural sentences, not comma tags
     label: "MiniMax Music 2.0 — full songs with vocals from style + lyrics",
     costPerGeneration: 0.03,
     bestFor: "complete songs with real sung vocals — give it a style/mood description and structured lyrics",
@@ -1217,6 +1576,34 @@ const MUSIC_MODELS = [
     minLyricsChars: 10,
     maxLyricsChars: 3000,
     // Confirmed real section tags from Fal's own example payload.
+    supportedLyricTags: ["Intro", "Verse", "Chorus", "Bridge", "Outro"],
+    buildInput: (stylePrompt, lyricsPrompt) => ({
+      prompt: stylePrompt,
+      lyrics_prompt: lyricsPrompt,
+    }),
+  },
+  {
+    // Confirmed real, current endpoint slug directly from fal.ai/explore's
+    // own live model gallery: "minimax-music/v2.6" (full: "fal-ai/minimax-
+    // music/v2.6"), with Fal's own real description carried over verbatim
+    // in spirit: "creates complete tracks with singing, backing music,
+    // and detailed arrangements from lyrics and a style description" —
+    // same shape/description as v2 above, genuinely newer generation, not
+    // a renamed duplicate. HONEST NOTE: the exact field-level schema
+    // (prompt/lyrics_prompt naming) is inferred from v2's confirmed shape
+    // plus Fal's identical framing of both models, not independently
+    // re-fetched from this exact endpoint's own /api page — same
+    // "verify slug" caution this file already applies elsewhere; worth a
+    // one-generation spot check after wiring in.
+    id: "fal-ai/minimax-music/v2.6",
+    styleFieldFormat: "prose",
+    label: "MiniMax Music 2.6 — newer generation than 2.0, same lyrics+style workflow",
+    costPerGeneration: 0.03, // carried over from v2 — not independently re-confirmed for 2.6's own price
+    bestFor: "the same easy style+lyrics songwriting workflow as MiniMax Music 2.0, on MiniMax's newer, generally higher-quality model generation — worth A/B-ing against 2.0 for naturalness on a given song before committing",
+    minStyleChars: 10,
+    maxStyleChars: 300,
+    minLyricsChars: 10,
+    maxLyricsChars: 3000,
     supportedLyricTags: ["Intro", "Verse", "Chorus", "Bridge", "Outro"],
     buildInput: (stylePrompt, lyricsPrompt) => ({
       prompt: stylePrompt,
@@ -1233,6 +1620,7 @@ const MUSIC_MODELS = [
     // format, so style and lyrics are honestly combined into one prompt
     // here rather than pretending this model has MiniMax's two-field shape.
     id: "fal-ai/elevenlabs/music",
+    styleFieldFormat: "prose", // confirmed real example prompts are full natural-language descriptions
     label: "ElevenLabs Music — studio-quality, vocal or instrumental, 19 output formats — $0.80/min",
     costPerGeneration: null, // priced per output minute, not flat — real ledger cost varies by generated length
     bestFor: "highest production quality when cost per minute isn't the deciding factor — understands both casual mood descriptions and precise musical terminology",
@@ -1249,6 +1637,12 @@ const MUSIC_MODELS = [
     // through broken blinds". This is real extra complexity, not
     // optional — the person needs to actually write timestamps.
     id: "fal-ai/diffrhythm",
+    // No confirmed separate style field exists for this model at all
+    // (see the honest note on its buildInput below — style control is
+    // reference-audio conditioning, not text) — the Song Architect
+    // should refuse to offer a compile target for this model rather
+    // than silently writing text into a field that doesn't do anything.
+    styleFieldFormat: "unconfirmed",
     label: "DiffRhythm — fastest & cheapest confirmed (<30s generation, $0.001/sec) — requires timestamped lyrics",
     costPerSecond: 0.001,
     bestFor: "rapid, cheap prototyping — but only if you're willing to write real [MM:SS.ms] timestamps on each lyric line, not plain lyrics",
@@ -1268,10 +1662,20 @@ const MUSIC_MODELS = [
     // lyrics, duration) with real documented defaults, straight from
     // Fal's own schema page.
     id: "fal-ai/ace-step",
+    // Confirmed real field is literally named "tags" and documented as
+    // "Comma-separated list of genre tags" — a prose sentence is the
+    // WRONG shape for this specific model, unlike every prose-style one
+    // above, so the Architect must compile a different format here.
+    styleFieldFormat: "tags",
     label: "ACE-Step — confirmed real schema, cheapest of the lyrics-based options (~$0.012/60s per third-party benchmarking)",
     costPerGeneration: 0.012, // from independent third-party benchmarking, not Fal's own pricing page directly — labeled as an estimate, not a confirmed Fal rate
     bestFor: "budget-conscious iteration — cheapest lyrics-based option found, with real confirmed [verse]/[chorus]/[bridge] structure support",
     supportsDuration: true, // confirmed real, controllable field — not every model here has this
+    // Deliberately NOT Intro/Outro like MiniMax's list below — this
+    // model's own confirmed structure (see comment above) only verified
+    // verse/chorus/bridge, so the toolbar shouldn't offer tags this
+    // model was never actually confirmed to understand.
+    supportedLyricTags: ["Verse", "Chorus", "Bridge"],
     buildInput: (stylePrompt, lyricsPrompt, opts = {}) => ({
       tags: stylePrompt, // confirmed real field: "Comma-separated list of genre tags"
       lyrics: lyricsPrompt, // confirmed real field, same [verse]/[chorus]/[bridge] structure as MiniMax
@@ -1287,6 +1691,7 @@ const MUSIC_MODELS = [
     // melancholic piano melody") and negative-prompt example
     // ("vocals, slow tempo" — actively excluding vocals as an example).
     id: "fal-ai/lyria2",
+    styleFieldFormat: "prose", // confirmed real example: "ambient soundscape...gentle, melancholic piano melody"
     label: "Lyria 2 (Google) — instrumental/ambient only, real negative-prompt control, 48kHz — $0.10/30s",
     costPerGeneration: null, // priced per output length on Fal's own billing, not a flat confirmed rate
     bestFor: "high-quality instrumental or ambient background music with precise negative prompting (e.g. explicitly excluding vocals or a certain tempo) — NOT for songs with vocals, no lyrics field exists",
@@ -1298,6 +1703,66 @@ const MUSIC_MODELS = [
     }),
   },
   {
+    // RESOLVES A GAP THIS FILE PREVIOUSLY FLAGGED AS UNCONFIRMED: an
+    // earlier version of recommendMusicModel (server.js) explicitly
+    // called out "Lyria 3 Pro (reported to support Hindi vocals) but its
+    // exact Fal model ID and schema couldn't be confirmed." Now confirmed
+    // directly: real endpoint slug "lyria3/pro" (full: "fal-ai/lyria3/
+    // pro") is listed live on fal.ai/explore's own model gallery
+    // ("Lyria 3 Pro is the latest music model from Google"), and Google's
+    // own developer material (blog.google, Vertex AI docs) confirms real
+    // sung vocal support in 8 languages: English, German, Spanish,
+    // French, HINDI, Japanese, Korean, Portuguese — the first genuinely
+    // confirmed non-English SUNG-VOCAL music model in this entire
+    // registry, closing the exact "Indian-language song" gap that was
+    // previously an honest dead end here.
+    // Real price confirmed from Fal's own "Best Text-to-Music APIs"
+    // review page: $0.08/generation (30s Lyria 3 base) — Pro's own price
+    // wasn't separately shown on that page, so this cost estimate is
+    // carried from the base model as a reasonable floor, not a confirmed
+    // Pro-tier rate.
+    // Real, confirmed prompt conventions straight from Google's own Lyria
+    // 3 Pro developer guide (not guessed): ending a prompt with the
+    // literal word "Instrumental." suppresses vocals; prefixing lyrics
+    // with "Lyrics:" makes the model sing those exact words instead of
+    // inventing its own; describing multiple singers in plain language
+    // (e.g. "a male and female vocal trading lines in the chorus") gets a
+    // real duet. HONEST SCOPE NOTE: Fal's own Lyria 2 sibling above takes
+    // a single flat "prompt" field with no separate lyrics parameter —
+    // Lyria 3 Pro is assumed to share that same single-field shape (same
+    // vendor, same "prompt"-only convention already confirmed for Lyria
+    // 2), with the lyrics/instrumental/duet control folded INTO the
+    // prompt text using Google's own documented convention above, rather
+    // than guessing at a separate "lyrics" field name that hasn't been
+    // independently confirmed against this exact Fal endpoint's schema —
+    // spot-check with Preview before relying on it in production, same
+    // "verify slug" caution already applied elsewhere in this file.
+    id: "fal-ai/lyria3/pro",
+    styleFieldFormat: "prose",
+    label: "★ Lyria 3 Pro (Google) — confirmed real Hindi vocal support, up to ~3min, image-guided mood",
+    costPerGeneration: 0.08,
+    recommendedForIndianLanguages: true,
+    bestFor: "songs with real sung vocals in Hindi (or English/German/Spanish/French/Japanese/Korean/Portuguese) — the only model in this registry with confirmed non-English vocal support, plus tempo conditioning, time-aligned lyrics, and optional image-guided mood",
+    confirmedVocalLanguages: ["English", "German", "Spanish", "French", "Hindi", "Japanese", "Korean", "Portuguese"],
+    supportsDuration: true,
+    maxOutputSeconds: 180, // ~3 minutes, per Google's own Lyria 3 Pro material
+    buildInput: (stylePrompt, lyricsPrompt, opts = {}) => {
+      // Folds Google's own documented control words into the single real
+      // "prompt" field this model family is confirmed to take (see note
+      // above) — same honest, non-guessed-field-name discipline as every
+      // other model here.
+      const parts = [stylePrompt];
+      if (opts.language && opts.language !== "auto") parts.push(`Sing in ${opts.language}.`);
+      if (lyricsPrompt && lyricsPrompt.trim()) {
+        parts.push(`Lyrics: ${lyricsPrompt.trim()}`);
+      } else if (opts.instrumentalOnly) {
+        parts.push("Instrumental.");
+      }
+      if (opts.duet) parts.push("A male and female vocal trading lines through the song.");
+      return { prompt: parts.join(" ") };
+    },
+  },
+  {
     // Confirmed directly from Fal's own blog post and API docs page —
     // note the real model ID capitalization: "CassetteAI/music-generator".
     // HONEST LIMIT: confirmed simple schema is exactly prompt + duration,
@@ -1307,6 +1772,7 @@ const MUSIC_MODELS = [
     // Instrumental only, but genuinely the fastest confirmed option: a
     // full 3-minute track in under 10 seconds.
     id: "CassetteAI/music-generator",
+    styleFieldFormat: "prose",
     label: "CassetteAI — instrumental only, extremely fast (3-min track in <10s) — $0.02/output minute",
     costPerGeneration: null, // priced per output minute on Fal's own billing
     bestFor: "fast instrumental background tracks when speed matters more than vocals or fine control — confirmed real 3-minute track in under 10 seconds",
@@ -1318,6 +1784,40 @@ const MUSIC_MODELS = [
     }),
   },
   {
+    // Confirmed directly from a real, live curl example (fal's own
+    // queue.fal.run endpoint, seen verbatim: {"prompt": "...", "duration":
+    // 60, "num_samples": 1}) and Fal's own model page description: "full
+    // control over style, mood, instrumentation, and exact duration."
+    // Genuinely different value proposition from every other instrumental
+    // model here: duration is a real first-class input from 1-600 seconds
+    // (not a rough target the model approximates), AND it can generate up
+    // to 3 samples per call in one request — real, confirmed, useful for
+    // "give me a few takes to choose from" without 3 separate paid calls.
+    // Real price confirmed from Fal's own review page: $0.0025/second/
+    // sample.
+    id: "fal-ai/sonilo/v1.1/text-to-music",
+    styleFieldFormat: "prose", // "describe instruments, genre, mood, and energy directly in the prompt" per its own bestFor text below
+    label: "Sonilo v1.1 — exact duration (1-600s), up to 3 samples per call, licensed commercial-safe",
+    costPerSecond: 0.0025,
+    bestFor: "when you need a track at a PRECISE length (scoring to a fixed video runtime, an exact ad slot) rather than an approximate one, or want several style variations from one call — describe instruments, genre, mood, and energy directly in the prompt, same rich descriptive-prompt convention as Lyria 2 above",
+    // HONEST SCOPE NOTE: Fal's own official description frames this as
+    // built for "long instrumental pieces, sound effects, and evolving
+    // textures" — one independent secondary source claims vocal capability
+    // too, but that's not corroborated by Fal's own framing, so this is
+    // conservatively marked instrumental-first rather than overclaiming
+    // vocal support that isn't confirmed.
+    instrumentalOnly: true,
+    supportsDuration: true,
+    maxDurationSeconds: 600,
+    supportsMultipleSamples: true,
+    maxSamples: 3,
+    buildInput: (stylePrompt, _lyricsUnused, opts = {}) => ({
+      prompt: stylePrompt,
+      duration: Math.min(600, Math.max(1, opts.durationSeconds || 90)),
+      num_samples: Math.min(3, Math.max(1, opts.numSamples || 1)),
+    }),
+  },
+  {
     // Confirmed directly from fal.ai/seed-audio-1.0 and its own FAQ —
     // ByteDance's Seed Audio 1.0. Genuinely different capability from
     // MiniMax Music above: this one accepts real reference voice clips
@@ -1326,6 +1826,7 @@ const MUSIC_MODELS = [
     // one generation — confirmed by Fal's own "British radio commercial"
     // example (voice + intro/background music together).
     id: "bytedance/seed-audio-1.0",
+    styleFieldFormat: "prose",
     label: "Seed Audio 1.0 (ByteDance) — your own voice + music, from a real reference clip",
     costPerGeneration: null, // not directly confirmed on the model page — real pricing shown at generation time in Fal's own billing, not fabricated here
     bestFor: "putting your own actual voice into a track with real reference audio — genuinely different from MiniMax Music, which has no voice-reference capability at all",
@@ -1448,4 +1949,8 @@ module.exports = {
   SFX_MODELS,
   TALKING_AVATAR_MODELS,
   prepareProductionScript,
+  isIndianLanguage,
+  INDIAN_LANGUAGE_NAMES,
+  MUSIC_INSTRUMENTS,
+  MUSIC_GENRE_PRESETS,
 };

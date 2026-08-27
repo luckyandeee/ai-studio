@@ -1268,8 +1268,11 @@ async function loadModelRegistry() {
     state.voiceCatalogStatus = data.voiceCatalogStatus || {};
     state.voiceCloneModels = data.voiceCloneModels || [];
     state.musicModels = data.musicModels || [];
+    state.musicInstruments = data.musicInstruments || { indian: [], western: [] };
+    state.musicGenrePresets = data.musicGenrePresets || [];
     state.talkingAvatarModels = data.talkingAvatarModels || [];
     populateMusicModelSelects();
+    renderSongArchitect();
     state.customVoices = data.customVoices || [];
     state.modelDefaults = data.defaults || {};
     state.recommendedDefaults = data.recommendedDefaults || {};
@@ -1455,6 +1458,86 @@ function escapeHtml(str) {
   const div = document.createElement("div");
   div.textContent = str;
   return div.innerHTML;
+}
+
+// ============================================================
+// MARKUP TOOLBAR — shared insertion primitive for the click-to-insert
+// delivery/emotion/section tag toolbars (Voice Studio's per-line
+// *tag* markers, Song Studio's [Section] lyric tags). Inserts at the
+// real cursor position (or replaces a selection, same as any normal
+// text editor), rather than requiring someone to hand-type asterisks/
+// brackets and get the exact syntax right themselves — that's the
+// actual point of this: the SAME underlying *tag*/[Tag] syntax
+// translateScriptMarkers already parses server-side, just inserted by
+// a click instead of memorized and typed. Dispatches a real "input"
+// event afterward so this app's EXISTING input listeners (state sync,
+// character counters) pick up the change with zero special-casing.
+// ============================================================
+function insertAtCursor(textarea, insertText, { padWithSpaces = true } = {}) {
+  if (!textarea) return;
+  const start = textarea.selectionStart ?? textarea.value.length;
+  const end = textarea.selectionEnd ?? textarea.value.length;
+  const hasSelection = end > start;
+  const before = textarea.value.slice(0, start);
+  // Real fix for a real data-loss bug: a delivery/emotion tag describes
+  // HOW to say the words near it, it isn't a replacement for them. If
+  // someone selects a word or phrase (the natural way to say "this bit
+  // right here") and clicks a tag, the old behavior silently deleted
+  // their selected text and replaced it with just the tag — losing
+  // real typed content with no undo affordance in this UI. Now: a
+  // selection is preserved, with the tag inserted immediately before
+  // it (this app's own existing convention — every real example in
+  // this file's own markupHint strings puts the cue before the words
+  // it describes, e.g. "*confident* We can do this."), not consumed.
+  const after = hasSelection ? textarea.value.slice(start) : textarea.value.slice(end);
+  let finalInsert = insertText;
+  if (padWithSpaces) {
+    // Avoids gluing the inserted marker onto an adjacent word (e.g.
+    // "hello*pause*world") when inserting mid-sentence without a
+    // selection — only adds a space where one doesn't already exist.
+    const needsLeadingSpace = before && !/\s$/.test(before);
+    const needsTrailingSpace = after && !/^\s/.test(after);
+    finalInsert = `${needsLeadingSpace ? " " : ""}${insertText}${needsTrailingSpace ? " " : ""}`;
+  }
+  textarea.value = before + finalInsert + after;
+  const newCursorPos = (before + finalInsert).length;
+  textarea.focus();
+  textarea.setSelectionRange(newCursorPos, newCursorPos);
+  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+// Builds the actual delivery-tag toolbar for a Voice Studio line, from
+// REAL structured per-model data (markupTagMode/fixedMarkupTags in
+// fal-models.js) rather than a static list — so the buttons shown are
+// exactly the ones this specific model will actually honor. A "fixed"
+// model (MiniMax family) only offers its real 8 confirmed sound cues;
+// a "freeform" model (ElevenLabs/Gemini) offers a starter set PLUS a
+// custom tag input, since it genuinely accepts any descriptive phrase;
+// an "unsupported" model shows no buttons at all and says so plainly,
+// rather than offering controls that would silently do nothing.
+const FREEFORM_TAG_SUGGESTIONS = ["whispers", "excited", "sarcastic", "confident", "dramatically", "sadly", "slowly", "shouting", "laughing", "sighs"];
+function buildVoiceMarkupToolbarHtml(model) {
+  if (!model) return "";
+  if (model.markupTagMode === "unsupported") {
+    return `<div class="xx-small text-muted mt-1">🚫 This model doesn't support any delivery/pause tags — anything you insert will be silently removed, not spoken.</div>`;
+  }
+  const pauseBtn = `<button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" data-markup-insert="*2 second pause*" title="Insert a 2-second pause">⏸ Pause</button>`;
+  // The "smart" layer: one click hands the WHOLE line to the AI director
+  // instead of clicking a tag per word/phrase — see /api/voice/suggest-
+  // markup, which is constrained to this exact model's real tag
+  // vocabulary so it can never suggest something that gets silently
+  // stripped on generation.
+  const aiSuggestBtn = `<button type="button" class="btn btn-sm btn-outline-primary py-0 px-1" data-markup-ai-suggest="1" title="Let the AI mark up this whole line for you">🪄 AI Suggest</button>`;
+  if (model.markupTagMode === "fixed") {
+    const tagButtons = (model.fixedMarkupTags || [])
+      .map((t) => `<button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" data-markup-insert="*${escapeHtml(t)}*">🗣 ${escapeHtml(t)}</button>`)
+      .join("");
+    return `<div class="d-flex flex-wrap gap-1 mt-1 mb-1">${pauseBtn}${tagButtons}${aiSuggestBtn}</div><div class="xx-small text-muted mb-1">Only these real sound cues are actually spoken by this model — click one to insert it at your cursor, or select a word/phrase first to keep it and tag right before it.</div>`;
+  }
+  const tagButtons = FREEFORM_TAG_SUGGESTIONS
+    .map((t) => `<button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" data-markup-insert="*${t}*">💬 ${t}</button>`)
+    .join("");
+  return `<div class="d-flex flex-wrap gap-1 mt-1 mb-1">${pauseBtn}${tagButtons}<button type="button" class="btn btn-sm btn-outline-primary py-0 px-1" data-markup-custom="1">✏️ Custom...</button>${aiSuggestBtn}</div><div class="xx-small text-muted mb-1">This model reads any descriptive tag directly — the buttons above are a starting point, "Custom..." accepts your own, or select a word/phrase first to tag right before it.</div>`;
 }
 
 // Renders detectSchema()'s real output as readable badges — this is
@@ -2084,16 +2167,35 @@ function populateMusicModelSelects() {
     selectEl.appendChild(customOpt);
   });
   updateSongLyricsModelHint();
+  updateSongVocalLanguageGapNote();
 }
 function updateSongLyricsModelHint() {
   const selectEl = document.getElementById("songLyricsModelSelect");
   const hintEl = document.getElementById("songLyricsModelHint");
   const lyricsFieldWrap = document.getElementById("songLyricsPrompt")?.closest(".mb-3");
   const durationSection = document.getElementById("songDurationSection");
+  const toolbarEl = document.getElementById("songLyricsMarkupToolbar");
   if (!selectEl || !hintEl) return;
   const modelId = readModelSelectEl(selectEl);
   const model = (state.musicModels || []).find((m) => m.id === modelId);
   durationSection?.classList.toggle("d-none", !model?.supportsDuration);
+  // Real per-model structural tags (see MUSIC_MODELS' supportedLyricTags
+  // in fal-models.js) — ACE-Step's confirmed set is genuinely narrower
+  // than MiniMax's (no Intro/Outro), so this never offers a tag a
+  // specific model wasn't actually confirmed to understand. Hidden
+  // entirely for instrumental-only/timestamped-lyrics models, where
+  // section tags don't apply at all.
+  if (toolbarEl) {
+    if (model?.supportedLyricTags?.length && !model?.instrumentalOnly && !model?.requiresTimestampedLyrics) {
+      toolbarEl.innerHTML = model.supportedLyricTags
+        .map((t) => `<button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" data-lyric-tag-insert="[${escapeHtml(t)}]">${escapeHtml(t)}</button>`)
+        .join("");
+      toolbarEl.classList.remove("d-none");
+    } else {
+      toolbarEl.innerHTML = "";
+      toolbarEl.classList.add("d-none");
+    }
+  }
   if (model?.instrumentalOnly) {
     if (model?.supportsNegativePrompt) {
       // Real fix for a real gap: Lyria2 genuinely supports negative_prompt
@@ -2138,7 +2240,175 @@ function resetSongLyricsFieldLabel(lyricsFieldWrap) {
   const textarea = document.getElementById("songLyricsPrompt");
   if (textarea) textarea.placeholder = "[Verse]\n...\n[Chorus]\n...";
 }
-document.getElementById("songLyricsModelSelect")?.addEventListener("change", updateSongLyricsModelHint);
+
+// ============================================================
+// SONG ARCHITECT — instrument + genre picker that works across EVERY
+// music model, not just one. The real constraint this has to respect:
+// each model wants its style description in a genuinely different
+// shape (see styleFieldFormat in fal-models.js) — MiniMax/ElevenLabs/
+// Lyria/Sonilo/CassetteAI/Seed Audio all want a natural-language
+// sentence, ACE-Step's real confirmed field is literally "comma-
+// separated genre tags" (a paragraph would be the WRONG shape for it),
+// and DiffRhythm has no confirmed style field at all — compiling the
+// same picks differently per model, or refusing to compile at all when
+// there's genuinely nowhere for it to go, rather than writing text into
+// a field that silently does nothing.
+// ============================================================
+const songArchitectState = { selectedInstruments: new Set(), genreId: "" };
+
+function renderSongArchitect() {
+  const genreSelect = document.getElementById("songArchitectGenre");
+  const indianGroup = document.getElementById("songArchitectGenreIndianGroup");
+  const westernGroup = document.getElementById("songArchitectGenreWesternGroup");
+  if (genreSelect && indianGroup && westernGroup) {
+    indianGroup.innerHTML = (state.musicGenrePresets || []).filter((g) => g.region === "indian")
+      .map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.label)}</option>`).join("");
+    westernGroup.innerHTML = (state.musicGenrePresets || []).filter((g) => g.region !== "indian")
+      .map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.label)}</option>`).join("");
+  }
+  const indianWrap = document.getElementById("songArchitectInstrumentsIndian");
+  const westernWrap = document.getElementById("songArchitectInstrumentsWestern");
+  const instrumentBtn = (inst) => `<button type="button" class="btn btn-sm ${songArchitectState.selectedInstruments.has(inst.id) ? "btn-dark" : "btn-outline-secondary"} py-0 px-1" data-architect-instrument="${escapeHtml(inst.id)}">${escapeHtml(inst.label)}</button>`;
+  if (indianWrap) indianWrap.innerHTML = (state.musicInstruments?.indian || []).map(instrumentBtn).join("");
+  if (westernWrap) westernWrap.innerHTML = (state.musicInstruments?.western || []).map(instrumentBtn).join("");
+  updateSongArchitectFormatNote();
+}
+
+function updateSongArchitectFormatNote() {
+  const noteEl = document.getElementById("songArchitectFormatNote");
+  const applyBtn = document.getElementById("songArchitectApplyBtn");
+  if (!noteEl) return;
+  const modelId = readModelSelectEl(document.getElementById("songLyricsModelSelect"));
+  const model = (state.musicModels || []).find((m) => m.id === modelId);
+  if (!model) { noteEl.textContent = ""; return; }
+  if (model.styleFieldFormat === "unconfirmed") {
+    noteEl.innerHTML = `⚠️ ${model.label.replace(/^★ /, "")} has no confirmed separate style field — this Architect can't compile into it. Pick a different Music model to use it.`;
+    if (applyBtn) applyBtn.disabled = true;
+  } else if (model.styleFieldFormat === "tags") {
+    noteEl.innerHTML = `Will compile as comma-separated genre tags — ${model.label.replace(/^★ /, "")}'s real confirmed field expects short tags, not a full sentence.`;
+    if (applyBtn) applyBtn.disabled = false;
+  } else {
+    noteEl.innerHTML = `Will compile as a natural-language style description for ${model.label.replace(/^★ /, "")}.`;
+    if (applyBtn) applyBtn.disabled = false;
+  }
+}
+
+function updateSongArchitectVocalNote() {
+  const noteEl = document.getElementById("songArchitectVocalNote");
+  if (!noteEl) return;
+  const preset = (state.musicGenrePresets || []).find((g) => g.id === songArchitectState.genreId);
+  if (!preset || preset.region !== "indian") { noteEl.innerHTML = ""; return; }
+  const modelId = readModelSelectEl(document.getElementById("songLyricsModelSelect"));
+  const currentModel = (state.musicModels || []).find((m) => m.id === modelId);
+  const currentHasVocals = (currentModel?.confirmedVocalLanguages || []).length > 0;
+  if (currentHasVocals) { noteEl.innerHTML = ""; return; }
+  const vocalCapable = (state.musicModels || []).find((m) => (m.confirmedVocalLanguages || []).some((l) => isLikelyIndianOrHindi(l)));
+  noteEl.innerHTML = vocalCapable
+    ? `<span class="text-warning">🇮🇳 For real sung Indian-language vocals (not just instrumentation), ${vocalCapable.label.replace(/^★ /, "")} is the confirmed option — the currently selected model's vocals are only confirmed in other languages.</span>`
+    : "";
+}
+// Small local check (mirrors fal-models.js's isIndianLanguage server-side)
+// just for deciding whether to surface the vocal-model nudge — not a
+// second source of truth for anything sent to the backend.
+function isLikelyIndianOrHindi(lang) {
+  return /hindi/i.test(lang || "");
+}
+
+function compileSongArchitectPrompt() {
+  const preset = (state.musicGenrePresets || []).find((g) => g.id === songArchitectState.genreId);
+  const mood = document.getElementById("songArchitectMood")?.value?.trim();
+  const instruments = [...songArchitectState.selectedInstruments];
+  const modelId = readModelSelectEl(document.getElementById("songLyricsModelSelect"));
+  const model = (state.musicModels || []).find((m) => m.id === modelId);
+  if (model?.styleFieldFormat === "tags") {
+    // ACE-Step's real confirmed shape: short comma-separated tags, not prose.
+    const parts = [...(preset?.styleDescriptors || []), ...instruments, mood].filter(Boolean);
+    return parts.join(", ");
+  }
+  // Prose format (the default, and what every other model here actually wants).
+  const sentenceParts = [];
+  if (preset?.styleDescriptors?.length) sentenceParts.push(preset.styleDescriptors.join(", "));
+  if (mood) sentenceParts.push(mood);
+  if (preset?.tempoHint) sentenceParts.push(preset.tempoHint);
+  let sentence = sentenceParts.join(", ");
+  if (instruments.length) sentence += `${sentence ? ", featuring " : "Featuring "}${instruments.join(", ")}`;
+  if (preset?.vocalStyleHint) sentence += `. Vocal style: ${preset.vocalStyleHint}.`;
+  return sentence;
+}
+
+document.getElementById("songArchitectGenre")?.addEventListener("change", (e) => {
+  songArchitectState.genreId = e.target.value;
+  const preset = (state.musicGenrePresets || []).find((g) => g.id === e.target.value);
+  if (preset) songArchitectState.selectedInstruments = new Set(preset.instruments || []);
+  renderSongArchitect();
+  updateSongArchitectVocalNote();
+});
+document.getElementById("songArchitectInstrumentsIndian")?.addEventListener("click", (e) => {
+  const id = e.target.closest("[data-architect-instrument]")?.getAttribute("data-architect-instrument");
+  if (!id) return;
+  songArchitectState.selectedInstruments.has(id) ? songArchitectState.selectedInstruments.delete(id) : songArchitectState.selectedInstruments.add(id);
+  renderSongArchitect();
+});
+document.getElementById("songArchitectInstrumentsWestern")?.addEventListener("click", (e) => {
+  const id = e.target.closest("[data-architect-instrument]")?.getAttribute("data-architect-instrument");
+  if (!id) return;
+  songArchitectState.selectedInstruments.has(id) ? songArchitectState.selectedInstruments.delete(id) : songArchitectState.selectedInstruments.add(id);
+  renderSongArchitect();
+});
+document.getElementById("songArchitectApplyBtn")?.addEventListener("click", () => {
+  const compiled = compileSongArchitectPrompt();
+  if (!compiled.trim()) return alert("Pick a genre or at least one instrument first.");
+  const styleEl = document.getElementById("songStylePrompt");
+  if (!styleEl) return;
+  styleEl.value = compiled.slice(0, 300);
+  styleEl.dispatchEvent(new Event("input", { bubbles: true }));
+});
+
+// Honest, always-current version of the old static banner — computed
+// live from state.musicModels' real confirmedVocalLanguages instead of
+// a hand-typed sentence that goes stale the moment a model like Lyria 3
+// Pro gets added with real non-English vocal support (exactly what
+// happened here).
+function updateSongVocalLanguageGapNote() {
+  const noteEl = document.getElementById("songVocalLanguageGapNote");
+  if (!noteEl) return;
+  const value = document.getElementById("songLyricLanguageStyle")?.value;
+  const models = state.musicModels || [];
+  if (!value || value === "match" || value === "english") {
+    noteEl.className = "alert alert-secondary py-2 px-3 xx-small mb-2";
+    noteEl.innerHTML = `Real note: sung-vocal pronunciation quality is only individually confirmed per model — MiniMax/ACE-Step/ElevenLabs Music are confirmed for English vocals; Lyria 3 Pro adds confirmed Hindi (+7 more languages). Real Telugu/Hindi/etc. <em>speech</em> narration is solid elsewhere in this app (Voice Studio) regardless.`;
+    return;
+  }
+  const matches = models.filter((m) => (m.confirmedVocalLanguages || []).some((l) => l.toLowerCase() === value.toLowerCase()));
+  if (matches.length) {
+    noteEl.className = "alert alert-success py-2 px-3 xx-small mb-2";
+    noteEl.innerHTML = `✅ ${matches.map((m) => m.label.replace(/^★ /, "")).join(", ")} ${matches.length === 1 ? "has" : "have"} real, confirmed sung-vocal support for ${escapeHtml(value)} — pick it as your Music model below for real singing, not just narration.`;
+  } else {
+    noteEl.className = "alert alert-warning py-2 px-3 xx-small mb-2";
+    noteEl.innerHTML = `Honest limit: no model here has confirmed sung-vocal support for ${escapeHtml(value)} specifically yet (Lyria 3 Pro confirms Hindi + 7 others, closing that one gap) — this language setting shapes the written lyrics text, but the model singing it may not pronounce ${escapeHtml(value)} correctly. Real ${escapeHtml(value)} <em>speech</em> narration is solid elsewhere in this app (Voice Studio).`;
+  }
+}
+document.getElementById("songLyricLanguageStyle")?.addEventListener("change", updateSongVocalLanguageGapNote);
+
+document.getElementById("songLyricsModelSelect")?.addEventListener("change", () => {
+  updateSongLyricsModelHint();
+  updateSongArchitectFormatNote();
+  updateSongArchitectVocalNote();
+});
+// Section tags belong on their own line (real convention this app's
+// own models expect — "[Verse]\nlyrics..."), so this inserts a leading
+// newline when the cursor isn't already at the start of one, rather
+// than reusing insertAtCursor's word-spacing padding (built for inline
+// *tag* markers, a different insertion shape than a block tag).
+document.getElementById("songLyricsMarkupToolbar")?.addEventListener("click", (e) => {
+  const tag = e.target.closest("[data-lyric-tag-insert]")?.getAttribute("data-lyric-tag-insert");
+  if (!tag) return;
+  const textarea = document.getElementById("songLyricsPrompt");
+  if (!textarea) return;
+  const before = textarea.value.slice(0, textarea.selectionStart ?? textarea.value.length);
+  const needsNewlineBefore = before.length > 0 && !before.endsWith("\n");
+  insertAtCursor(textarea, `${needsNewlineBefore ? "\n" : ""}${tag}\n`, { padWithSpaces: false });
+});
 document.getElementById("songDurationSlider")?.addEventListener("input", (e) => {
   document.getElementById("songDurationValue").textContent = `${e.target.value}s`;
 });
@@ -6103,26 +6373,56 @@ function newVoiceScriptLine() {
 }
 function renderVoiceScriptLine(line, index) {
   const model = (state.voiceModels || []).find((m) => m.id === line.modelId) || null;
+  // 🇮🇳 badge is a real signal, not decoration — models are pre-sorted
+  // server-side (fal-voice-catalog.js) so Indian-language-capable ones
+  // lead the list; the badge just makes that sort visible instead of
+  // silent.
   const modelOptions = (state.voiceModels || [])
-    .map((m) => `<option value="${escapeHtml(m.id)}" ${m.id === line.modelId ? "selected" : ""}>${escapeHtml(m.label)}</option>`)
+    .map((m) => {
+      const badge = m.indianLanguageCoverage?.length ? "🇮🇳 " : "";
+      return `<option value="${escapeHtml(m.id)}" ${m.id === line.modelId ? "selected" : ""}>${badge}${escapeHtml(m.label)}</option>`;
+    })
     .join("");
 
   let voiceControlHtml;
   if (model?.voiceInputMode === "freeform" || (!model?.confirmedVoiceIds?.length && model)) {
     voiceControlHtml = `<input type="text" class="form-control form-control-sm" data-line-field="voiceId" value="${escapeHtml(line.voiceId || "")}" placeholder="Voice name (this model has no fixed list)">`;
   } else if (model?.confirmedVoiceIds?.length) {
+    const totalVoices = model.confirmedVoiceIds.length;
+    // Live-discovered voices (pulled straight from Fal's own schema,
+    // see fal-voice-catalog.js's withLiveDiscoveredData) have no
+    // human-written description yet — flagged honestly with 🆕 rather
+    // than pretending they're as vetted as a curated entry.
     const opts = model.confirmedVoiceIds
-      .map((v) => `<option value="${escapeHtml(v.id)}" ${v.id === line.voiceId ? "selected" : ""}>${escapeHtml(v.id)}${v.description ? ` — ${escapeHtml(v.description)}` : ""}</option>`)
+      .map((v) => {
+        const isLive = v.source === "live";
+        const label = isLive ? `🆕 ${v.id} — newly discovered, not yet verified` : `${v.id}${v.description ? ` — ${v.description}` : ""}`;
+        const searchKey = `${v.id} ${v.description || ""}`.toLowerCase();
+        return `<option value="${escapeHtml(v.id)}" data-search="${escapeHtml(searchKey)}" ${v.id === line.voiceId ? "selected" : ""}>${escapeHtml(label)}</option>`;
+      })
       .join("");
-    voiceControlHtml = `<select class="form-select form-select-sm" data-line-field="voiceId">${opts}</select>`;
+    // A native <select> stops being usable once a model's real voice
+    // count climbs into the dozens/hundreds (MiniMax alone lists 300+ on
+    // its own page) — this is the direct, concrete cost of the dynamic
+    // load actually working, so a filter box earns its place here
+    // rather than being decoration.
+    const searchHtml = totalVoices > 10
+      ? `<input type="text" class="form-control form-control-sm mb-1" data-line-field="voiceSearch" placeholder="🔎 Search ${totalVoices} voices...">`
+      : "";
+    const discovery = model.voiceDiscovery;
+    const discoveryNote = discovery?.liveDiscoveredVoiceCount > 0
+      ? `<div class="xx-small text-muted mt-1">${discovery.curatedVoiceCount} known + ${discovery.liveDiscoveredVoiceCount} newly discovered live from Fal 🆕</div>`
+      : "";
+    voiceControlHtml = `${searchHtml}<select class="form-select form-select-sm" data-line-field="voiceId">${opts}</select>${discoveryNote}`;
   } else {
     voiceControlHtml = `<div class="form-control form-control-sm text-muted bg-light">Pick a model first</div>`;
   }
 
+  const indianLangSet = new Set((model?.indianLanguageCoverage || []).map((l) => l.toLowerCase()));
   const languageRowHtml = model?.confirmedLanguages?.length
     ? `<select class="form-select form-select-sm mt-2" data-line-field="language">
         <option value="">Auto / default</option>
-        ${model.confirmedLanguages.map((l) => `<option value="${escapeHtml(l)}" ${l === line.language ? "selected" : ""}>${escapeHtml(l)}</option>`).join("")}
+        ${model.confirmedLanguages.map((l) => `<option value="${escapeHtml(l)}" ${l === line.language ? "selected" : ""}>${indianLangSet.has(l.toLowerCase()) ? "🇮🇳 " : ""}${escapeHtml(l)}</option>`).join("")}
       </select>`
     : "";
 
@@ -6141,7 +6441,8 @@ function renderVoiceScriptLine(line, index) {
       <div class="border rounded p-2 ${line.selectedVariationIndex === i ? "border-primary bg-light" : ""}" data-variation-index="${i}">
         <div class="d-flex justify-content-between align-items-center">
           <span class="small fw-semibold">${escapeHtml(v.label)}${line.selectedVariationIndex === i ? " ✅" : ""}</span>
-          <div class="d-flex gap-1">
+          <div class="d-flex align-items-center gap-1">
+            ${v.durationMs ? `<span class="xx-small text-muted">${(v.durationMs / 1000).toFixed(1)}s</span>` : ""}
             ${v.audio ? `<button type="button" class="btn btn-sm btn-outline-primary" data-variation-action="use">Use this take</button><button type="button" class="btn btn-sm btn-outline-secondary" data-variation-action="download">⬇️</button>` : ""}
           </div>
         </div>
@@ -6166,6 +6467,7 @@ function renderVoiceScriptLine(line, index) {
         </div>
       </div>
       <textarea class="form-control form-control-sm mb-1" rows="2" data-line-field="text" placeholder="Type this line...">${escapeHtml(line.text)}</textarea>
+      ${buildVoiceMarkupToolbarHtml(model)}
       <small class="text-muted d-block mb-2">${escapeHtml(model?.markupHint || "Pick a model to see what stage-direction markup it supports.")}</small>
       <div class="row g-2">
         <div class="col-6"><select class="form-select form-select-sm" data-line-field="modelId">${modelOptions}</select></div>
@@ -6212,6 +6514,30 @@ document.getElementById("voiceScriptLines")?.addEventListener("input", (e) => {
   if (!lineEl || !field) return;
   const line = state.voiceScript.lines.find((l) => l.id === lineEl.getAttribute("data-line-id"));
   if (!line) return;
+  if (field === "voiceSearch") {
+    // Filters the sibling <select> in place, without a full
+    // renderVoiceScript() — a re-render would wipe out the search box's
+    // own text on every keystroke, since it isn't a persisted line
+    // property. Hidden options just disappear from the open dropdown;
+    // the current selection is preserved unless it's no longer visible,
+    // in which case we jump to the first visible match rather than
+    // silently keeping a hidden, invisible-to-the-user selection.
+    const query = e.target.value.trim().toLowerCase();
+    const selectEl = lineEl.querySelector('select[data-line-field="voiceId"]');
+    if (selectEl) {
+      let firstVisible = null;
+      Array.from(selectEl.options).forEach((opt) => {
+        const match = !query || (opt.getAttribute("data-search") || "").includes(query);
+        opt.hidden = !match;
+        if (match && !firstVisible) firstVisible = opt;
+      });
+      if (selectEl.selectedOptions[0]?.hidden && firstVisible) {
+        selectEl.value = firstVisible.value;
+        line.voiceId = firstVisible.value;
+      }
+    }
+    return;
+  }
   if (field === "speed" || field === "pitch") line[field] = parseFloat(e.target.value);
   else if (field === "variationCount") line[field] = parseInt(e.target.value);
   else line[field] = e.target.value;
@@ -6239,6 +6565,42 @@ document.getElementById("voiceScriptLines")?.addEventListener("click", async (e)
   const line = state.voiceScript.lines[lineIndex];
   if (!line) return;
 
+  // Markup toolbar clicks — insert directly into THIS line's own
+  // textarea at the cursor, never a full renderVoiceScript() (which
+  // would blow away the cursor position the person just clicked into).
+  const markupInsert = e.target.closest("[data-markup-insert]")?.getAttribute("data-markup-insert");
+  if (markupInsert) {
+    insertAtCursor(lineEl.querySelector('textarea[data-line-field="text"]'), markupInsert);
+    return;
+  }
+  if (e.target.closest("[data-markup-custom]")) {
+    const tag = prompt('Describe the delivery/tone to insert (e.g. "nervously", "with a smile", "building excitement"):');
+    if (tag && tag.trim()) insertAtCursor(lineEl.querySelector('textarea[data-line-field="text"]'), `*${tag.trim()}*`);
+    return;
+  }
+  if (e.target.closest("[data-markup-ai-suggest]")) {
+    if (!line.text?.trim()) return alert("Type something for this line first.");
+    const btn = e.target.closest("[data-markup-ai-suggest]");
+    const originalLabel = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = "🪄 Thinking...";
+    try {
+      const { res, data } = await fetchJson("/api/voice/suggest-markup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: line.text, modelId: line.modelId, textModel: getTextModel(), userApiKey: getUserKey(), runId: state.voiceScript.runId }),
+      });
+      if (!res.ok) throw new Error(data.error || "Couldn't get AI suggestions.");
+      line.text = data.taggedText;
+      renderVoiceScript();
+    } catch (err) {
+      alert("AI markup suggestion failed: " + err.message);
+      btn.disabled = false;
+      btn.innerHTML = originalLabel;
+    }
+    return;
+  }
+
   const lineAction = e.target.closest("[data-line-action]")?.getAttribute("data-line-action");
   if (lineAction === "delete") {
     state.voiceScript.lines.splice(lineIndex, 1);
@@ -6263,7 +6625,17 @@ document.getElementById("voiceScriptLines")?.addEventListener("click", async (e)
       const { res, data } = await fetchJson("/api/voice/script/generate-variations", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lineText: line.text, modelId: line.modelId, count: line.variationCount, runId: state.voiceScript.runId, userApiKey: getUserKey() }),
+        // REAL FIX: voiceId/language/speed/pitch/emotion used to be
+        // silently dropped here — the dropdowns updated `line.*` in
+        // local state, but none of it ever reached the backend, so
+        // picking a specific voice or language had zero effect on the
+        // actual generated audio. All five now go through.
+        body: JSON.stringify({
+          lineText: line.text, modelId: line.modelId, count: line.variationCount,
+          voiceId: line.voiceId, language: line.language || undefined,
+          speed: line.speed, pitch: line.pitch, emotion: line.emotion,
+          runId: state.voiceScript.runId, userApiKey: getUserKey(),
+        }),
       });
       if (!res.ok) throw new Error(data.error || "Failed to generate takes.");
       line.variations = data.results || [];

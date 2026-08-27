@@ -33,6 +33,7 @@
 const falCatalog = require("./fal-catalog");
 const falClient = require("./fal-client");
 const falModels = require("./fal-models");
+const falVoiceCatalog = require("./fal-voice-catalog");
 const db = require("./db");
 
 const CURATED_ARRAYS = {
@@ -157,22 +158,31 @@ const FalAdapter = {
   },
 
   // --------------------------------------------------------
-  // discoverVoices(modelId) — real voice list for a voice model, from
-  // whichever source actually has it: the curated confirmedVoiceIds
-  // (hand-verified, with descriptions) if this is a curated model, or
-  // the schema-derived voiceOptions enum (see fal-schema-utils.js) for
-  // a discovered one. Prefers curated (richer, human-described) but
-  // falls back to schema data rather than returning nothing.
+  // discoverVoices(modelId) — real voice list for a voice model, MERGED
+  // from every source that has one: curated confirmedVoiceIds (hand-
+  // verified, with real descriptions) PLUS whatever the live schema's
+  // voiceOptions enum adds on top (see fal-schema-utils.js's generic
+  // enum extraction) for a curated model, or schema data alone for a
+  // fully-discovered one. Previously this returned curated OR schema —
+  // for any curated model (every VOICE_MODELS entry), that meant a
+  // model's real live voice count was never checked against its
+  // schema at all, so a model like MiniMax (300+ voices per its own
+  // listing) only ever offered whichever handful had been hand-typed
+  // into fal-models.js. Reuses fal-voice-catalog.js's exact merge logic
+  // so this and the main Voice Studio catalog never drift apart into
+  // two different answers for the same model.
   // --------------------------------------------------------
   discoverVoices(modelId) {
     const curated = findCuratedEntry(modelId);
-    if (curated?.confirmedVoiceIds?.length) {
-      return { voices: curated.confirmedVoiceIds, source: "curated", discoveryStatus: "cached" };
-    }
     const details = this.getModelDetails(modelId);
     const schemaVoices = details?.liveSchema?.voiceOptions?.options;
+    if (curated?.confirmedVoiceIds?.length) {
+      const merged = falVoiceCatalog.mergeVoiceIds(curated.confirmedVoiceIds, schemaVoices);
+      const liveAddedCount = merged.length - curated.confirmedVoiceIds.length;
+      return { voices: merged, source: liveAddedCount ? "curated+live" : "curated", discoveryStatus: "cached", curatedCount: curated.confirmedVoiceIds.length, liveDiscoveredCount: liveAddedCount };
+    }
     if (schemaVoices?.length) {
-      return { voices: schemaVoices.map((id) => ({ id, description: null })), source: "schema", discoveryStatus: "live" };
+      return { voices: schemaVoices.map((id) => ({ id, description: null, source: "live" })), source: "schema", discoveryStatus: "live" };
     }
     if (curated?.voiceInputMode === "freeform") {
       return { voices: [], source: "none", discoveryStatus: "unsupported", note: "This model takes a freeform voice name/ID — no fixed list to choose from." };
@@ -198,9 +208,19 @@ const FalAdapter = {
       duration: schema?.durationField ? { field: schema.durationField, min: schema.durationMin, max: schema.durationMax, options: schema.durationEnum } : (curated?.duration || null),
       resolution: { supported: !!(curated?.supportsResolutionParam || schema?.resolutionField), options: schema?.resolutionEnum || (curated?.supportsResolutionParam ? falModels.IMAGE_RESOLUTIONS : null) },
       negativePrompt: !!schema?.hasNegativePrompt,
-      voices: curated?.confirmedVoiceIds?.length ? curated.confirmedVoiceIds.length : (schema?.voiceOptions?.options?.length || 0),
-      languages: curated?.confirmedLanguages || schema?.languageOptions?.options || null,
-      emotions: curated?.confirmedEmotions || schema?.emotionOptions?.options || null,
+      // Merged counts/lists (curated + live schema), not curated-OR-
+      // schema — same reasoning as discoverVoices() above: a curated
+      // model's real live coverage should never be silently ignored
+      // just because a hand-typed list already exists for it.
+      voices: curated?.confirmedVoiceIds?.length
+        ? falVoiceCatalog.mergeVoiceIds(curated.confirmedVoiceIds, schema?.voiceOptions?.options).length
+        : (schema?.voiceOptions?.options?.length || 0),
+      languages: curated?.confirmedLanguages
+        ? falVoiceCatalog.mergeStringList(curated.confirmedLanguages, schema?.languageOptions?.options)
+        : (schema?.languageOptions?.options || curated?.confirmedLanguages || null),
+      emotions: curated?.confirmedEmotions
+        ? falVoiceCatalog.mergeStringList(curated.confirmedEmotions, schema?.emotionOptions?.options)
+        : (schema?.emotionOptions?.options || curated?.confirmedEmotions || null),
       // AI-synthesized "what is this good for" — only present once
       // enrichDiscoveredModels has processed this model (discovered
       // models only; curated models already have hand-written bestFor).

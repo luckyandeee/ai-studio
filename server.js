@@ -41,6 +41,8 @@ const {
   SFX_MODELS,
   prepareProductionScript,
   TALKING_AVATAR_MODELS,
+  MUSIC_INSTRUMENTS,
+  MUSIC_GENRE_PRESETS,
 } = require("./fal-models");
 const {
   refreshModelLiveStatus,
@@ -4186,6 +4188,8 @@ app.get("/api/models", (req, res) => {
     voiceCatalogStatus: voiceCatalog.getVoiceCatalogStatus(),
     voiceCloneModels: VOICE_CLONE_MODELS,
     musicModels: MUSIC_MODELS,
+    musicInstruments: MUSIC_INSTRUMENTS,
+    musicGenrePresets: MUSIC_GENRE_PRESETS,
     talkingAvatarModels: TALKING_AVATAR_MODELS,
     customVoices: db.listCustomVoices("minimax"),
     imageResolutions: IMAGE_RESOLUTIONS,
@@ -4826,6 +4830,55 @@ ${script.trim()}`;
   }
 });
 
+// ============================================================
+// AI-SUGGESTED DELIVERY MARKUP — the actual "smart" layer on top of the
+// click-to-insert toolbar (buildVoiceMarkupToolbarHtml in app.js): a
+// director's pass over the whole line at once, rather than clicking one
+// tag at a time. Real safety property, not just a nice prompt: the
+// model is given the EXACT tag vocabulary this specific voice model
+// will actually honor (fixedMarkupTags for MiniMax's 8 confirmed sound
+// cues, or the freeform convention for ElevenLabs/Gemini) — never an
+// open invitation to invent tags, which would just reproduce the
+// original "*confident* silently vanishes" bug one level up, now
+// AI-authored instead of human-typed. A model with markupTagMode
+// "unsupported" (Kokoro/Inworld/xAI) is refused outright rather than
+// generating tags that would just get stripped on generation.
+// ============================================================
+app.post("/api/voice/suggest-markup", async (req, res) => {
+  try {
+    const { text, modelId, textModel, userApiKey, runId: clientRunId } = req.body;
+    if (!text?.trim()) return res.status(400).json({ error: "Missing line text." });
+    const model = VOICE_MODELS.find((m) => m.id === modelId);
+    if (!model) return res.status(400).json({ error: "Unknown voice model — pick one for this line first." });
+    if (!model.markupTagMode || model.markupTagMode === "unsupported") {
+      return res.status(400).json({ error: `${model.label} doesn't support any delivery/tone tags — switch to MiniMax, ElevenLabs, or Gemini TTS on this line first, then try again.` });
+    }
+    const apiKey = userApiKey || process.env.FAL_KEY;
+    if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
+    const runId = clientRunId || crypto.randomUUID();
+    const tagVocabInstruction = model.markupTagMode === "fixed"
+      ? `This voice model ONLY understands these exact tags — anything else is silently NOT spoken at all: ${(model.fixedMarkupTags || []).map((t) => `*${t}*`).join(", ")}, plus *N second pause* for a timed pause (e.g. *2 second pause*). Do not use any tag outside this exact list.`
+      : `This voice model reads any short, specific descriptive delivery cue written as *cue* (e.g. *whispers*, *building excitement*, *sarcastic*, *3 second pause*) as a real instruction for HOW to say the words immediately after it. Use genuine, specific cues that actually fit this line — don't invent a vague one just to have used a tag.`;
+    const prompt = `You are an experienced voice director marking up a script for a text-to-speech performance — the real gap this closes is a flat, monotone AI read with zero expression.
+${tagVocabInstruction}
+CRITICAL RULES:
+- Do NOT change, add, remove, or reorder a single word of the original script — insert *tag* markers between the existing words only, never rewrite them.
+- Place each tag immediately BEFORE the exact words it directs.
+- Restraint matters — a natural performance doesn't have a cue before every clause; most lines need zero, one, or two tags, not one per sentence.
+Return ONLY the tagged script, nothing else — no explanation, no markdown fences, no surrounding quotes.
+SCRIPT:
+${text.trim()}`;
+    const response = await falTextRequest(prompt, {
+      model: textModel || DEFAULT_TEXT_MODEL, apiKey, temperature: 0.6,
+      costMeta: { runId, endpoint: "voice-suggest-markup" },
+    });
+    res.json({ taggedText: response.text.trim(), runId });
+  } catch (error) {
+    console.error(`[Voice] Markup suggestion failed: ${error.message}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post("/api/voice/generate", async (req, res) => {
   let runId;
   try {
@@ -5140,6 +5193,14 @@ function recommendVoiceModel({ language, wantsEmotionControl, wantsOwnVoice, pri
   }
   const normalized = normalizeLanguageForMatch(language);
   if (normalized && normalized !== "english" && normalized !== "auto") {
+    // Checked FIRST, ahead of the 2.5 sibling below: real, confirmed
+    // broader language coverage (70+ languages vs. 2.5's confirmed set)
+    // AND independently benchmarked #1 for naturalness on Artificial
+    // Analysis' Speech Arena — the two things most directly requested
+    // when someone asks for a specific non-English language: does it
+    // cover it, and does it actually sound natural doing it.
+    const gemini31Entry = VOICE_MODELS.find((m) => m.id === "fal-ai/gemini-3.1-flash-tts");
+    const gemini31Confirms = gemini31Entry?.confirmedLanguages?.some((l) => normalizeLanguageForMatch(l) === normalized);
     const geminiEntry = VOICE_MODELS.find((m) => m.id === "fal-ai/gemini-tts");
     const geminiConfirms = geminiEntry?.confirmedLanguages?.some((l) => normalizeLanguageForMatch(l) === normalized);
     // ElevenLabs eleven-v3 auto-detects language from the input text's
@@ -5149,17 +5210,30 @@ function recommendVoiceModel({ language, wantsEmotionControl, wantsOwnVoice, pri
     // that reason (see fal-models.js).
     const elevenEntry = VOICE_MODELS.find((m) => m.id === "fal-ai/elevenlabs/tts/eleven-v3");
     const elevenConfirms = elevenEntry?.autoDetectedLanguagesSupported?.some((l) => normalizeLanguageForMatch(l) === normalized);
+    if (gemini31Confirms) {
+      reasons.push(`You're generating in ${language} — Gemini 3.1 Flash TTS has confirmed real support for this language (one of 70+ it covers, including the broadest confirmed Indian-regional-language set of any model here) and is independently benchmarked as the most natural-sounding voice model available, which directly answers "the voices don't sound natural" as much as "does it cover my language."`);
+      return { modelId: "fal-ai/gemini-3.1-flash-tts", reasons, confidence: "high", alternativeModelId: elevenConfirms ? "fal-ai/elevenlabs/tts/eleven-v3" : "fal-ai/gemini-tts" };
+    }
     if (geminiConfirms && elevenConfirms) {
-      reasons.push(`You're generating in ${language} — both Gemini TTS and ElevenLabs Eleven v3 have confirmed real support for this language. Gemini TTS takes it as an explicit parameter; ElevenLabs auto-detects it from the text's script instead. Recommending Gemini TTS as the more predictable of the two, but ElevenLabs is a genuinely good alternative, especially for more expressive/character delivery.`);
+      reasons.push(`You're generating in ${language} — both Gemini TTS (2.5) and ElevenLabs Eleven v3 have confirmed real support for this language. Gemini TTS takes it as an explicit parameter; ElevenLabs auto-detects it from the text's script instead. Recommending Gemini TTS as the more predictable of the two, but ElevenLabs is a genuinely good alternative, especially for more expressive/character delivery.`);
       return { modelId: "fal-ai/gemini-tts", reasons, confidence: "high", alternativeModelId: "fal-ai/elevenlabs/tts/eleven-v3" };
     }
     if (geminiConfirms) {
-      reasons.push(`You're generating in ${language} — Gemini TTS has confirmed real support for this language, one of 12+ Indian regional languages it genuinely covers. Most other voice models here only confirm Hindi (if any Indian language at all) and fall back to unconfirmed "auto" detection for the rest.`);
+      reasons.push(`You're generating in ${language} — Gemini TTS (2.5) has confirmed real support for this language, one of 12+ Indian regional languages it genuinely covers. Most other voice models here only confirm Hindi (if any Indian language at all) and fall back to unconfirmed "auto" detection for the rest.`);
       return { modelId: "fal-ai/gemini-tts", reasons, confidence: "high" };
     }
     if (elevenConfirms) {
       reasons.push(`You're generating in ${language} — ElevenLabs Eleven v3 has confirmed real support for this language (it auto-detects language directly from the text's script rather than needing it set explicitly).`);
       return { modelId: "fal-ai/elevenlabs/tts/eleven-v3", reasons, confidence: "high" };
+    }
+    // Checked before the plain speech-02-hd fallback: 2.6-hd has a
+    // genuinely broader confirmed language enum than 02-hd for this exact
+    // purpose (adds confirmed Tamil).
+    const minimax26Entry = VOICE_MODELS.find((m) => m.id === "fal-ai/minimax/speech-2.6-hd");
+    const minimax26Confirms = minimax26Entry?.confirmedLanguages?.some((l) => normalizeLanguageForMatch(l) === normalized);
+    if (minimax26Confirms) {
+      reasons.push(`You're generating in ${language} — MiniMax Speech-2.6 HD has confirmed real support for this language (a broader confirmed set than the 02-HD generation, including Tamil).`);
+      return { modelId: "fal-ai/minimax/speech-2.6-hd", reasons, confidence: "high" };
     }
     const minimaxEntry = VOICE_MODELS.find((m) => m.id === "fal-ai/minimax/speech-02-hd");
     const minimaxConfirms = minimaxEntry?.confirmedLanguages?.some((l) => normalizeLanguageForMatch(l) === normalized);
@@ -5168,8 +5242,8 @@ function recommendVoiceModel({ language, wantsEmotionControl, wantsOwnVoice, pri
       return { modelId: "fal-ai/minimax/speech-02-hd", reasons, confidence: "high" };
     }
     if (CONFIRMED_INDIAN_LANGUAGES.has(normalized)) {
-      reasons.push(`You're generating in ${language}. Being honest about a real limit: no model in this app's registry has CONFIRMED support for this exact language. Gemini TTS and ElevenLabs Eleven v3 both cover the broadest confirmed set of Indian languages here, so Gemini TTS is still the best bet — but this specific one hasn't been directly verified. Try it; if quality isn't there, that's a real limit right now, not a bug to chase.`);
-      return { modelId: "fal-ai/gemini-tts", reasons, confidence: "low", languageGap: true };
+      reasons.push(`You're generating in ${language}. Being honest about a real limit: no model in this app's registry has CONFIRMED support for this exact language. Gemini 3.1 Flash TTS has the broadest confirmed set of Indian languages here, so it's still the best bet — but this specific one hasn't been directly verified. Try it; if quality isn't there, that's a real limit right now, not a bug to chase.`);
+      return { modelId: "fal-ai/gemini-3.1-flash-tts", reasons, confidence: "low", languageGap: true };
     }
     reasons.push(`You're generating in ${language} — no model here has confirmed support for it specifically. Defaulting to MiniMax Speech-02 HD (broadest general confirmed coverage, 30+ languages), but treat this as untested for your language.`);
     return { modelId: "fal-ai/minimax/speech-02-hd", reasons, confidence: "low", languageGap: true };
@@ -5195,69 +5269,72 @@ app.post("/api/voice/recommend-model", (req, res) => {
 // creative directions for one line, each mapped to REAL settings for
 // the specific model selected — never a generic label with nothing
 // real behind it. For emotion-capable models (MiniMax), maps to a real
-// confirmed emotion + voice. For tag-based models (ElevenLabs/Gemini),
-// maps to a real bracket-tag cue embedded via the SAME
-// translateScriptMarkers infrastructure already built and tested for
-// the *word* markup system — no parallel mechanism invented. For a
-// model with no real expressive lever at all beyond one voice, this is
-// honest about that instead of generating N near-identical clips and
-// calling them "variations."
+// confirmed emotion. For tag-based models (ElevenLabs/Gemini), maps to
+// a real bracket-tag cue embedded via the SAME translateScriptMarkers
+// infrastructure already built and tested for the *word* markup system
+// — no parallel mechanism invented. For a model with no real
+// expressive lever at all, this is honest about that instead of
+// generating N near-identical clips and calling them "variations."
+//
+// REAL BUG FIXED HERE: this used to also vary VOICE per take — meaning
+// whichever voice a person picked in the line's own dropdown was
+// silently overridden and reassigned differently for every single take,
+// even on a single-voice generation. Voice, language, speed, and pitch
+// are the person's own deliberate choices, not something "creative
+// direction" should touch — only emotion/delivery genuinely benefits
+// from exploring multiple takes of the SAME voice. Voice is now a fixed
+// input to this function, never something it generates or varies.
 // ============================================================
 async function generateVoiceDirections({ lineText, model, count, apiKey }) {
-  const voiceOptions = model.confirmedVoiceIds || [];
-  const hasMultipleVoices = voiceOptions.length > 1;
   const hasEmotions = !!model.confirmedEmotions?.length;
-  const hasTags = !!model.autoDetectsLanguageFromText || model.id === "fal-ai/gemini-tts";
+  const hasTags = !!model.autoDetectsLanguageFromText || model.markupTagMode === "freeform";
 
-  if (!hasMultipleVoices && !hasEmotions && !hasTags) {
+  if (!hasEmotions && !hasTags) {
     return {
-      directions: [{ label: "Default", voiceId: voiceOptions[0]?.id || null, emotion: null, tagPrefix: null }],
-      cappedReason: `${model.label} has no real expressive control beyond a single voice — genuinely different takes aren't possible on this model. Switch to MiniMax (emotion control), or ElevenLabs/Gemini TTS (descriptive delivery tags) for meaningful variation.`,
+      directions: [{ label: "Default", emotion: null, tagPrefix: null }],
+      cappedReason: `${model.label} has no real expressive control beyond a single delivery — genuinely different takes aren't possible on this model. Switch to MiniMax (emotion control), or ElevenLabs/Gemini TTS (descriptive delivery tags) for meaningful variation.`,
     };
   }
 
   const realLevers = [
     hasEmotions ? `real confirmed emotions: ${model.confirmedEmotions.join(", ")}` : null,
     hasTags ? `descriptive delivery tags embedded in the text (e.g. "confident", "warm", "urgent" — any real English word works, this model reads them directly)` : null,
-    hasMultipleVoices ? `${voiceOptions.length} real named voices: ${voiceOptions.map((v) => `${v.id} (${v.description})`).join("; ")}` : null,
   ].filter(Boolean).join(". ");
 
-  const prompt = `You are directing ${count} genuinely different voice performances of one line for a professional voice production tool. Real constraints for the model actually being used — do not invent anything outside these: ${realLevers}.
+  const prompt = `You are directing ${count} genuinely different performances of ONE line, in the SAME voice, for a professional voice production tool. Real constraints for the model actually being used — do not invent anything outside these: ${realLevers}.
 
 LINE TO PERFORM: "${lineText}"
 
-Generate exactly ${count} DISTINCT creative directions for this line — each should sound meaningfully different from the others when actually performed (e.g. calm/premium vs energetic/advertising vs dramatic/cinematic), grounded in the real levers above.
+Generate exactly ${count} DISTINCT creative directions for this line — each should sound meaningfully different in DELIVERY/EMOTION when actually performed (e.g. calm/premium vs energetic/advertising vs dramatic/cinematic), grounded in the real levers above. Do not suggest a different voice — only how the SAME voice delivers this line differently.
 
-Return ONLY this JSON array, no markdown fences: [{"label": "short 2-4 word description", ${hasEmotions ? `"emotion": "one of the confirmed emotions listed above", ` : ""}${hasTags ? `"tagPrefix": "one real descriptive word for the delivery tag", ` : ""}${hasMultipleVoices ? `"voiceId": "one of the real voice IDs listed above", ` : ""}"reasoning": "one short phrase on why this direction fits"}]`;
+Return ONLY this JSON array, no markdown fences: [{"label": "short 2-4 word description", ${hasEmotions ? `"emotion": "one of the confirmed emotions listed above", ` : ""}${hasTags ? `"tagPrefix": "one real descriptive word for the delivery tag", ` : ""}"reasoning": "one short phrase on why this direction fits"}]`;
 
   try {
     const response = await falTextRequest(prompt, { apiKey, temperature: 0.9, costMeta: { endpoint: "voice-directions" } });
     const parsed = JSON.parse(response.text.replace(/```json|```/g, "").trim());
-    // Real, deliberate validation — never trust the LLM's own claim of a
-    // voice/emotion without checking it against what's ACTUALLY real for
-    // this model, same discipline as the model-enrichment contradiction
-    // guard built earlier this session.
+    // Real, deliberate validation — never trust the LLM's own claim of an
+    // emotion without checking it against what's ACTUALLY real for this
+    // model, same discipline as the model-enrichment contradiction guard
+    // built earlier this session.
     const validated = (Array.isArray(parsed) ? parsed : []).slice(0, count).map((d, i) => ({
       label: d.label || `Take ${i + 1}`,
       emotion: hasEmotions && model.confirmedEmotions.includes(d.emotion) ? d.emotion : null,
       tagPrefix: hasTags && typeof d.tagPrefix === "string" ? d.tagPrefix.trim() : null,
-      voiceId: hasMultipleVoices && voiceOptions.some((v) => v.id === d.voiceId) ? d.voiceId : (voiceOptions[0]?.id || null),
       reasoning: d.reasoning || null,
     }));
     if (validated.length) return { directions: validated, cappedReason: null };
   } catch (err) {
-    console.warn(`[Voice Directions] Couldn't get AI-directed variations (${err.message}) — falling back to cycling real voices/emotions directly.`);
+    console.warn(`[Voice Directions] Couldn't get AI-directed variations (${err.message}) — falling back to cycling real emotions directly.`);
   }
   // Fallback if the AI call fails entirely — still genuinely real, just
   // mechanical instead of creatively directed: cycles through actual
-  // confirmed voices/emotions rather than returning nothing.
+  // confirmed emotions rather than returning nothing. Never touches voice.
   const fallbackDirections = [];
   for (let i = 0; i < count; i++) {
     fallbackDirections.push({
-      label: hasEmotions ? model.confirmedEmotions[i % model.confirmedEmotions.length] : (voiceOptions[i % voiceOptions.length]?.id || `Take ${i + 1}`),
+      label: hasEmotions ? model.confirmedEmotions[i % model.confirmedEmotions.length] : `Take ${i + 1}`,
       emotion: hasEmotions ? model.confirmedEmotions[i % model.confirmedEmotions.length] : null,
       tagPrefix: null,
-      voiceId: hasMultipleVoices ? voiceOptions[i % voiceOptions.length].id : (voiceOptions[0]?.id || null),
       reasoning: null,
     });
   }
@@ -5265,33 +5342,46 @@ Return ONLY this JSON array, no markdown fences: [{"label": "short 2-4 word desc
 }
 app.post("/api/voice/script/generate-variations", async (req, res) => {
   try {
-    const { lineText, modelId, count = 4, runId, userApiKey } = req.body;
+    const { lineText, modelId, count = 4, runId, userApiKey, voiceId, language, speed, pitch, emotion: fixedEmotion } = req.body;
     const apiKey = userApiKey || process.env.FAL_KEY;
     if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
     if (!lineText?.trim()) return res.status(400).json({ error: "No line text provided." });
     const model = VOICE_MODELS.find((m) => m.id === modelId);
     if (!model) return res.status(400).json({ error: `Unknown voice model: ${modelId}` });
     const safeCount = Math.min(8, Math.max(1, parseInt(count) || 4));
-    const { directions, cappedReason } = await generateVoiceDirections({ lineText, model, count: safeCount, apiKey });
-    // Real concurrency-aware generation — reuses the exact same
-    // falVoiceRequest/buildInput path every other voice feature in this
-    // app already uses, just looped once per direction. Each direction's
-    // own real settings (voice/emotion/tag) get applied via the model's
-    // own buildInput function, same as a single generation would.
+    // REAL FIX: a single take means "generate exactly what I configured,"
+    // full stop — no AI creative-direction layer at all, so the person's
+    // own emotion choice is respected exactly rather than a directed
+    // reinterpretation of it. Multiple takes still explore emotion/
+    // delivery variety (see generateVoiceDirections above), but even
+    // then voice/language/speed/pitch are FIXED to the line's own
+    // settings for every single take, never reassigned.
+    const { directions, cappedReason } = safeCount === 1
+      ? { directions: [{ label: "Take 1", emotion: fixedEmotion || null, tagPrefix: null, reasoning: null }], cappedReason: null }
+      : await generateVoiceDirections({ lineText, model, count: safeCount, apiKey });
     const results = await Promise.all(
       directions.map(async (direction, i) => {
         try {
           const textWithTag = direction.tagPrefix ? `*${direction.tagPrefix}* ${lineText}` : lineText;
-          const input = model.buildInput(textWithTag, { voiceId: direction.voiceId, emotion: direction.emotion });
+          const input = model.buildInput(textWithTag, {
+            voiceId, // fixed — the person's own choice, never reassigned per take
+            emotion: direction.emotion || fixedEmotion,
+            language, // REAL FIX: this was never sent/used at all before — language_boost/language_code now actually reaches the model
+            speed, // REAL FIX: same — the speed slider had zero effect on generated audio until now
+            pitch, // REAL FIX: same
+          });
           const strippedMarkers = input.__strippedMarkers || [];
           const result = await falVoiceRequest(model.id, input, {
             apiKey, costPer1kChars: model.costPer1kChars, textLength: lineText.length,
             costMeta: { runId, endpoint: "voice-variation", frameIndex: i },
           });
           const dataUri = await downloadImageAsDataUri(result.url);
-          return { ...direction, audio: dataUri, modelUsed: model.id, strippedMarkers, error: null };
+          // REAL FIX: durationMs was computed by falVoiceRequest but
+          // discarded here — so there was no way to see how long a take
+          // actually ran, which matters directly for dialogue pacing.
+          return { ...direction, audio: dataUri, durationMs: result.durationMs ?? null, modelUsed: model.id, strippedMarkers, error: null };
         } catch (err) {
-          return { ...direction, audio: null, modelUsed: model.id, error: err.message };
+          return { ...direction, audio: null, durationMs: null, modelUsed: model.id, error: err.message };
         }
       }),
     );
@@ -5438,11 +5528,26 @@ function recommendMusicModel({ wantsVocals, wantsOwnVoice, language, prioritize 
     reasons.push("You want instrumental only — Lyria 2 (Google) gives real negative-prompt control and 48kHz output for precise instrumental/ambient work.");
     return { modelId: "fal-ai/lyria2", reasons, confidence: "high" };
   }
-  // Wants vocals from here on.
-  const knownVocalLanguages = ["english"]; // HONEST: this is the actual confirmed set across all 7 verified models — none of them have confirmed non-English lyric/vocal support
-  const languageIsNonEnglish = language && !knownVocalLanguages.includes(language.toLowerCase());
+  // Wants vocals from here on. Computed LIVE from each model's own
+  // confirmedVocalLanguages array instead of a hand-typed list here —
+  // this is the exact bug being fixed: Lyria 3 Pro was added to
+  // MUSIC_MODELS with real confirmed Hindi (+7 other languages) vocal
+  // support, but this function still said "none of the models have
+  // confirmed non-English vocal support" because nobody updated this
+  // hardcoded array to match. Reading it straight from the registry
+  // means it can't go stale like that again the next time a model with
+  // real non-English vocal support gets added.
+  const modelsWithLanguage = (lang) =>
+    MUSIC_MODELS.filter((m) => (m.confirmedVocalLanguages || []).some((l) => l.toLowerCase() === lang.toLowerCase()));
+  const languageIsNonEnglish = language && language.toLowerCase() !== "english";
   if (languageIsNonEnglish) {
-    reasons.push(`You asked for vocals in ${language}. Being honest about a real gap: none of the 7 models verified in this app have confirmed non-English vocal support — their real docs only demonstrate English lyrics. There's a promising lead (Google's "Lyria 3 Pro," reported to support Hindi vocals among others) but its exact Fal model ID and schema couldn't be confirmed, so it isn't wired in as a verified option. Defaulting to the strongest confirmed vocal model — try it, and if the language doesn't come through, that's the actual limit right now, not a bug to chase.`);
+    const matches = modelsWithLanguage(language);
+    if (matches.length) {
+      const best = matches[0];
+      reasons.push(`You asked for vocals in ${language} — ${best.label.replace(/^★ /, "")} has real, confirmed sung-vocal support for it (not just spoken narration), the only model(s) here that do: ${matches.map((m) => m.label.replace(/^★ /, "")).join(", ")}.`);
+      return { modelId: best.id, reasons, confidence: "high" };
+    }
+    reasons.push(`You asked for vocals in ${language}. Being honest about a real, narrower gap than before: Lyria 3 Pro now has confirmed sung-vocal support for 8 languages (English, German, Spanish, French, Hindi, Japanese, Korean, Portuguese) — closing the Hindi gap — but ${language} still isn't confirmed in any model here. Defaulting to the strongest confirmed vocal model for structure/quality; try it, and if the language doesn't come through, that's the actual limit right now, not a bug to chase.`);
     return { modelId: "fal-ai/minimax-music/v2", reasons, confidence: "low", languageGap: true };
   }
   if (prioritize === "budget") {
@@ -5720,12 +5825,20 @@ app.listen(PORT, () => {
   // the UTILITY_MODELS (upscale/extend/restore/videoBackground) were
   // never checked at all, so a deprecated model in any of those
   // categories would only be discovered when a real generation call
-  // failed. VOICE_MODELS is deliberately still excluded here — it
-  // already has its own separate, working verification system
-  // (voiceCatalog, below) that needs a real user API key and so runs
-  // from the frontend instead of at server startup.
+  // failed. VOICE_MODELS is now INCLUDED here (previously deliberately
+  // excluded) — this refresh is the free OpenAPI-schema/metadata check
+  // (findModelsLive, via GET /v1/models?expand=openapi-3.0), not a paid
+  // generation, so there's no real cost reason to leave voice models
+  // out of it. What's still correctly kept separate is the OTHER voice
+  // verification system (voiceCatalog.verifyAllVoices, below) — that one
+  // does real, individually-billed test generations per voice and
+  // genuinely does need a real user API key, so it stays frontend-
+  // triggered. This schema refresh is what makes fal-voice-catalog.js's
+  // live voice/language/emotion enum merge (see withLiveDiscoveredData)
+  // actually have real data to merge, instead of silently no-op'ing
+  // forever because the server never fetched a voice model's schema.
   const curatedModelIds = [
-    ...IMAGE_MODELS, ...VIDEO_MODELS, ...MUSIC_MODELS, ...SFX_MODELS,
+    ...IMAGE_MODELS, ...VIDEO_MODELS, ...VOICE_MODELS, ...MUSIC_MODELS, ...SFX_MODELS,
     ...VOICE_CLONE_MODELS, ...TALKING_AVATAR_MODELS,
     ...Object.values(UTILITY_MODELS).flat(),
   ].map((m) => m.id);
