@@ -21,8 +21,7 @@
                         <li><button class="dropdown-item" id="flowModeNavBtn">🎬 Flow Studio</button></li>
                         <li><hr class="dropdown-divider"></li>
                         <li><button class="dropdown-item" data-bs-toggle="modal" data-bs-target="#imageToolsModal">🛠️ Image Tools</button></li>
-                        <li><button class="dropdown-item" data-bs-toggle="modal" data-bs-target="#voiceStudioModal">🎙️ Voice Studio</button></li>
-                        <li><button class="dropdown-item" data-bs-toggle="modal" data-bs-target="#songStudioModal">🎵 Song Studio</button></li>
+                        <li><button class="dropdown-item" id="audioModeNavBtn">🎙️🎵 Audio Studio</button></li>
                     </ul>
                 </div>
                 <div class="dropdown">
@@ -83,25 +82,32 @@
                 <p class="text-muted mb-0">Product shots, human-model variations, video, voice, and music — one workflow, one place to see what it cost.</p>
             </div>
             <div class="row g-4 justify-content-center">
-                <div class="col-12 col-md-4">
+                <div class="col-12 col-md-3">
                     <div class="card border-0 shadow-sm h-100 p-4 text-center mode-choice-card" data-choice-mode="single">
                         <div class="mb-2" style="font-size: 2.5rem;">📸</div>
                         <h5 class="fw-bold">One Product</h5>
                         <p class="small text-muted mb-0">Upload a single product photo and get a full shoot of coherent campaign images — product-only and human shots, consistent identity throughout.</p>
                     </div>
                 </div>
-                <div class="col-12 col-md-4">
+                <div class="col-12 col-md-3">
                     <div class="card border-0 shadow-sm h-100 p-4 text-center mode-choice-card" data-choice-mode="batch">
                         <div class="mb-2" style="font-size: 2.5rem;">👗</div>
                         <h5 class="fw-bold">Many Products</h5>
                         <p class="small text-muted mb-0">Upload several products at once (up to 8) for one consistent multi-product campaign — same environment, same model, same look.</p>
                     </div>
                 </div>
-                <div class="col-12 col-md-4">
+                <div class="col-12 col-md-3">
                     <div class="card border-0 shadow-sm h-100 p-4 text-center mode-choice-card" data-choice-mode="flow">
                         <div class="mb-2" style="font-size: 2.5rem;">🎬</div>
                         <h5 class="fw-bold">Video</h5>
                         <p class="small text-muted mb-0">Turn images or a script into a short campaign video, with voice narration and music layered in.</p>
+                    </div>
+                </div>
+                <div class="col-12 col-md-3">
+                    <div class="card border-0 shadow-sm h-100 p-4 text-center mode-choice-card" data-choice-mode="audio">
+                        <div class="mb-2" style="font-size: 2.5rem;">🎙️</div>
+                        <h5 class="fw-bold">Audio</h5>
+                        <p class="small text-muted mb-0">Voice lines, full songs, and a real offline mixing console with trim, fades, and background music — one connected workspace.</p>
                     </div>
                 </div>
             </div>
@@ -1063,17 +1069,47 @@
             </div>
         </div>
     </div>
-    <div class="modal fade" id="voiceStudioModal" tabindex="-1" aria-hidden="true">
-        <div class="modal-dialog modal-dialog-centered modal-lg">
-            <div class="modal-content border-0 shadow-lg">
-                <div class="modal-header bg-dark text-white">
-                    <h5 class="modal-title fw-bold">🎙️ Voice Studio</h5>
-                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
-                </div>
+    <div class="row g-4 d-none" id="audioModeRow">
+        <div class="col-12">
+            <div class="card border-0 shadow-sm">
+                <div class="card-body p-4">
+                    <div class="d-flex justify-content-between align-items-start mb-1">
+                        <h4 class="fw-bold text-dark mb-0">🎙️🎵 Audio Studio</h4>
+                        <button type="button" class="btn btn-sm btn-outline-danger flex-shrink-0" id="audioStudioNewSessionBtn" title="Clears the current Voice Studio script and everything loaded into the Mixer — a real reset, not just visual">🔄 New Session</button>
+                    </div>
+                    <p class="text-muted small mb-3">Voice lines, full songs, and a real offline mixing console — one connected workspace. Everything here is session-based — use "New Session" above whenever you want a genuinely clean slate instead of manually clearing each line and slot.</p>
+                    <div class="btn-group w-100 mb-4" role="group" id="audioStudioSwitcher">
+                        <input type="radio" class="btn-check" name="audioStudioSection" id="audioSectionVoice" autocomplete="off" checked>
+                        <label class="btn btn-outline-dark fw-semibold py-2" for="audioSectionVoice" data-audio-section="voiceStudioTabPane">🎙️ Voice Studio</label>
+                        <input type="radio" class="btn-check" name="audioStudioSection" id="audioSectionSong" autocomplete="off">
+                        <label class="btn btn-outline-dark fw-semibold py-2" for="audioSectionSong" data-audio-section="songStudioModal">🎵 Song Studio</label>
+                        <input type="radio" class="btn-check" name="audioStudioSection" id="audioSectionMixer" autocomplete="off">
+                        <label class="btn btn-outline-dark fw-semibold py-2" for="audioSectionMixer" data-audio-section="mixerConsoleTabPane">🎛️ Mixer</label>
+                        <input type="radio" class="btn-check" name="audioStudioSection" id="audioSectionTools" autocomplete="off">
+                        <label class="btn btn-outline-dark fw-semibold py-2" for="audioSectionTools" data-audio-section="audioToolsTabPane">🧰 Tools</label>
+                    </div>
+                <div id="voiceStudioTabPane">
                 <div class="modal-body p-4">
                     <p class="text-muted small mb-3">Build a script line by line — each line can use a completely different model and voice. Generate multiple takes per line, compare them, and pick the one you want.</p>
+                    <div class="border rounded p-2 mb-3 bg-light">
+                        <div class="xx-small fw-semibold mb-1">🎯 What do you need? Every line's model/voice list below filters to only real, confirmed matches.</div>
+                        <div class="d-flex gap-2">
+                            <select class="form-select form-select-sm" id="voiceRequirementLanguage" style="max-width:200px;">
+                                <option value="">Any language</option>
+                            </select>
+                            <select class="form-select form-select-sm" id="voiceRequirementGender" style="max-width:160px;">
+                                <option value="">Any gender</option>
+                                <option value="female">Female voices</option>
+                                <option value="male">Male voices</option>
+                            </select>
+                        </div>
+                    </div>
                     <div id="voiceScriptLines" class="d-flex flex-column gap-3 mb-3"></div>
                     <button type="button" class="btn btn-outline-dark w-100 fw-bold" id="voiceScriptAddLineBtn">➕ Add Line</button>
+                    <hr class="my-2">
+                    <button type="button" class="btn btn-dark w-100 fw-bold" id="voiceScriptCombineBtn">🔗 Combine All Selected Takes (sequential)</button>
+                    <div class="xx-small text-muted mt-1">System-based, not AI — deterministic audio stitching. Plays every line back-to-back, in order. For background music or timed sound overlays, use the 🎛️ Mixer tab above — it can pull these takes in from your library too.</div>
+                    <div id="voiceScriptCombineResult" class="mt-2"></div>
                     <hr class="my-4">
                     <button type="button" class="btn btn-outline-dark w-100 text-start d-flex justify-content-between align-items-center" data-bs-toggle="collapse" data-bs-target="#voiceCloneSection">
                         <span>🎤 Or, create a real custom voice from a recording</span>
@@ -1114,19 +1150,8 @@
                         <div class="mt-3" id="voiceCloneSavedList"></div>
                     </div>
                 </div>
-                <div class="modal-footer bg-light">
-                    <button type="button" class="btn btn-secondary text-sm" data-bs-dismiss="modal">Close</button>
                 </div>
-            </div>
-        </div>
-    </div>
-    <div class="modal fade" id="songStudioModal" tabindex="-1" aria-hidden="true">
-        <div class="modal-dialog modal-dialog-centered modal-lg">
-            <div class="modal-content border-0 shadow-lg">
-                <div class="modal-header bg-dark text-white">
-                    <h5 class="modal-title fw-bold">🎵 Song Studio</h5>
-                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
-                </div>
+                <div class="d-none" id="songStudioModal">
                 <div class="modal-body p-4">
                     <p class="text-muted small">Full songs with real sung vocals — give it a mood/style and lyrics, or describe your story and let it write the lyrics for you.</p>
                     <button type="button" class="btn btn-outline-dark w-100 text-start d-flex justify-content-between align-items-center mb-3" data-bs-toggle="collapse" data-bs-target="#songWriterSection">
@@ -1294,8 +1319,174 @@
                     <button type="button" class="btn btn-outline-dark w-100 fw-bold" id="sfxGenerateBtn">🔊 Generate Sound Effect</button>
                     <div class="mt-2" id="sfxResult"></div>
                 </div>
-                <div class="modal-footer bg-light">
-                    <button type="button" class="btn btn-secondary text-sm" data-bs-dismiss="modal">Close</button>
+                </div>
+                <div class="d-none" id="mixerConsoleTabPane">
+                <div class="modal-body p-4">
+                    <p class="text-muted small mb-3">Arrange anything you've generated — voice takes, songs, sound effects — into a Main track (plays in order), one optional Background track (loops underneath), and any number of timed sound overlays (placed at an exact second). 100% offline: real local ffmpeg mixing, no AI call, no per-render cost.</p>
+                    <div id="mixerFfmpegWarning" class="alert alert-warning py-2 px-3 xx-small d-none"></div>
+                    <div class="row g-3">
+                        <div class="col-md-5">
+                            <div class="fw-semibold small mb-1">📚 Your Library</div>
+                            <select class="form-select form-select-sm mb-2" id="mixerLibraryTypeFilter">
+                                <option value="">All types</option>
+                                <option value="voice">Voice</option>
+                                <option value="song">Song</option>
+                                <option value="sfx">SFX</option>
+                                <option value="upload">Uploaded</option>
+                                <option value="mix">🎛️ Your mixes</option>
+                            </select>
+                            <label class="btn btn-sm btn-outline-dark w-100 mb-2" for="mixerUploadInput">📁 Upload your own audio</label>
+                            <input type="file" accept="audio/*" id="mixerUploadInput" class="d-none">
+                            <div id="mixerLibraryList" class="d-flex flex-column gap-1" style="max-height:320px; overflow-y:auto;"></div>
+                        </div>
+                        <div class="col-md-7">
+                            <div class="fw-semibold small mb-1">🎬 Intro <span class="text-muted fw-normal">(plays first, one clip)</span></div>
+                            <div id="mixerIntroSlot" class="border rounded p-2 mb-2">
+                                <span class="text-muted xx-small">No intro set.</span>
+                            </div>
+                            <div class="fw-semibold small mb-1">🎚️ Main Track <span class="text-muted fw-normal">(plays in order)</span></div>
+                            <div id="mixerMainTrackList" class="d-flex flex-column gap-1 mb-2 border rounded p-2" style="min-height:80px;">
+                                <span class="text-muted xx-small" id="mixerMainTrackEmpty">Add clips from your library on the left.</span>
+                            </div>
+                            <div class="fw-semibold small mb-1">🎬 Outro <span class="text-muted fw-normal">(plays last, one clip)</span></div>
+                            <div id="mixerOutroSlot" class="border rounded p-2 mb-3">
+                                <span class="text-muted xx-small">No outro set.</span>
+                            </div>
+                            <div class="fw-semibold small mb-1">🎧 Background Track <span class="text-muted fw-normal">(loops underneath, one clip)</span></div>
+                            <div id="mixerBackgroundTrackSlot" class="border rounded p-2 mb-2">
+                                <span class="text-muted xx-small">No background clip set.</span>
+                            </div>
+                            <label class="xx-small text-muted mb-0">Background volume</label>
+                            <input type="range" class="form-range mb-1" id="mixerBackgroundVolume" min="0" max="1" step="0.05" value="0.25">
+                            <div class="form-check xx-small mb-3">
+                                <input class="form-check-input" type="checkbox" id="mixerBackgroundDuck">
+                                <label class="form-check-label xx-small" for="mixerBackgroundDuck" title="Real auto-ducking (ffmpeg sidechaincompress) — background dynamically drops under the main track's actual level, not just a fixed volume cut">🎚️ Auto-duck under Main Track</label>
+                            </div>
+                            <label class="xx-small text-muted mb-0">When background is longer than the main track</label>
+                            <select class="form-select form-select-sm mb-3" id="mixerDurationMode">
+                                <option value="matchMain">Cut background to match main track length</option>
+                                <option value="full">Let background keep playing past the end</option>
+                            </select>
+                            <div class="fw-semibold small mb-1">⏱ Timed Overlays <span class="text-muted fw-normal">(each placed at an exact second, not looped — click "⏱" on a library item to add one)</span></div>
+                            <div id="mixerOverlaysList" class="d-flex flex-column gap-1 mb-3 border rounded p-2" style="min-height:60px;">
+                                <span class="text-muted xx-small" id="mixerOverlaysEmpty">Click ⏱ on a library item to place it at a specific moment.</span>
+                            </div>
+                            <button type="button" class="btn btn-dark w-100 fw-bold" id="mixerRenderBtn">🎛️ Render Mix</button>
+                            <div id="mixerRenderResult" class="mt-2"></div>
+                        </div>
+                    </div>
+                </div>
+                </div>
+                <div class="d-none" id="audioToolsTabPane">
+                <div class="modal-body p-4">
+                    <p class="text-muted small mb-3">Standalone utilities — real, local ffmpeg processing wherever possible. No AI call, no per-use cost, except Re-voice, which is a genuine AI conversion and does cost real money per use.</p>
+                    <div class="row g-4">
+                        <div class="col-md-6">
+                            <div class="border rounded p-3 mb-3 bg-light">
+                                <h6 class="fw-bold small mb-2">🎬 Extract Audio from Video</h6>
+                                <label class="btn btn-sm btn-outline-dark w-100 mb-2" for="toolsVideoUpload">📁 Upload a video</label>
+                                <input type="file" accept="video/*" class="d-none" id="toolsVideoUpload">
+                                <p class="xx-small text-muted mb-2" id="toolsVideoStatus"></p>
+                                <select class="form-select form-select-sm mb-2" id="toolsVideoFormat">
+                                    <option value="mp3" selected>MP3</option>
+                                    <option value="wav">WAV (lossless)</option>
+                                    <option value="ogg">OGG</option>
+                                    <option value="m4a">M4A</option>
+                                    <option value="flac">FLAC (lossless)</option>
+                                </select>
+                                <button type="button" class="btn btn-primary w-100 fw-bold" id="toolsExtractBtn" disabled>🎬 Extract Audio</button>
+                                <div class="mt-2" id="toolsExtractResult"></div>
+                            </div>
+                            <div class="border rounded p-3 mb-3 bg-light">
+                                <h6 class="fw-bold small mb-2">🔁 Convert Format</h6>
+                                <select class="form-select form-select-sm mb-1" id="toolsConvertSource">
+                                    <option value="">Pick a clip from your library...</option>
+                                </select>
+                                <label class="btn btn-sm btn-outline-secondary w-100 mb-2" for="toolsConvertUpload">📁 Or upload a file from your computer</label>
+                                <input type="file" accept="audio/*" class="d-none" id="toolsConvertUpload">
+                                <p class="xx-small text-muted mb-2" id="toolsConvertUploadStatus"></p>
+                                <select class="form-select form-select-sm mb-2" id="toolsConvertFormat">
+                                    <option value="mp3" selected>MP3</option>
+                                    <option value="wav">WAV (lossless)</option>
+                                    <option value="ogg">OGG</option>
+                                    <option value="m4a">M4A</option>
+                                    <option value="flac">FLAC (lossless)</option>
+                                </select>
+                                <button type="button" class="btn btn-primary w-100 fw-bold" id="toolsConvertBtn">🔁 Convert</button>
+                                <div class="mt-2" id="toolsConvertResult"></div>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="border rounded p-3 mb-3 bg-light">
+                                <h6 class="fw-bold small mb-2">📱 Ringtone Maker</h6>
+                                <select class="form-select form-select-sm mb-1" id="toolsRingtoneSource">
+                                    <option value="">Pick a clip from your library...</option>
+                                </select>
+                                <label class="btn btn-sm btn-outline-secondary w-100 mb-2" for="toolsRingtoneUpload">📁 Or upload a song/clip from your computer</label>
+                                <input type="file" accept="audio/*" class="d-none" id="toolsRingtoneUpload">
+                                <p class="xx-small text-muted mb-2" id="toolsRingtoneUploadStatus"></p>
+                                <div class="row g-2 mb-2">
+                                    <div class="col-6">
+                                        <label class="xx-small text-muted mb-0">Start (s)</label>
+                                        <input type="number" class="form-control form-control-sm" id="toolsRingtoneStart" min="0" step="0.5" value="0">
+                                    </div>
+                                    <div class="col-6">
+                                        <label class="xx-small text-muted mb-0">End (s)</label>
+                                        <input type="number" class="form-control form-control-sm" id="toolsRingtoneEnd" min="0" step="0.5" placeholder="e.g. 20">
+                                    </div>
+                                </div>
+                                <select class="form-select form-select-sm mb-2" id="toolsRingtonePlatform">
+                                    <option value="android" selected>Android (up to 30s, .mp3)</option>
+                                    <option value="ios">iPhone (up to 40s, .m4r)</option>
+                                </select>
+                                <button type="button" class="btn btn-primary w-100 fw-bold" id="toolsRingtoneBtn">📱 Make Ringtone</button>
+                                <div class="mt-2" id="toolsRingtoneResult"></div>
+                            </div>
+                            <div class="border rounded p-3 mb-3 bg-light">
+                                <h6 class="fw-bold small mb-2">🔄 Re-voice <span class="badge bg-warning text-dark fw-normal">Real AI call — costs money per use</span></h6>
+                                <p class="xx-small text-muted mb-2">Takes an existing clip's exact words, timing, and performance, and swaps only the voice — genuinely different from generating new speech. Great for: something you generated with a model that has better language/markup support, remade in a voice you already have.</p>
+                                <select class="form-select form-select-sm mb-1" id="toolsRevoiceSource">
+                                    <option value="">Source clip (what to convert)...</option>
+                                </select>
+                                <label class="btn btn-sm btn-outline-secondary w-100 mb-2" for="toolsRevoiceSourceUpload">📁 Or upload the source clip</label>
+                                <input type="file" accept="audio/*" class="d-none" id="toolsRevoiceSourceUpload">
+                                <p class="xx-small text-muted mb-2" id="toolsRevoiceSourceUploadStatus"></p>
+                                <div class="d-none" id="toolsRevoiceRegionSection">
+                                    <div class="position-relative mb-1" data-waveform-wrap="revoice-region">
+                                        <canvas class="w-100 bg-white rounded border" height="56" data-waveform-canvas="revoice-region"></canvas>
+                                        <div class="xx-small text-muted" data-waveform-status="revoice-region"></div>
+                                    </div>
+                                    <p class="xx-small text-muted mb-2">Whole clip converts by default. Drag on the waveform above to select just one part instead — then either re-voice only that part, or replace it with corrected text, and it splices back into the rest automatically.</p>
+                                    <div class="d-none" id="toolsRevoiceCorrectSection">
+                                        <label class="form-label xx-small fw-semibold mb-1">Corrected text for the selected region</label>
+                                        <textarea class="form-control form-control-sm mb-2" id="toolsCorrectText" rows="2" placeholder="Type exactly what should be said in this region..."></textarea>
+                                        <label class="form-label xx-small fw-semibold mb-1">Voice for the correction</label>
+                                        <select class="form-select form-select-sm mb-2" id="toolsCorrectVoiceSelect">
+                                            <option value="">Pick a voice...</option>
+                                        </select>
+                                        <button type="button" class="btn btn-sm btn-success w-100 fw-bold mb-2" id="toolsCorrectRegionBtn">✏️ Replace Region With Corrected Text</button>
+                                    </div>
+                                </div>
+                                <select class="form-select form-select-sm mb-1" id="toolsRevoiceTarget">
+                                    <option value="">Target voice — your saved clones or a real voice sample, never AI-generated content...</option>
+                                </select>
+                                <p class="xx-small text-muted mb-1">Only real human voice references show up here — your cloned voices from Voice Studio, or anything you upload. Songs, sound effects, and other AI-generated takes are deliberately left out, since they don't make sense as a voice to convert into.</p>
+                                <label class="btn btn-sm btn-outline-secondary w-100 mb-2" for="toolsRevoiceTargetUpload">📁 Or upload anyone's voice sample (5-10s, clean audio)</label>
+                                <input type="file" accept="audio/*" class="d-none" id="toolsRevoiceTargetUpload">
+                                <p class="xx-small text-muted mb-2" id="toolsRevoiceTargetUploadStatus"></p>
+                                <div class="d-flex gap-2 mb-2">
+                                    <button type="button" class="btn btn-primary flex-grow-1 fw-bold" id="toolsRevoiceBtn">🔄 Re-voice Whole Clip</button>
+                                    <button type="button" class="btn btn-outline-primary flex-grow-1 fw-bold d-none" id="toolsRevoiceRegionBtn">🔄 Re-voice Selected Region Only</button>
+                                </div>
+                                <button type="button" class="btn btn-sm btn-outline-secondary w-100 mb-2 d-none" id="toolsRevoiceShowCorrectBtn">✏️ Or replace the region with corrected text instead</button>
+                                <div class="mt-2" id="toolsRevoiceResult"></div>
+                                <div class="mt-2" id="toolsCorrectResult"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                </div>
+                </div>
                 </div>
             </div>
         </div>
@@ -1442,6 +1633,11 @@
                         <label class="btn btn-sm btn-outline-secondary w-100 mb-2" for="flowBgmUpload">📁 Or just upload a finished BGM clip</label>
                         <input type="file" accept="audio/*" id="flowBgmUpload" class="d-none">
                         <p class="xx-small text-muted mb-2" id="flowBgmUploadStatus"></p>
+                        <label class="form-label xx-small fw-semibold mb-1">🎧 Or use something already in your Audio Library <span class="text-muted fw-normal">(a song, a Mixer render, anything you've already made)</span></label>
+                        <select class="form-select form-select-sm mb-2" id="flowBgmLibrarySelect">
+                            <option value="">Pick a saved clip...</option>
+                        </select>
+                        <audio class="w-100 mb-2 d-none" id="flowBgmLibraryPreview" controls></audio>
                         <button type="button" class="btn btn-sm btn-outline-primary w-100 mb-1" id="flowPreviewBgmBtn">▶️ Generate &amp; Listen</button>
                         <audio class="w-100 mb-2 d-none" id="flowBgmPreviewPlayer" controls></audio>
                             </div>
@@ -1541,6 +1737,7 @@
                             <select class="form-select form-select-sm mb-2" id="flowTalkingVoiceMode">
                                 <option value="standard" selected>Standard voice (confirmed reliable for Indian languages)</option>
                                 <option value="clone">Clone a voice from a reference clip <span class="text-muted">(this app's own cloning — confirmed reliable for Indian languages; not HeyGen's website cloning, which the API here doesn't expose)</span></option>
+                                <option value="existing-clone">Use a voice you already cloned <span class="text-muted">(free — reuses a saved clone instead of cloning again)</span></option>
                                 <option value="heygen-native">Use one of HeyGen's own preset voices <span class="text-muted">(fixed voice list, not a clone — HeyGen's own docs claim broad language support, not independently verified in this app)</span></option>
                             </select>
                             <select class="form-select form-select-sm mb-2" id="flowTalkingStandardVoiceSelect"></select>
@@ -1549,9 +1746,21 @@
                                 <input type="file" accept="audio/*" id="flowTalkingCloneUpload" class="d-none">
                                 <p class="xx-small text-muted mb-2" id="flowTalkingCloneStatus"></p>
                             </div>
+                            <div id="flowTalkingExistingCloneSection" class="d-none">
+                                <select class="form-select form-select-sm mb-2" id="flowTalkingExistingCloneSelect">
+                                    <option value="">Loading your cloned voices...</option>
+                                </select>
+                                <p class="xx-small text-muted mb-2">Same clones from Voice Studio's "🎤 create a custom voice" section — carries the same full emotional range that voice was cloned with, no re-cloning needed.</p>
+                            </div>
+                            <div id="flowTalkingCloneEmotionSection" class="d-none row g-2 mb-2">
+                                <div class="col-4"><label class="xx-small text-muted mb-0">Speed <span id="flowTalkingSpeedValue">1.0</span></label><input type="range" class="form-range" id="flowTalkingSpeed" min="0.5" max="2.0" step="0.1" value="1.0"></div>
+                                <div class="col-4"><label class="xx-small text-muted mb-0">Pitch <span id="flowTalkingPitchValue">0</span></label><input type="range" class="form-range" id="flowTalkingPitch" min="-12" max="12" step="1" value="0"></div>
+                                <div class="col-4"><label class="xx-small text-muted mb-0">Emotion</label><select class="form-select form-select-sm" id="flowTalkingEmotion"><option value="neutral">neutral</option><option value="happy">happy</option><option value="sad">sad</option><option value="angry">angry</option><option value="fearful">fearful</option><option value="disgusted">disgusted</option><option value="surprised">surprised</option></select></div>
+                            </div>
                             <div id="flowTalkingHeygenVoiceSection" class="d-none">
                                 <input type="text" class="form-control form-control-sm mb-2" id="flowTalkingHeygenVoiceName" placeholder="HeyGen voice name (e.g. Ivy) — leave blank for default">
                             </div>
+                            <p class="xx-small text-muted mb-2 d-none" id="flowTalkingEmotionScopeNote">Speed/pitch/emotion only apply here — this app's cloning routes through MiniMax specifically, which confirms these controls.</p>
                         </div>
 
                         <label class="form-label xx-small fw-semibold mb-1">Model</label>

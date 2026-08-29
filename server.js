@@ -67,6 +67,7 @@ const { getRealBalance, getRealUsage, getRealPricing } = require("./fal-billing"
 const { FalAdapter } = require("./provider-adapter");
 const voiceCatalog = require("./fal-voice-catalog");
 const videoStitcher = require("./video-stitcher");
+const audioMixer = require("./audio-mixer");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -2268,7 +2269,8 @@ app.post("/api/flow/generate-talking", async (req, res) => {
   try {
     const {
       imageBase64, audioBase64,
-      text, targetLanguage, voiceMode, voiceModelId, voiceReferenceAudioBase64,
+      text, targetLanguage, voiceMode, voiceModelId, voiceReferenceAudioBase64, existingCustomVoiceId,
+      voiceEmotion, voiceSpeed, voicePitch,
       useNativeHeygenVoice, heygenVoiceName,
       background, talkingStyle, aspectRatio, modelId, textModel, userApiKey, runId: clientRunId,
     } = req.body;
@@ -2313,7 +2315,16 @@ app.post("/api/flow/generate-talking", async (req, res) => {
         progress.startProgress(runId, "generating-voice", "Generating speech...");
         let effectiveVoiceModel = VOICE_MODELS.find((m) => m.id === voiceModelId) || VOICE_MODELS[0];
         let effectiveVoiceId = req.body.voiceId || null;
-        if (voiceMode === "clone" && voiceReferenceAudioBase64) {
+        if (voiceMode === "existing-clone" && existingCustomVoiceId) {
+          // Real fix for "clone once, reuse everywhere": this skips the
+          // billed clone API call entirely — no new reference audio, no
+          // new charge, just the SAME already-cloned voice_id already
+          // sitting in this app's own custom-voices table (see Voice
+          // Studio's clone section), used directly on MiniMax the same
+          // way a freshly-cloned one would be.
+          effectiveVoiceModel = VOICE_MODELS.find((m) => m.id === "fal-ai/minimax/speech-02-hd") || effectiveVoiceModel;
+          effectiveVoiceId = existingCustomVoiceId;
+        } else if (voiceMode === "clone" && voiceReferenceAudioBase64) {
           progress.startProgress(runId, "cloning-voice", "Cloning voice from your reference clip...");
           const cloneModel = VOICE_CLONE_MODELS[0];
           const cloneUrl = toFalImageUrl(voiceReferenceAudioBase64, "audio/wav");
@@ -2325,7 +2336,20 @@ app.post("/api/flow/generate-talking", async (req, res) => {
             effectiveVoiceId = cloneResult.customVoiceId;
           }
         }
-        const voiceResult = await falVoiceRequest(effectiveVoiceModel.id, effectiveVoiceModel.buildInput(finalText, { voiceId: effectiveVoiceId }), {
+        const voiceResult = await falVoiceRequest(effectiveVoiceModel.id, effectiveVoiceModel.buildInput(finalText, {
+          voiceId: effectiveVoiceId,
+          // REAL GAP FIXED: this route never sent emotion/speed/pitch at
+          // all, for ANY voice path (standard, freshly cloned, or reused
+          // clone) — buildInput has always accepted them (see Voice
+          // Studio's own emotion/speed/pitch sliders using the exact same
+          // function), they just weren't being read from the request
+          // here. Only meaningful on models that confirm this capability
+          // (see supportsEmotionPitchSpeed) — buildInput itself already
+          // ignores these safely on models that don't.
+          emotion: voiceEmotion || undefined,
+          speed: typeof voiceSpeed === "number" ? voiceSpeed : undefined,
+          pitch: typeof voicePitch === "number" ? voicePitch : undefined,
+        }), {
           apiKey, costMeta: { runId, endpoint: "flow-talking-voice" }, costPer1kChars: effectiveVoiceModel.costPer1kChars,
         });
         audioUrl = voiceResult.url;
@@ -4845,7 +4869,7 @@ app.post("/api/voice/generate-multilingual", async (req, res) => {
     // durationMs is a sum of the individual segment durations — real
     // per-segment numbers from Fal's own responses, not a guess — used
     // by the SAME anomaly-flagging the single-language path already has.
-    res.json({ audio: dataUri, modelUsed: model.id, segments: segmentDetails, durationMs: totalDurationMs || null });
+    res.json({ audio: dataUri, audioUrl: finalUrl, modelUsed: model.id, segments: segmentDetails, durationMs: totalDurationMs || null });
   } catch (error) {
     if (runId) progress.finishProgress(runId);
     console.error(`[Voice] Multilingual generation failed: ${error.message}`);
@@ -4897,37 +4921,109 @@ ${script.trim()}`;
 // "unsupported" (Kokoro/Inworld/xAI) is refused outright rather than
 // generating tags that would just get stripped on generation.
 // ============================================================
+// ============================================================
+// UNIFIED EMOTION / INTENTION CONTROL — one input, every model, each
+// handled honestly according to what it can ACTUALLY do (never the
+// same fake promise painted over different real capabilities):
+//   - markupTagMode "fixed" + confirmedEmotions (MiniMax): the
+//     intention is mapped to the CLOSEST real confirmed emotion
+//     (validated against the actual list, never invented) AND to a
+//     real sound cue from fixedMarkupTags where one genuinely fits.
+//   - markupTagMode "freeform" (ElevenLabs/Gemini): the intention
+//     becomes a real *tag* describing the delivery directly.
+//   - markupTagMode "unsupported" (Kokoro/Inworld/xAI): refused
+//     outright with an honest explanation, not silently ignored —
+//     these models have no real expressive lever at all.
+// ============================================================
 app.post("/api/voice/suggest-markup", async (req, res) => {
   try {
-    const { text, modelId, textModel, userApiKey, runId: clientRunId } = req.body;
+    const { text, modelId, intention, textModel, userApiKey, runId: clientRunId } = req.body;
     if (!text?.trim()) return res.status(400).json({ error: "Missing line text." });
     const model = VOICE_MODELS.find((m) => m.id === modelId);
     if (!model) return res.status(400).json({ error: "Unknown voice model — pick one for this line first." });
     if (!model.markupTagMode || model.markupTagMode === "unsupported") {
-      return res.status(400).json({ error: `${model.label} doesn't support any delivery/tone tags — switch to MiniMax, ElevenLabs, or Gemini TTS on this line first, then try again.` });
+      return res.status(400).json({ error: `${model.label} has no confirmed way to express emotion, tone, or intention at all — switch to MiniMax, ElevenLabs, or Gemini TTS on this line first, then try again.` });
     }
     const apiKey = userApiKey || process.env.FAL_KEY;
     if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
     const runId = clientRunId || crypto.randomUUID();
+    const hasEmotions = !!model.confirmedEmotions?.length;
+    const intentionInstruction = intention?.trim()
+      ? `The person directing this line wants it to convey: "${intention.trim()}". Every tag you choose (and the emotion pick, if applicable) must serve THIS specific intention — don't default to something generic if it doesn't fit.`
+      : `No specific intention was given — use your own judgment for what would make this line land well.`;
     const tagVocabInstruction = model.markupTagMode === "fixed"
       ? `This voice model ONLY understands these exact tags — anything else is silently NOT spoken at all: ${(model.fixedMarkupTags || []).map((t) => `*${t}*`).join(", ")}, plus *N second pause* for a timed pause (e.g. *2 second pause*). Do not use any tag outside this exact list.`
       : `This voice model reads any short, specific descriptive delivery cue written as *cue* (e.g. *whispers*, *building excitement*, *sarcastic*, *3 second pause*) as a real instruction for HOW to say the words immediately after it. Use genuine, specific cues that actually fit this line — don't invent a vague one just to have used a tag.`;
-    const prompt = `You are an experienced voice director marking up a script for a text-to-speech performance — the real gap this closes is a flat, monotone AI read with zero expression.
+    const emotionInstruction = hasEmotions
+      ? `Separately, also pick the SINGLE closest-fitting emotion from this model's real confirmed list for the whole line: ${model.confirmedEmotions.join(", ")}. Include it as "emotion" in your JSON response — must be EXACTLY one of those words, or null if none genuinely fit.`
+      : "";
+    const prompt = `You are an experienced voice director marking up a script for a text-to-speech performance — the real gap this closes is a flat, monotone AI read with zero expression or intention behind it.
+${intentionInstruction}
 ${tagVocabInstruction}
+${emotionInstruction}
 CRITICAL RULES:
 - Do NOT change, add, remove, or reorder a single word of the original script — insert *tag* markers between the existing words only, never rewrite them.
 - Place each tag immediately BEFORE the exact words it directs.
 - Restraint matters — a natural performance doesn't have a cue before every clause; most lines need zero, one, or two tags, not one per sentence.
-Return ONLY the tagged script, nothing else — no explanation, no markdown fences, no surrounding quotes.
+Return ONLY this JSON object, no markdown fences: {"taggedText": "the script with tags inserted"${hasEmotions ? `, "emotion": "one of the confirmed emotions above, or null"` : ""}}
 SCRIPT:
 ${text.trim()}`;
     const response = await falTextRequest(prompt, {
       model: textModel || DEFAULT_TEXT_MODEL, apiKey, temperature: 0.6,
       costMeta: { runId, endpoint: "voice-suggest-markup" },
     });
-    res.json({ taggedText: response.text.trim(), runId });
+    let parsed;
+    try {
+      parsed = JSON.parse(response.text.replace(/```json|```/g, "").trim());
+    } catch {
+      // Fallback for a model that ignores the JSON instruction and
+      // returns bare tagged text — still usable, just no emotion pick.
+      parsed = { taggedText: response.text.trim(), emotion: null };
+    }
+    const taggedText = typeof parsed.taggedText === "string" ? parsed.taggedText : text.trim();
+    // Never trust the LLM's own claimed emotion without checking it
+    // against the model's REAL confirmed list — same discipline as
+    // generateVoiceDirections above.
+    const emotion = hasEmotions && model.confirmedEmotions.includes(parsed.emotion) ? parsed.emotion : null;
+    res.json({ taggedText, emotion, runId });
   } catch (error) {
     console.error(`[Voice] Markup suggestion failed: ${error.message}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// FREE TEXT-PROCESSING PREVIEW — shows exactly what a model will
+// actually receive and speak BEFORE spending a real generation on it.
+// Genuinely free and instant: buildInput() is a pure text-transform
+// function (turns *tags* into that model's real syntax, applies
+// production-script cleanup) — it never calls Fal, so this can run on
+// every keystroke without any real cost, unlike a real generation.
+// Answers "what is this actually going to do" directly instead of
+// finding out only after paying for a take.
+// ============================================================
+app.post("/api/voice/preview-text-processing", (req, res) => {
+  try {
+    const { text, modelId, voiceId, language, speed, pitch, emotion } = req.body;
+    if (!text?.trim()) return res.json({ finalSpokenText: "", strippedMarkers: [], estimatedSeconds: 0 });
+    const model = VOICE_MODELS.find((m) => m.id === modelId);
+    if (!model) return res.status(400).json({ error: "Unknown voice model." });
+    const productionScript = prepareProductionScript(text.trim());
+    const input = model.buildInput(productionScript.text, { voiceId, language, speed, pitch, emotion });
+    // Field name genuinely differs by model (MiniMax/ElevenLabs use
+    // "text", Gemini TTS/Kokoro use "prompt") — check both rather than
+    // assume one, same real distinction already handled at generation
+    // time in /api/voice/generate.
+    const finalSpokenText = input.text || input.prompt || productionScript.text;
+    const strippedMarkers = input.__strippedMarkers || [];
+    // Estimate is off the FINAL spoken text, not the raw typed text —
+    // stripped stage directions and tag syntax shouldn't count toward
+    // spoken word count, so this is a more accurate number than a
+    // client-side estimate off the untouched textarea value.
+    const wordCount = finalSpokenText.trim().split(/\s+/).filter(Boolean).length;
+    const estimatedSeconds = wordCount ? +(wordCount / (2.5 * (speed || 1.0))).toFixed(1) : 0;
+    res.json({ finalSpokenText, strippedMarkers, deliveryNote: productionScript.deliveryNote || null, estimatedSeconds });
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
@@ -5111,6 +5207,29 @@ app.post("/api/voice/clone", async (req, res) => {
       sourceText: previewText || null,
       languageNote: languageNote || null,
     });
+    // REAL BUG FOUND AND FIXED HERE: the actual recording (audioBase64)
+    // used to just get sent to MiniMax's clone endpoint and then
+    // discarded entirely — only the MiniMax-internal custom_voice_id
+    // string was ever kept. That string is USELESS outside MiniMax —
+    // Chatterbox's re-voice tool has no idea what a MiniMax voice_id
+    // is; it needs a real, playable audio file as its target voice
+    // reference. Saving the raw recording here too means every voice
+    // cloned from now on is genuinely usable as a re-voice target, not
+    // just for MiniMax TTS. Existing clones made before this fix (their
+    // original recording was never kept anywhere) can't be retrofitted
+    // — that's a real, honest limitation, not something this can fix
+    // retroactively.
+    let voiceReferenceLibraryId = null;
+    try {
+      voiceReferenceLibraryId = db.saveAudioLibraryItem({
+        type: "upload",
+        name: `${name.trim()} (voice reference)`,
+        audioDataUri: audioBase64,
+        runId,
+      });
+    } catch (saveErr) {
+      console.warn(`[Voice Clone] Couldn't save the reference recording to the library: ${saveErr.message}`); // never fail the actual clone over this
+    }
     // The full emotional range — real, separate paid calls (opt-in via
     // generateEmotions, not automatic), using the regular TTS model with
     // the freshly-cloned voice_id and MiniMax's own confirmed emotion
@@ -5148,6 +5267,7 @@ app.post("/api/voice/clone", async (req, res) => {
       customVoiceId: result.customVoiceId,
       previewAudio: dataUri,
       emotionSamples,
+      voiceReferenceLibraryId,
       retentionWarning: `This voice will be automatically deleted by MiniMax if not used again within ${model.retentionDays} days — using it to generate real speech resets that clock automatically.`,
     });
   } catch (error) {
@@ -5438,7 +5558,7 @@ app.post("/api/voice/script/generate-variations", async (req, res) => {
           // REAL FIX: durationMs was computed by falVoiceRequest but
           // discarded here — so there was no way to see how long a take
           // actually ran, which matters directly for dialogue pacing.
-          return { ...direction, audio: dataUri, durationMs: result.durationMs ?? null, modelUsed: model.id, strippedMarkers, error: null };
+          return { ...direction, audio: dataUri, audioUrl: result.url, durationMs: result.durationMs ?? null, modelUsed: model.id, strippedMarkers, error: null };
         } catch (err) {
           return { ...direction, audio: null, durationMs: null, modelUsed: model.id, error: err.message };
         }
@@ -5452,12 +5572,117 @@ app.post("/api/voice/script/generate-variations", async (req, res) => {
 });
 
 // ============================================================
-// AUDIO LIBRARY (Phase 11) — real, simple REST endpoints over the
-// db.js functions above. Deliberately minimal: list/save/delete/
-// favorite is enough to make generated audio actually reusable instead
-// of vanishing when a modal closes, without over-building before real
-// usage shows what's actually needed beyond that.
+// SYSTEM-BASED COMBINE (not AI) — the real ask: stitch every line's
+// chosen take into one continuous file. Two real modes now:
+//
+// "sequential" (default) — Fal's cloud merge-audios, confirmed real
+// schema/pricing ($0.00017/compute-second). Requires a real API key
+// and network access to Fal.
+//
+// "background" — TRUE simultaneous mixing (voice + a chosen song
+// playing together, music sitting behind the voice, not after it).
+// Runs LOCALLY via audio-mixer.js's real ffmpeg amix filter, because
+// Fal's own compose endpoint exists but its exact track/volume schema
+// isn't confirmed from public docs — guessing at it risked silently
+// producing the wrong file. This mode is genuinely free (no Fal API
+// call, no API key required for this step) and needs ffmpeg installed
+// on this server; if it isn't, the error says so plainly rather than
+// pretending the feature worked.
+//
+// CAVEAT on the sequential/cloud path, stated honestly rather than
+// assumed: Fal doesn't document a guaranteed retention window for
+// generated-file URLs, so combining soon after generating is the safe
+// pattern.
 // ============================================================
+// Real, reusable helper: reads a local ffmpeg output file and saves it
+// into the Audio Library server-side, same real pattern already proven
+// for the Mixer's own render route — so ANY audio produced anywhere in
+// this app (a combine, a background mix, a full Mixer render) is
+// consistently reusable everywhere else, not just when the cloud path
+// happened to run instead of the local fallback.
+function saveLocalRenderToLibrary(filePath, name) {
+  try {
+    const audioBuffer = fs.readFileSync(filePath);
+    // Real fix: this used to hardcode audio/mpeg regardless of the
+    // actual file — harmless for the Mixer's MP3-only renders, but
+    // wrong for the new tools below, which can genuinely produce WAV,
+    // FLAC, or M4R output. A correct MIME type matters for reliable
+    // <audio> playback in the browser, not just cosmetic accuracy.
+    const ext = path.extname(filePath).slice(1).toLowerCase();
+    const mimeByExt = { mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", m4a: "audio/mp4", m4r: "audio/mp4", flac: "audio/flac" };
+    const mime = mimeByExt[ext] || "audio/mpeg";
+    const audioDataUri = `data:${mime};base64,${audioBuffer.toString("base64")}`;
+    return db.saveAudioLibraryItem({ type: "mix", name, audioDataUri });
+  } catch (err) {
+    console.warn(`[Audio] Auto-save to library failed: ${err.message}`); // never fail the actual render over a library-save hiccup
+    return null;
+  }
+}
+app.post("/api/voice/script/combine", async (req, res) => {
+  try {
+    const { audioUrls, mixMode, musicVolume, userApiKey, runId: clientRunId } = req.body;
+    const runId = clientRunId || crypto.randomUUID();
+
+    if (mixMode === "background") {
+      // Real simultaneous mix: exactly 2 sources — the combined voice
+      // narration and one song, played together. Local, free, no API
+      // key check needed for this path at all.
+      if (!Array.isArray(audioUrls) || audioUrls.length !== 2) {
+        return res.status(400).json({ error: "Background mixing needs exactly 2 sources: your combined narration and one song." });
+      }
+      const [voiceSource, musicSource] = audioUrls;
+      try {
+        const mixed = await audioMixer.mixVoiceWithMusic({
+          voiceSource, musicSource,
+          musicVolume: typeof musicVolume === "number" ? Math.min(1, Math.max(0, musicVolume)) : 0.25,
+          loopMusic: true,
+        });
+        const libraryItemId = saveLocalRenderToLibrary(mixed.filePath, `Narration + music — ${new Date().toLocaleString()}`);
+        return res.json({ downloadUrl: `/api/flow/download/${mixed.filename}`, sizeBytes: mixed.sizeBytes, mixMode: "background", runId, libraryItemId });
+      } catch (mixErr) {
+        return res.status(503).json({ error: mixErr.message });
+      }
+    }
+
+    // Default: sequential, via Fal's cloud merge.
+    if (!Array.isArray(audioUrls) || audioUrls.length < 2) return res.status(400).json({ error: "Need at least 2 lines with a generated take selected to combine." });
+    const apiKey = userApiKey || process.env.FAL_KEY;
+    if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
+    // Normalizes each entry through the SAME confirmed-working pattern
+    // already used elsewhere in this app for BGM (see generateBgmAudioForFlow
+    // and its "Combine multiple layers... narration + BGM together" call
+    // site) — Fal's ffmpeg-api endpoints accept a base64 data URI
+    // directly, same as a real hosted URL, so a song loaded from the
+    // Audio Library (which only ever has the base64, not a live Fal
+    // URL) can be combined here too without any upload step.
+    const normalizedUrls = audioUrls.map((u) => toFalImageUrl(u, "audio/mpeg")).filter(Boolean);
+    try {
+      const merged = await falMergeRequest("fal-ai/ffmpeg-api/merge-audios", { audio_urls: normalizedUrls }, { apiKey, costMeta: { runId, endpoint: "voice-script-combine" } });
+      const dataUri = await downloadImageAsDataUri(merged.url);
+      return res.json({ audio: dataUri, audioUrl: merged.url, mixMode: "sequential", runId });
+    } catch (cloudErr) {
+      // Free, fully offline fallback — no Fal call, no API key needed.
+      // Same reasoning as video-stitcher.js's cloud-then-local pattern:
+      // a real second path instead of a single point of failure.
+      console.warn(`[Voice] Fal cloud combine failed (${cloudErr.message}) — trying local ffmpeg concat instead.`);
+      try {
+        const local = await audioMixer.concatAudioLocally(normalizedUrls);
+        // REAL FIX: this path used to return a result with no way to
+        // reach the Audio Library at all (only the cloud path's base64
+        // response got saved) — a combine that happened to hit this
+        // fallback was a dead end, unlike everywhere else in the app.
+        const libraryItemId = saveLocalRenderToLibrary(local.filePath, `Combined script — ${new Date().toLocaleString()}`);
+        return res.json({ downloadUrl: `/api/flow/download/${local.filename}`, sizeBytes: local.sizeBytes, mixMode: "sequential-local-fallback", runId, libraryItemId });
+      } catch (localErr) {
+        throw cloudErr; // neither path worked — surface the original, more informative cloud error
+      }
+    }
+  } catch (error) {
+    console.error(`[Voice] Combine failed: ${error.message}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/api/audio-library", (req, res) => {
   try {
     res.json({ items: db.listAudioLibraryItems({ type: req.query.type || undefined }) });
@@ -5468,7 +5693,7 @@ app.get("/api/audio-library", (req, res) => {
 app.post("/api/audio-library", (req, res) => {
   try {
     const { type, name, audioDataUri, modelUsed, voiceUsed, language, runId, metadata } = req.body;
-    if (!type || !["voice", "song", "sfx"].includes(type)) return res.status(400).json({ error: "type must be 'voice', 'song', or 'sfx'." });
+    if (!type || !["voice", "song", "sfx", "upload", "mix", "revoice"].includes(type)) return res.status(400).json({ error: "type must be 'voice', 'song', 'sfx', 'upload', 'mix', or 'revoice'." });
     if (!name?.trim()) return res.status(400).json({ error: "Missing a name for this item." });
     if (!audioDataUri) return res.status(400).json({ error: "Missing audio data." });
     const id = db.saveAudioLibraryItem({ type, name: name.trim(), audioDataUri, modelUsed, voiceUsed, language, runId, metadata });
@@ -5492,6 +5717,340 @@ app.post("/api/audio-library/:id/favorite", (req, res) => {
     res.json({ favorite });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// MIXER CONSOLE — the general offline render for "everything the
+// Audio Library holds — voice takes, songs, SFX — arranged and mixed."
+// Intro/Main track/Outro: any number of clips, any type — intro plays
+// first, main track in the middle (in order), outro plays last.
+// Background: one optional clip, looped, volume-reduced, playing under
+// the whole sequence. Overlays: any number of additional clips, each
+// placed at a specific second (a real "canvas" — timed sound hits, not
+// just one background bed). Every clip (main track, intro, outro,
+// background, or overlay) can carry real per-clip edits — trim,
+// silence removal, fade in/out — applied before it enters the mix.
+// 100% local ffmpeg (see audio-mixer.js) — no Fal call, no API key
+// needed, no per-render cost at all.
+// ============================================================
+app.get("/api/audio/mixer/ffmpeg-status", async (req, res) => {
+  res.json({ localFfmpegAvailable: await audioMixer.checkFfmpegAvailable() });
+});
+// Normalizes a client-sent { source, edit } (or bare source string)
+// into the exact shape audio-mixer.js expects, clamping/validating
+// every edit field so a bad value can't reach ffmpeg's own argument
+// list unchecked.
+function normalizeClientSource(entry) {
+  if (!entry) return null;
+  const source = typeof entry === "string" ? entry : entry.source;
+  if (!source) return null;
+  const rawEdit = typeof entry === "object" ? entry.edit : null;
+  if (!rawEdit) return source;
+  const edit = {};
+  if (typeof rawEdit.trimStart === "number" && rawEdit.trimStart > 0) edit.trimStart = rawEdit.trimStart;
+  if (typeof rawEdit.trimEnd === "number" && rawEdit.trimEnd > 0) edit.trimEnd = rawEdit.trimEnd;
+  if (rawEdit.reverse) edit.reverse = true;
+  if (typeof rawEdit.speed === "number" && rawEdit.speed > 0) edit.speed = Math.min(4, Math.max(0.25, rawEdit.speed));
+  if (rawEdit.removeSilence) edit.removeSilence = true;
+  if (rawEdit.denoise) edit.denoise = true;
+  if (typeof rawEdit.silenceThresholdDb === "number") edit.silenceThresholdDb = Math.min(0, Math.max(-60, rawEdit.silenceThresholdDb));
+  if (typeof rawEdit.silenceMinDuration === "number" && rawEdit.silenceMinDuration > 0) edit.silenceMinDuration = Math.min(5, rawEdit.silenceMinDuration);
+  if (rawEdit.normalize) edit.normalize = true;
+  if (typeof rawEdit.boost === "number" && rawEdit.boost > 1) edit.boost = Math.min(3, rawEdit.boost);
+  if (typeof rawEdit.boostStart === "number" && rawEdit.boostStart >= 0) edit.boostStart = rawEdit.boostStart;
+  if (typeof rawEdit.boostEnd === "number" && rawEdit.boostEnd > 0) edit.boostEnd = rawEdit.boostEnd;
+  if (rawEdit.clarity) edit.clarity = true;
+  if (typeof rawEdit.fadeIn === "number" && rawEdit.fadeIn > 0) edit.fadeIn = rawEdit.fadeIn;
+  if (typeof rawEdit.fadeOut === "number" && rawEdit.fadeOut > 0) edit.fadeOut = rawEdit.fadeOut;
+  if (typeof rawEdit.loopCount === "number" && rawEdit.loopCount > 1) edit.loopCount = Math.min(20, Math.round(rawEdit.loopCount));
+  return Object.keys(edit).length ? { source, edit } : source;
+}
+app.post("/api/audio/mixer/edit-preview", async (req, res) => {
+  try {
+    const { source, edit } = req.body;
+    if (!source) return res.status(400).json({ error: "Missing a source clip to preview." });
+    const normalized = normalizeClientSource({ source, edit });
+    const editObj = typeof normalized === "object" ? normalized.edit : null;
+    const result = await audioMixer.editClip(source, editObj || {});
+    res.json({ downloadUrl: `/api/flow/download/${result.filename}`, sizeBytes: result.sizeBytes });
+  } catch (error) {
+    console.error(`[Mixer] Edit preview failed: ${error.message}`);
+    res.status(503).json({ error: error.message });
+  }
+});
+// ============================================================
+// RE-VOICE — real voice conversion (speech-to-speech), a genuinely
+// different technology from every other voice route in this app.
+// Everything else here is text-to-speech: text + a voice -> brand new
+// audio. This is audio + a target voice -> the SAME audio's exact
+// content/timing/performance, with only the vocal timbre swapped.
+// Confirmed real endpoint and exact schema straight from Fal's own
+// docs (fal.ai/models/fal-ai/chatterbox/speech-to-speech/api):
+// source_audio_url (required) + target_voice_audio_url, output
+// {audio: {url}}. This is what makes "generate with any model, then
+// remake it in a voice we already have" genuinely possible — the
+// output isn't a fresh TTS take, it's the SAME recording, re-voiced.
+// Real cost, not guessed: $0.015/min per Fal's own listed pricing,
+// computed from the SOURCE clip's actual probed duration (via
+// ffprobe, already proven elsewhere in this app) rather than a flat
+// estimate — conversion output duration tracks the input closely, so
+// this is an honest number, not a fabricated one.
+// ============================================================
+app.post("/api/audio/mixer/revoice", async (req, res) => {
+  let runId;
+  try {
+    const { sourceAudio, targetVoiceAudio, userApiKey, runId: clientRunId } = req.body;
+    if (!sourceAudio) return res.status(400).json({ error: "Missing the clip to re-voice." });
+    if (!targetVoiceAudio) return res.status(400).json({ error: "Missing a target voice reference — pick a clip whose voice you want to convert to." });
+    const apiKey = userApiKey || process.env.FAL_KEY;
+    if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
+    runId = clientRunId || crypto.randomUUID();
+
+    // Real duration probe on the actual source clip — same npm-native
+    // ffprobe already proven throughout audio-mixer.js, reused here
+    // rather than guessing a flat cost.
+    let estimatedMinutes = 1; // safe fallback if probing fails for any reason — never blocks the real request over a cost-estimate hiccup
+    try {
+      const os = require("os");
+      const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "revoice-probe-"));
+      const probePath = path.join(workDir, "source.mp3");
+      await audioMixer.downloadOrDecodeToFile(sourceAudio, probePath);
+      const seconds = await audioMixer.probeDuration(probePath);
+      if (seconds) estimatedMinutes = seconds / 60;
+      fs.rmSync(workDir, { recursive: true, force: true });
+    } catch (probeErr) {
+      console.warn(`[Revoice] Duration probe failed, using fallback cost estimate: ${probeErr.message}`);
+    }
+
+    const sourceUrl = toFalImageUrl(sourceAudio, "audio/mpeg");
+    const targetUrl = toFalImageUrl(targetVoiceAudio, "audio/mpeg");
+    const result = await falVoiceRequest("fal-ai/chatterbox/speech-to-speech", {
+      source_audio_url: sourceUrl,
+      target_voice_audio_url: targetUrl,
+    }, {
+      apiKey, costMeta: { runId, endpoint: "audio-mixer-revoice" },
+      flatCost: Number((estimatedMinutes * 0.015).toFixed(6)),
+      progressLabel: "Re-voicing your clip...",
+    });
+    // REAL BUG FOUND AND FIXED HERE: this used to hand Fal's raw result
+    // straight back with an assumed .mp3 label — but Fal's own real
+    // example response for this exact endpoint returns a .wav file
+    // (confirmed directly against fal's own schema docs), not mp3. A
+    // WAV's actual bytes wrapped in an "audio/mpeg" label plays fine in
+    // a browser (lenient content-sniffing) but fails strict validators
+    // like WhatsApp's, which check real file structure, not just the
+    // extension — this is exactly the reported symptom (rejected as
+    // "unsupported" even though it "said mp3"). Fixed the same way the
+    // ringtone maker's real m4r issue was: never trust a downloaded
+    // file matches its assumed format — re-encode it locally through
+    // the SAME real ffmpeg pipeline (proven working since the format-
+    // conversion tool) so the result is genuinely, verifiably a
+    // standard MP3, not just labeled as one.
+    const reencoded = await audioMixer.convertAudioFormat(result.url, "mp3");
+    const reencodedBuffer = fs.readFileSync(reencoded.filePath);
+    const dataUri = `data:audio/mpeg;base64,${reencodedBuffer.toString("base64")}`;
+    res.json({ audio: dataUri, audioUrl: result.url, runId });
+  } catch (error) {
+    console.error(`[Revoice] Failed: ${error.message}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+// ============================================================
+// STANDALONE TOOLS — real, offline, ffmpeg-backed utilities: format
+// conversion, extracting audio from a video, and a guided ringtone
+// maker. No Fal call, no API key needed for any of these — genuinely
+// free and local, unlike re-voicing above.
+// ============================================================
+// ============================================================
+// SELECTIVE RE-VOICE — the real, achievable version of "correct only
+// selected things." Chatterbox's own confirmed schema has no text-
+// prompt parameter (checked directly against fal's real docs — not
+// something to fake), so "give it a prompt to fix things" isn't
+// literally how voice conversion works. What IS real and buildable:
+// pick an exact region on the waveform, and either (a) re-voice just
+// that region (Chatterbox, on the extracted segment only) or (b)
+// replace just that region with freshly TTS-generated speech for
+// corrected text, in a real voice (standard or your own clone) — the
+// actual mechanism behind "prompt it to fix this part." Both splice
+// the result back into the untouched rest of the clip via
+// audio-mixer.js's spliceRegion, tested directly against real audio
+// (start/middle/end region cases all confirmed correct duration).
+// ============================================================
+app.post("/api/audio/mixer/revoice-region", async (req, res) => {
+  let runId;
+  try {
+    const { sourceAudio, targetVoiceAudio, regionStart, regionEnd, userApiKey, runId: clientRunId } = req.body;
+    if (!sourceAudio) return res.status(400).json({ error: "Missing the clip to edit." });
+    if (!targetVoiceAudio) return res.status(400).json({ error: "Missing a target voice reference." });
+    if (typeof regionStart !== "number" || typeof regionEnd !== "number" || regionEnd <= regionStart) {
+      return res.status(400).json({ error: "Pick a valid region (drag a selection on the waveform) first." });
+    }
+    const apiKey = userApiKey || process.env.FAL_KEY;
+    if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
+    runId = clientRunId || crypto.randomUUID();
+
+    // Extract just the selected region — same real trim primitive as
+    // the per-clip editor, not a special-case implementation.
+    const regionOnly = await audioMixer.editClip(sourceAudio, { trimStart: regionStart, trimEnd: regionEnd });
+    const regionAudioBuffer = fs.readFileSync(regionOnly.filePath);
+    const regionDataUri = `data:audio/mpeg;base64,${regionAudioBuffer.toString("base64")}`;
+
+    const estimatedMinutes = Math.max(0.05, (regionEnd - regionStart) / 60);
+    const sourceUrl = toFalImageUrl(regionDataUri, "audio/mpeg");
+    const targetUrl = toFalImageUrl(targetVoiceAudio, "audio/mpeg");
+    const converted = await falVoiceRequest("fal-ai/chatterbox/speech-to-speech", {
+      source_audio_url: sourceUrl,
+      target_voice_audio_url: targetUrl,
+    }, {
+      apiKey, costMeta: { runId, endpoint: "audio-mixer-revoice-region" },
+      flatCost: Number((estimatedMinutes * 0.015).toFixed(6)),
+      progressLabel: "Re-voicing the selected region...",
+    });
+
+    const spliced = await audioMixer.spliceRegion(sourceAudio, regionStart, regionEnd, converted.url);
+    const libraryItemId = saveLocalRenderToLibrary(spliced.filePath, `Region re-voiced (${regionStart.toFixed(1)}s-${regionEnd.toFixed(1)}s) — ${new Date().toLocaleString()}`);
+    res.json({ downloadUrl: `/api/flow/download/${spliced.filename}`, sizeBytes: spliced.sizeBytes, libraryItemId, runId });
+  } catch (error) {
+    if (runId) console.error(`[Revoice Region] Failed: ${error.message}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+app.post("/api/audio/mixer/correct-region", async (req, res) => {
+  let runId;
+  try {
+    const { sourceAudio, correctedText, modelId, voiceId, emotion, speed, pitch, regionStart, regionEnd, userApiKey, runId: clientRunId } = req.body;
+    if (!sourceAudio) return res.status(400).json({ error: "Missing the clip to edit." });
+    if (!correctedText || !correctedText.trim()) return res.status(400).json({ error: "Type the corrected text for this region." });
+    if (typeof regionStart !== "number" || typeof regionEnd !== "number" || regionEnd <= regionStart) {
+      return res.status(400).json({ error: "Pick a valid region (drag a selection on the waveform) first." });
+    }
+    const apiKey = userApiKey || process.env.FAL_KEY;
+    if (!apiKey) return res.status(401).json({ error: "Missing Fal API Key." });
+    runId = clientRunId || crypto.randomUUID();
+
+    const model = VOICE_MODELS.find((m) => m.id === modelId) || VOICE_MODELS.find((m) => m.id === "fal-ai/minimax/speech-02-hd");
+    if (!model) return res.status(400).json({ error: "No voice model available for correction." });
+    const input = model.buildInput(correctedText, { voiceId, emotion, speed, pitch });
+    const generated = await falVoiceRequest(model.id, input, {
+      apiKey, costMeta: { runId, endpoint: "audio-mixer-correct-region", model: model.id },
+      costPer1kChars: model.costPer1kChars,
+      textLength: correctedText.length,
+      progressLabel: "Generating corrected speech for this region...",
+    });
+    if (voiceId) { try { db.touchCustomVoiceLastUsed(voiceId); } catch {} } // harmless no-op if voiceId isn't actually a custom clone (e.g. a standard preset voice was used for the correction)
+
+    const spliced = await audioMixer.spliceRegion(sourceAudio, regionStart, regionEnd, generated.url);
+    const libraryItemId = saveLocalRenderToLibrary(spliced.filePath, `Region corrected (${regionStart.toFixed(1)}s-${regionEnd.toFixed(1)}s) — ${new Date().toLocaleString()}`);
+    res.json({ downloadUrl: `/api/flow/download/${spliced.filename}`, sizeBytes: spliced.sizeBytes, libraryItemId, runId });
+  } catch (error) {
+    if (runId) console.error(`[Correct Region] Failed: ${error.message}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+app.post("/api/audio/tools/convert-format", async (req, res) => {
+  try {
+    const { source, format } = req.body;
+    if (!source) return res.status(400).json({ error: "Missing a source clip to convert." });
+    if (!format) return res.status(400).json({ error: "Missing a target format." });
+    const result = await audioMixer.convertAudioFormat(source, format);
+    const libraryItemId = saveLocalRenderToLibrary(result.filePath, `Converted to ${format.toUpperCase()} — ${new Date().toLocaleString()}`);
+    res.json({ downloadUrl: `/api/flow/download/${result.filename}`, sizeBytes: result.sizeBytes, libraryItemId });
+  } catch (error) {
+    console.error(`[Tools] Format conversion failed: ${error.message}`);
+    res.status(503).json({ error: error.message });
+  }
+});
+app.post("/api/audio/tools/extract-from-video", async (req, res) => {
+  try {
+    const { source, format } = req.body;
+    if (!source) return res.status(400).json({ error: "Missing a video to extract audio from." });
+    const result = await audioMixer.extractAudioFromVideo(source, format || "mp3");
+    const libraryItemId = saveLocalRenderToLibrary(result.filePath, `Extracted from video — ${new Date().toLocaleString()}`);
+    res.json({ downloadUrl: `/api/flow/download/${result.filename}`, sizeBytes: result.sizeBytes, libraryItemId });
+  } catch (error) {
+    console.error(`[Tools] Video audio extraction failed: ${error.message}`);
+    res.status(503).json({ error: error.message });
+  }
+});
+app.post("/api/audio/tools/make-ringtone", async (req, res) => {
+  try {
+    const { source, trimStart, trimEnd, fadeIn, fadeOut, platform } = req.body;
+    if (!source) return res.status(400).json({ error: "Missing a source clip." });
+    const result = await audioMixer.makeRingtone(source, {
+      trimStart: typeof trimStart === "number" ? Math.max(0, trimStart) : 0,
+      trimEnd: typeof trimEnd === "number" ? trimEnd : undefined,
+      fadeIn: typeof fadeIn === "number" ? fadeIn : 0.5,
+      fadeOut: typeof fadeOut === "number" ? fadeOut : 1,
+      platform: platform === "ios" ? "ios" : "android",
+    });
+    const libraryItemId = saveLocalRenderToLibrary(result.filePath, `Ringtone (${platform === "ios" ? "iPhone" : "Android"}) — ${new Date().toLocaleString()}`);
+    res.json({ downloadUrl: `/api/flow/download/${result.filename}`, sizeBytes: result.sizeBytes, libraryItemId });
+  } catch (error) {
+    console.error(`[Tools] Ringtone creation failed: ${error.message}`);
+    res.status(503).json({ error: error.message });
+  }
+});
+app.post("/api/audio/mixer/render", async (req, res) => {
+  try {
+    const { introSource, mainTrackSources, outroSource, backgroundSource, backgroundVolume, backgroundDuck, overlays, mixDuration } = req.body;
+    if (!Array.isArray(mainTrackSources) || !mainTrackSources.length) {
+      return res.status(400).json({ error: "Main track needs at least 1 clip — add something from the library first." });
+    }
+    const layers = [];
+    if (backgroundSource) {
+      const normalizedBg = normalizeClientSource(backgroundSource);
+      const bgSource = typeof normalizedBg === "string" ? normalizedBg : normalizedBg.source;
+      const bgEdit = typeof normalizedBg === "object" ? normalizedBg.edit : null;
+      layers.push({ source: bgSource, edit: bgEdit, volume: typeof backgroundVolume === "number" ? Math.min(1, Math.max(0, backgroundVolume)) : 0.25, delaySeconds: 0, loop: true, duck: !!backgroundDuck });
+    }
+    if (Array.isArray(overlays)) {
+      overlays.filter((o) => o?.source).forEach((o) => {
+        const normalized = normalizeClientSource(o);
+        const src = typeof normalized === "string" ? normalized : normalized.source;
+        const edit = typeof normalized === "object" ? normalized.edit : null;
+        layers.push({
+          source: src,
+          edit,
+          volume: typeof o.volume === "number" ? Math.min(1, Math.max(0, o.volume)) : 0.8,
+          delaySeconds: typeof o.delaySeconds === "number" ? Math.max(0, o.delaySeconds) : 0,
+          loop: false,
+        });
+      });
+    }
+    const result = await audioMixer.renderMixConsole({
+      introSource: introSource ? normalizeClientSource(introSource) : null,
+      mainTrackSources: mainTrackSources.map(normalizeClientSource).filter(Boolean),
+      outroSource: outroSource ? normalizeClientSource(outroSource) : null,
+      layers,
+      mixDuration: mixDuration === "full" ? "full" : "matchMain",
+    });
+    // Real fix for "what if I want to edit the final output": a render
+    // used to be a dead end — the only way to change anything about it
+    // was to rebuild the whole main track/background/overlay setup from
+    // scratch. Auto-saving the actual rendered result back into the
+    // SAME Audio Library everything else lives in (as a new "mix" type)
+    // means it's immediately available to load into the Main Track (or
+    // as a new Background, Intro, Outro, or Overlay) and get the exact
+    // same real editing tools — trim, reverse, speed, loop, fades,
+    // silence removal — applied to the finished mix itself, then
+    // rendered again. A real bounce-and-refine cycle, not a one-shot.
+    let libraryItemId = null;
+    try {
+      const audioBuffer = fs.readFileSync(result.filePath);
+      const audioDataUri = `data:audio/mpeg;base64,${audioBuffer.toString("base64")}`;
+      libraryItemId = db.saveAudioLibraryItem({
+        type: "mix",
+        name: `Mixed output — ${new Date().toLocaleString()}`,
+        audioDataUri,
+      });
+    } catch (saveErr) {
+      console.warn(`[Mixer] Render succeeded but auto-save to library failed: ${saveErr.message}`); // never fail the actual render over a library-save hiccup — the download link still works either way
+    }
+    res.json({ downloadUrl: `/api/flow/download/${result.filename}`, sizeBytes: result.sizeBytes, libraryItemId });
+  } catch (error) {
+    console.error(`[Mixer] Render failed: ${error.message}`);
+    res.status(503).json({ error: error.message });
   }
 });
 
@@ -5560,9 +6119,13 @@ app.post("/api/music/generate-variations", async (req, res) => {
             flatCost: model.costPerGeneration || 0.05,
           });
           const dataUri = await downloadImageAsDataUri(result.url);
-          return { ...direction, audio: dataUri, modelUsed: model.id, error: null };
+          // REAL FIX, same bug class as Voice Studio's takes: durationMs
+          // was computed but discarded — for music this matters even
+          // more, since several models take a requested durationSeconds
+          // INPUT with no confirmation the actual output honored it.
+          return { ...direction, audio: dataUri, durationMs: result.durationMs ?? null, requestedDurationSeconds: model.supportsDuration ? parseInt(durationSeconds) || null : null, modelUsed: model.id, error: null };
         } catch (err) {
-          return { ...direction, audio: null, modelUsed: model.id, error: err.message };
+          return { ...direction, audio: null, durationMs: null, modelUsed: model.id, error: err.message };
         }
       }),
     );
@@ -5774,7 +6337,12 @@ app.post("/api/music/generate", async (req, res) => {
     });
     progress.finishProgress(runId);
     const dataUri = await downloadImageAsDataUri(result.url);
-    res.json({ audio: dataUri, modelUsed: model.id, replacementNote: musicReplacementNote });
+    // REAL FIX, same bug: durationMs computed then discarded.
+    res.json({
+      audio: dataUri, modelUsed: model.id, replacementNote: musicReplacementNote,
+      durationMs: result.durationMs ?? null,
+      requestedDurationSeconds: knownModel?.supportsDuration ? parseInt(durationSeconds) || null : null,
+    });
   } catch (error) {
     if (runId) progress.finishProgress(runId);
     console.error(`[Music] Generation failed: ${error.message}`);
@@ -5841,7 +6409,9 @@ app.post("/api/sfx/generate", async (req, res) => {
     });
     progress.finishProgress(runId);
     const dataUri = await downloadImageAsDataUri(result.url);
-    res.json({ audio: dataUri, modelUsed: model.id });
+    // REAL FIX, same bug: SFX has a real requested-duration slider input
+    // (durationSeconds) but never confirmed actual output length matched it.
+    res.json({ audio: dataUri, modelUsed: model.id, durationMs: result.durationMs ?? null, requestedDurationSeconds: parseInt(durationSeconds) || null });
   } catch (error) {
     if (runId) progress.finishProgress(runId);
     console.error(`[SFX] Generation failed: ${error.message}`);

@@ -20,7 +20,7 @@ const db = require("./db");
 const { falVoiceRequest } = require("./fal-client");
 const { VOICE_MODELS, isIndianLanguage } = require("./fal-models");
 // No circular dependency: fal-catalog.js never requires this file back.
-const { getLiveStatus } = require("./fal-catalog");
+const { getLiveStatus, getDiscoveredModels } = require("./fal-catalog");
 
 const CACHE_KEY = "voice_catalog_verification_cache";
 const FRESHNESS_MS = 14 * 24 * 60 * 60 * 1000; // 14 days — voices don't change as often as the broader model catalog
@@ -269,7 +269,7 @@ function withLiveDiscoveredData(model) {
 // so the picker leads with them, per the actual real ask, rather than
 // leaving that entirely to alphabetical/registry-insertion order.
 function getVerifiedVoiceModels() {
-  return VOICE_MODELS.map((rawModel) => {
+  const curated = VOICE_MODELS.map((rawModel) => {
     const model = withLiveDiscoveredData(rawModel);
     if (!model.confirmedVoiceIds?.length) return model;
     const filtered = model.confirmedVoiceIds.filter((voice) => {
@@ -277,7 +277,89 @@ function getVerifiedVoiceModels() {
       return !result || result.working !== false; // keep if unchecked or working; drop only on confirmed failure
     });
     return { ...model, confirmedVoiceIds: filtered };
-  }).sort((a, b) => (b.indianLanguageCoverage?.length || 0) - (a.indianLanguageCoverage?.length || 0));
+  });
+  return [...curated, ...getDiscoveredVoiceModels()]
+    .sort((a, b) => (b.indianLanguageCoverage?.length || 0) - (a.indianLanguageCoverage?.length || 0));
+}
+
+// ============================================================
+// DISCOVERED VOICE MODELS — the actual fix for "I've seen many Indian
+// voices on Fal, our app has none": the model-discovery system
+// (fal-catalog.js) already classifies any Fal model as mediaType
+// "audio" from its own category label, and already extracts real
+// voice/language/emotion enums from ANY model's live schema (see
+// fal-schema-utils.js's generic enum extraction) — for image and video,
+// that discovered data was already wired into GET /api/models; for
+// voice, it silently never was, so any TTS model on Fal that isn't in
+// this file's hand-curated VOICE_MODELS array — including a dedicated
+// Indian-language one added to Fal after this list was last updated —
+// was invisible no matter how "dynamic" the underlying discovery
+// already was.
+//
+// A discovered model that has a real detected voiceOptions enum is
+// treated as a genuine voice/TTS model (music/SFX audio models don't
+// expose a voice selector at all, so this is a real, not guessed,
+// distinguishing signal) and given a GENERIC buildInput — built from
+// the exact field names its own live schema reports (including one
+// level of nesting, the same real pattern MiniMax's own schema uses
+// for voice_setting.voice_id) — rather than a hand-written one, since
+// nobody has manually researched this specific model's conventions yet.
+// Honestly labeled: markupTagMode "unsupported" (no evidence either way
+// that it takes stage-direction tags — assuming it does would be a
+// fabrication) and costUnconfirmed, matching the exact same honesty
+// convention already used for discovered image/video models.
+// ============================================================
+function setNestedField(obj, path, value) {
+  const parts = path.split(".");
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    cur[parts[i]] = cur[parts[i]] || {};
+    cur = cur[parts[i]];
+  }
+  cur[parts[parts.length - 1]] = value;
+}
+function buildGenericVoiceInput(schemaInfo) {
+  return (text, { voiceId, language, emotion } = {}) => {
+    const textField = schemaInfo.allFields?.includes("text") ? "text" : "prompt";
+    const input = { [textField]: text };
+    if (voiceId && schemaInfo.voiceOptions?.field) setNestedField(input, schemaInfo.voiceOptions.field, voiceId);
+    if (language && schemaInfo.languageOptions?.field && (schemaInfo.languageOptions.options || []).includes(language)) {
+      setNestedField(input, schemaInfo.languageOptions.field, language);
+    }
+    if (emotion && schemaInfo.emotionOptions?.field && (schemaInfo.emotionOptions.options || []).includes(emotion)) {
+      setNestedField(input, schemaInfo.emotionOptions.field, emotion);
+    }
+    return input;
+  };
+}
+function discoveredVoiceModelToEntry(m) {
+  const schemaInfo = m.schemaInfo || {};
+  const confirmedLanguages = schemaInfo.languageOptions?.options || null;
+  return {
+    id: m.id,
+    label: `${m.guideMetadata?.displayName || m.id} 🆕 discovered — not yet manually verified`,
+    discovered: true,
+    costUnconfirmed: true,
+    costPer1kChars: 0.05, // unconfirmed placeholder, same convention as discovered image models' costPerImage
+    markupTagMode: "unsupported",
+    confirmedVoiceIds: (schemaInfo.voiceOptions?.options || []).map((id) => ({ id, description: null, source: "discovered" })),
+    confirmedLanguages,
+    confirmedEmotions: schemaInfo.emotionOptions?.options || null,
+    supportsEmotionPitchSpeed: false,
+    voiceInputMode: schemaInfo.voiceOptions?.options?.length ? "list" : "freeform",
+    buildInput: buildGenericVoiceInput(schemaInfo),
+    indianLanguageCoverage: (confirmedLanguages || []).filter(isIndianLanguage),
+    voiceDiscovery: { curatedVoiceCount: 0, liveDiscoveredVoiceCount: schemaInfo.voiceOptions?.options?.length || 0 },
+  };
+}
+function getDiscoveredVoiceModels() {
+  try {
+    return getDiscoveredModels({ mediaType: "audio" })
+      .filter((m) => m.schemaInfo?.voiceOptions?.options?.length) // real, detected voice enum required — this is what tells a TTS model apart from music/SFX in the same "audio" bucket
+      .map(discoveredVoiceModelToEntry);
+  } catch {
+    return []; // discovery cache not ready yet (e.g. right after a fresh server start) — curated list alone is still returned correctly
+  }
 }
 
 // Real, specific entries — not just a count — for surfacing in the

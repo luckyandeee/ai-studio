@@ -1389,11 +1389,26 @@ const VOICE_MODELS = [
     // still rated competitively on naturalness in Fal's own review.
     id: "fal-ai/inworld-tts",
     markupTagMode: "unsupported",
-    label: "Inworld TTS-1.5 Max — lowest confirmed cost, low-latency, 15 languages",
+    label: "Inworld TTS-1.5 Max — lowest confirmed cost, low-latency, 15 languages incl. Hindi",
     costPer1kChars: 0.01,
     bestFor: "cost-sensitive narration at real scale — cheapest confirmed option here while still rated competitively on naturalness",
     markupHint: "No confirmed stage-direction or tone-tag support for this model — anything in *asterisks* will be removed entirely, not spoken. Switch to MiniMax (sound cues) or ElevenLabs/Gemini TTS (descriptive tags) if you need expressive markup.",
     supportsEmotionPitchSpeed: false,
+    // Confirmed directly from Inworld's own docs (docs.inworld.ai/tts/
+    // capabilities/multilingual) AND fal's own announcement post: real
+    // 15-language support (Arabic, Chinese, Dutch, English, French,
+    // German, Hebrew, Hindi, Italian, Japanese, Korean, Polish,
+    // Portuguese, Russian, Spanish) — including Hindi, closing a real
+    // gap this model previously had no language data for at all. No
+    // confirmed dedicated language-selector PARAMETER on this exact Fal
+    // endpoint though (same honest distinction as ElevenLabs below) —
+    // it appears to work from the text's own script directly, so this
+    // is autoDetectedLanguagesSupported, not confirmedLanguages (a real
+    // selectable parameter), which are genuinely different things.
+    autoDetectedLanguagesSupported: [
+      "Arabic", "Chinese", "Dutch", "English", "French", "German", "Hebrew", "Hindi",
+      "Italian", "Japanese", "Korean", "Polish", "Portuguese", "Russian", "Spanish",
+    ],
     // HONEST, deliberately conservative: "Craig (en)" is the only voice
     // name directly confirmed in Fal's own real example payload for
     // THIS specific endpoint. A fuller voice list exists on a different

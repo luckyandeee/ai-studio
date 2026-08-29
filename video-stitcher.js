@@ -25,11 +25,22 @@ const crypto = require("crypto");
 const { fal } = require("@fal-ai/client");
 const { withConcurrencyLimit } = require("./fal-client");
 
-let ffmpegAvailableCache = null; // cached after first real check — avoids re-spawning a process on every single request
+// Same real npm-native fix as audio-mixer.js: a prebuilt ffmpeg binary
+// installed automatically via `npm install`, not a manual OS-level
+// step. Falls back to a system "ffmpeg" on PATH only if the bundled
+// one doesn't run on this platform/arch.
+let ffmpegStaticPath = null;
+try {
+  ffmpegStaticPath = require("ffmpeg-static");
+} catch {}
+
+let ffmpegAvailableCache = null;
+let resolvedFfmpegBinary = null;
 
 function runFfmpeg(args) {
+  const binary = resolvedFfmpegBinary || ffmpegStaticPath || "ffmpeg";
   return new Promise((resolve, reject) => {
-    execFile("ffmpeg", args, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
+    execFile(binary, args, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
       if (err) return reject(new Error(`ffmpeg failed: ${stderr?.slice(-2000) || err.message}`));
       resolve({ stdout, stderr });
     });
@@ -38,8 +49,17 @@ function runFfmpeg(args) {
 
 async function checkFfmpegAvailable() {
   if (ffmpegAvailableCache !== null) return ffmpegAvailableCache;
+  if (ffmpegStaticPath) {
+    try {
+      await new Promise((resolve, reject) => execFile(ffmpegStaticPath, ["-version"], (err) => (err ? reject(err) : resolve())));
+      resolvedFfmpegBinary = ffmpegStaticPath;
+      ffmpegAvailableCache = true;
+      return true;
+    } catch {}
+  }
   try {
-    await runFfmpeg(["-version"]);
+    await new Promise((resolve, reject) => execFile("ffmpeg", ["-version"], (err) => (err ? reject(err) : resolve())));
+    resolvedFfmpegBinary = "ffmpeg";
     ffmpegAvailableCache = true;
   } catch {
     ffmpegAvailableCache = false;

@@ -55,6 +55,63 @@ let state = {
   batchFrameModels: [], // per-product image model override, batch mode, index-matched to batchItems
   videoBriefModels: {}, // draftKey -> videoModel override
 };
+// ============================================================
+// GLOBAL AUDIO COORDINATION — real fix for a real gap: this app has
+// many independent audio surfaces (Voice Studio takes, Song Studio
+// results, SFX results, Voice Clone previews, Flow Studio's narration/
+// BGM/talking-video previews, and the Mixer's own shared preview
+// player) — none of them coordinated with each other, so playing one
+// never stopped another, and multiple clips could overlap.
+//
+// Two real mechanisms, because they're genuinely different kinds of
+// audio elements:
+//  1. A capture-phase "play" listener on document — real DOM <audio>
+//     elements (every take/result player, static or dynamically
+//     rendered via innerHTML) all bubble/capture through the document
+//     tree, so one listener here catches every one of them, present
+//     now or added later, with no per-render wiring needed.
+//  2. playAudioExclusively() — for JS-created `new Audio()` instances
+//     (never attached to the DOM, so their events do NOT reach
+//     document — a real, easy-to-miss browser behavior, not a bug in
+//     this approach) — a single shared instance reused everywhere
+//     instead of each call site creating its own untracked one.
+// Each direction explicitly stops the other kind too, so no matter
+// which one starts, everything else really does stop.
+// ============================================================
+let globalPreviewAudio = null;
+function stopAllDomAudioExcept(exceptEl) {
+  document.querySelectorAll("audio").forEach((a) => {
+    if (a !== exceptEl && !a.paused) a.pause();
+  });
+}
+document.addEventListener("play", (e) => {
+  if (e.target.tagName !== "AUDIO") return;
+  stopAllDomAudioExcept(e.target);
+  if (globalPreviewAudio && globalPreviewAudio !== e.target && !globalPreviewAudio.paused) globalPreviewAudio.pause();
+  if (typeof mixerPreviewAudio !== "undefined" && mixerPreviewAudio && mixerPreviewAudio !== e.target && !mixerPreviewAudio.paused) {
+    mixerPreviewAudio.pause();
+    mixerPreviewKey = null;
+    if (typeof updateMixerPreviewButtons === "function") updateMixerPreviewButtons();
+    if (typeof stopPlayheadTracking === "function") stopPlayheadTracking();
+  }
+}, true); // capture phase — HTML5 media "play" events don't bubble, so this is the only way one listener catches every audio element
+// Shared exclusive player for one-shot JS-created previews (voice
+// preview cache, etc.) — replaces each call site's own untracked
+// `new Audio(src).play()`, so these now stop real DOM players (and
+// vice versa) instead of silently overlapping them.
+function playAudioExclusively(src) {
+  stopAllDomAudioExcept(null);
+  if (typeof mixerPreviewAudio !== "undefined" && mixerPreviewAudio && !mixerPreviewAudio.paused) {
+    mixerPreviewAudio.pause();
+    mixerPreviewKey = null;
+    if (typeof updateMixerPreviewButtons === "function") updateMixerPreviewButtons();
+    if (typeof stopPlayheadTracking === "function") stopPlayheadTracking();
+  }
+  if (globalPreviewAudio) globalPreviewAudio.pause();
+  globalPreviewAudio = new Audio(src);
+  globalPreviewAudio.play();
+  return globalPreviewAudio;
+}
 const dom = {
   studioForm: document.getElementById("studioForm"),
   imageInput: document.getElementById("imageInput"),
@@ -140,6 +197,7 @@ const dom = {
   singleProductRow: document.getElementById("singleProductRow"),
   batchModeRow: document.getElementById("batchModeRow"),
   wizardModeRow: document.getElementById("wizardModeRow"),
+  audioModeRow: document.getElementById("audioModeRow"),
   wizardModeNavBtn: document.getElementById("wizardModeNavBtn"),
   batchForm: document.getElementById("batchForm"),
   batchImageInput: document.getElementById("batchImageInput"),
@@ -1272,6 +1330,7 @@ async function loadModelRegistry() {
     state.musicGenrePresets = data.musicGenrePresets || [];
     state.voiceoverLanguages = data.voiceoverLanguages || [];
     state.scriptRanges = data.scriptRanges || {};
+    populateVoiceRequirementLanguages();
     state.talkingAvatarModels = data.talkingAvatarModels || [];
     populateMusicModelSelects();
     renderSongArchitect();
@@ -1518,28 +1577,32 @@ function insertAtCursor(textarea, insertText, { padWithSpaces = true } = {}) {
 // an "unsupported" model shows no buttons at all and says so plainly,
 // rather than offering controls that would silently do nothing.
 const FREEFORM_TAG_SUGGESTIONS = ["whispers", "excited", "sarcastic", "confident", "dramatically", "sadly", "slowly", "shouting", "laughing", "sighs"];
-function buildVoiceMarkupToolbarHtml(model) {
+function buildVoiceMarkupToolbarHtml(model, line) {
   if (!model) return "";
+  // Unified control, same input for every model — what differs is
+  // honestly what happens to it per model's real capability (see
+  // /api/voice/suggest-markup), not the UI paradigm itself.
+  const intentionInput = `<input type="text" class="form-control form-control-sm mt-1" data-line-field="intention" placeholder="Describe the intention/feeling (e.g. reluctant, a little sad, rushed)..." value="${escapeHtml(line?.intention || "")}">`;
   if (model.markupTagMode === "unsupported") {
-    return `<div class="xx-small text-muted mt-1">🚫 This model doesn't support any delivery/pause tags — anything you insert will be silently removed, not spoken.</div>`;
+    return `${intentionInput}<div class="xx-small text-muted mt-1">🚫 This model has no confirmed way to express emotion, tone, or intention at all — whatever you type above can't reach the audio. Switch to MiniMax, ElevenLabs, or Gemini TTS on this line to use it.</div>`;
   }
   const pauseBtn = `<button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" data-markup-insert="*2 second pause*" title="Insert a 2-second pause">⏸ Pause</button>`;
-  // The "smart" layer: one click hands the WHOLE line to the AI director
-  // instead of clicking a tag per word/phrase — see /api/voice/suggest-
-  // markup, which is constrained to this exact model's real tag
-  // vocabulary so it can never suggest something that gets silently
-  // stripped on generation.
-  const aiSuggestBtn = `<button type="button" class="btn btn-sm btn-outline-primary py-0 px-1" data-markup-ai-suggest="1" title="Let the AI mark up this whole line for you">🪄 AI Suggest</button>`;
+  // The "smart" layer: hands the WHOLE line + the intention above to the
+  // AI director instead of clicking a tag per word/phrase — see
+  // /api/voice/suggest-markup, constrained to this exact model's real
+  // tag vocabulary (and, for MiniMax, its real confirmed emotion list
+  // too) so it can never suggest something that gets silently stripped.
+  const aiSuggestBtn = `<button type="button" class="btn btn-sm btn-outline-primary py-0 px-1" data-markup-ai-suggest="1" title="Direct this whole line using the intention above">🪄 Apply Intention</button>`;
   if (model.markupTagMode === "fixed") {
     const tagButtons = (model.fixedMarkupTags || [])
       .map((t) => `<button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" data-markup-insert="*${escapeHtml(t)}*">🗣 ${escapeHtml(t)}</button>`)
       .join("");
-    return `<div class="d-flex flex-wrap gap-1 mt-1 mb-1">${pauseBtn}${tagButtons}${aiSuggestBtn}</div><div class="xx-small text-muted mb-1">Only these real sound cues are actually spoken by this model — click one to insert it at your cursor, or select a word/phrase first to keep it and tag right before it.</div>`;
+    return `${intentionInput}<div class="d-flex flex-wrap gap-1 mt-1 mb-1">${pauseBtn}${tagButtons}${aiSuggestBtn}</div><div class="xx-small text-muted mb-1">Only these real sound cues are actually spoken by this model — "Apply Intention" also picks the closest real confirmed emotion for you.</div>`;
   }
   const tagButtons = FREEFORM_TAG_SUGGESTIONS
     .map((t) => `<button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" data-markup-insert="*${t}*">💬 ${t}</button>`)
     .join("");
-  return `<div class="d-flex flex-wrap gap-1 mt-1 mb-1">${pauseBtn}${tagButtons}<button type="button" class="btn btn-sm btn-outline-primary py-0 px-1" data-markup-custom="1">✏️ Custom...</button>${aiSuggestBtn}</div><div class="xx-small text-muted mb-1">This model reads any descriptive tag directly — the buttons above are a starting point, "Custom..." accepts your own, or select a word/phrase first to tag right before it.</div>`;
+  return `${intentionInput}<div class="d-flex flex-wrap gap-1 mt-1 mb-1">${pauseBtn}${tagButtons}<button type="button" class="btn btn-sm btn-outline-primary py-0 px-1" data-markup-custom="1">✏️ Custom...</button>${aiSuggestBtn}</div><div class="xx-small text-muted mb-1">This model reads any descriptive tag directly — "Apply Intention" turns the text above into real delivery cues for this exact line.</div>`;
 }
 
 // Renders detectSchema()'s real output as readable badges — this is
@@ -2465,6 +2528,21 @@ async function runSfxRefine(answers = null) {
     btn.textContent = "✨ Describe it your way — I'll turn it into a professional sound-design prompt";
   }
 }
+// Shared across music/SFX results — same "durationMs computed but
+// discarded" bug existed in all three generation routes (song single,
+// song variations, SFX), now fixed server-side; this renders it
+// consistently, and flags when a model with a real requestedDuration
+// INPUT didn't actually honor it (a genuine mismatch worth knowing
+// about, not just cosmetic).
+function formatDurationNote(durationMs, requestedDurationSeconds) {
+  if (!durationMs) return `<div class="xx-small text-muted fst-italic">duration not reported by this model</div>`;
+  const actualSeconds = durationMs / 1000;
+  if (requestedDurationSeconds) {
+    const off = Math.abs(actualSeconds - requestedDurationSeconds) > requestedDurationSeconds * 0.3;
+    return `<div class="xx-small ${off ? "text-danger fw-semibold" : "text-muted"}">${actualSeconds.toFixed(1)}s${off ? ` ⚠️ (asked for ${requestedDurationSeconds}s)` : ` (requested ${requestedDurationSeconds}s)`}</div>`;
+  }
+  return `<div class="xx-small text-muted">${actualSeconds.toFixed(1)}s</div>`;
+}
 document.getElementById("sfxRefineBtn")?.addEventListener("click", () => runSfxRefine());
 
 document.getElementById("sfxGenerateBtn")?.addEventListener("click", async () => {
@@ -2491,7 +2569,8 @@ document.getElementById("sfxGenerateBtn")?.addEventListener("click", async () =>
     saveToAudioLibrary({ type: "sfx", name: `SFX — ${prompt.slice(0, 40)}${prompt.length > 40 ? "..." : ""}`, audioDataUri: data.audio, modelUsed: data.modelUsed, runId, silent: true });
     resultEl.innerHTML = `
       <audio controls class="w-100 mb-2" src="${data.audio}"></audio>
-      <a href="${data.audio}" data-download-url="${data.audio}" data-download-filename="sfx-${Date.now()}.wav" class="btn btn-sm btn-dark fw-bold w-100">⬇️ Download</a>
+      ${formatDurationNote(data.durationMs, data.requestedDurationSeconds)}
+      <a href="${data.audio}" data-download-url="${data.audio}" data-download-filename="sfx-${Date.now()}.wav" class="btn btn-sm btn-dark fw-bold w-100 mt-1">⬇️ Download</a>
     `;
     logActivity("success", "Sound effect generated.");
   } catch (err) {
@@ -3430,6 +3509,101 @@ document.getElementById("flowModeNavBtn")?.addEventListener("click", () => {
   showAppMode("flow");
   populateFlowAudioModelSelects(); // real fix: this was defined but never actually called, so the narration/BGM dropdowns would have stayed empty
 });
+document.getElementById("audioModeNavBtn")?.addEventListener("click", () => showAppMode("audio"));
+// ============================================================
+// AUDIO STUDIO SECTION SWITCHER — deliberately plain radio button-group
+// + .d-none toggling, not Bootstrap's Tab component. Audio Studio used
+// to look like "some tab thing" sitting inside a modal; now that it's a
+// real page mode like Single/Batch/Flow, its internal section switch
+// should read as a segmented control on a page, not a tab bar — the
+// same visual language the rest of the app already avoids using for
+// primary navigation.
+// ============================================================
+document.getElementById("audioStudioSwitcher")?.addEventListener("change", (e) => {
+  const sectionId = document.querySelector(`label[for="${e.target.id}"]`)?.getAttribute("data-audio-section");
+  if (!sectionId) return;
+  ["voiceStudioTabPane", "songStudioModal", "mixerConsoleTabPane", "audioToolsTabPane"].forEach((id) => {
+    document.getElementById(id)?.classList.toggle("d-none", id !== sectionId);
+  });
+  if (sectionId === "songStudioModal") state.songStudioRunId = crypto.randomUUID();
+  if (sectionId === "mixerConsoleTabPane") {
+    // Real fix: restoring here needs to happen exactly ONCE per page
+    // load, not every time this tab is switched to — otherwise
+    // switching away and back mid-edit (before the 600ms debounced
+    // save fires) would silently overwrite fresh in-progress changes
+    // with a stale saved copy, a real data-loss bug of its own.
+    if (!state.mixerSessionRestored) {
+      state.mixerSessionRestored = true;
+      restoreMixerSession().then(() => {
+        renderMixerMainTrack();
+        renderMixerBackground();
+        renderMixerOverlays();
+        renderMixerIntroOutro();
+      });
+    } else {
+      loadMixerLibrary();
+      renderMixerMainTrack();
+      renderMixerBackground();
+      renderMixerOverlays();
+      renderMixerIntroOutro();
+    }
+  }
+  if (sectionId === "audioToolsTabPane") populateAudioToolsLibrarySelects();
+});
+// ============================================================
+// NEW SESSION — real reset, not just a visual clear: Audio Studio's
+// state is genuinely session-based (Voice Studio's script persists to
+// localStorage, the Mixer's Main Track/Intro/Outro/Background/Overlays
+// live in memory for as long as the tab's open) — this wipes all of
+// it in one place instead of manually deleting every line and clip.
+// Doesn't touch the Audio Library itself (nothing already generated or
+// saved is deleted) — only the CURRENT working session's arrangement.
+// ============================================================
+document.getElementById("audioStudioNewSessionBtn")?.addEventListener("click", () => {
+  if (!confirm("Start a new session? This clears the current Voice Studio script and everything loaded into the Mixer (Main Track, Intro, Outro, Background, Overlays). Nothing in your Audio Library gets deleted — only this session's current arrangement.")) return;
+  // Voice Studio — real reset, including the persisted copy, not just
+  // the in-memory one (otherwise reopening the modal would silently
+  // restore the "cleared" script from localStorage).
+  localStorage.removeItem("voiceScriptSession");
+  state.voiceScript = { lines: [newVoiceScriptLine()], runId: crypto.randomUUID() };
+  renderVoiceScript();
+  document.getElementById("voiceScriptCombineResult").innerHTML = "";
+  // Mixer — clears every slot back to empty, including the persisted
+  // copy (otherwise the old arrangement would silently come back on
+  // the next reload, since only the in-memory state would be cleared).
+  localStorage.removeItem("mixerSession");
+  state.mixerSessionRestored = true; // explicit, defensive — prevents any later first-visit-to-Mixer this session from attempting a restore after an intentional reset (the localStorage clear above already makes that a no-op regardless, but this is the clearer signal)
+  state.mixerMainTrack = [];
+  state.mixerIntro = null;
+  state.mixerOutro = null;
+  state.mixerBackground = null;
+  state.mixerOverlays = [];
+  renderMixerMainTrack();
+  renderMixerIntroOutro();
+  renderMixerBackground();
+  renderMixerOverlays();
+  const mixerResultEl = document.getElementById("mixerRenderResult");
+  if (mixerResultEl) mixerResultEl.innerHTML = "";
+  // Song Studio — clears the working fields, fresh run ID for whatever
+  // gets generated next.
+  ["songStylePrompt", "songLyricsPrompt", "songStoryPrompt"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.value = "";
+  });
+  const songResultEl = document.getElementById("songStudioResult");
+  if (songResultEl) songResultEl.innerHTML = "";
+  state.songStudioRunId = crypto.randomUUID();
+  // Audio Tools — clears any staged uploads so a stale file from a
+  // previous session isn't silently reused.
+  state.audioToolsUploads = {};
+  document.querySelectorAll('#audioToolsTabPane input[type="file"]').forEach((input) => { input.value = ""; });
+  document.querySelectorAll('#audioToolsTabPane [id$="UploadStatus"]').forEach((el) => { el.textContent = ""; });
+  ["toolsExtractResult", "toolsConvertResult", "toolsRingtoneResult", "toolsRevoiceResult"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = "";
+  });
+  logActivity("success", "Audio Studio session cleared — starting fresh.");
+});
 // The new choice-screen landing view — each card is a one-way jump into
 // that mode; "Home" (nav button + brand link) is the one-way jump back,
 // replacing the old toggle-back-to-single-on-second-click behavior now
@@ -3447,14 +3621,25 @@ document.getElementById("homeNavBrand")?.addEventListener("click", (e) => {
   e.preventDefault();
   showAppMode("home");
 });
-// Shared 5-way mode switcher (home/single/batch/wizard/flow) — only one
-// visible at a time. "home" is the choice-screen landing view.
+// Shared 6-way mode switcher (home/single/batch/wizard/flow/audio) —
+// only one visible at a time. "home" is the choice-screen landing view.
+// Audio Studio used to be a Bootstrap modal — now it's a real page mode
+// like every other one here, not "some tab thing or modal thing" sitting
+// on top of the page. The 6 init listeners that used to fire on the
+// modal's own "show.bs.modal" event (fresh run ID, live voice-catalog
+// recheck, populating dropdowns, etc.) still exist completely unchanged
+// — rather than rewriting each one's internal logic, this just keeps
+// dispatching that exact same event on the (renamed) container element
+// every time Audio mode is entered, so all of them keep firing exactly
+// as before with zero risk of subtly changing what any of them do.
 function showAppMode(mode) {
   document.getElementById("modeChoiceScreen")?.classList.toggle("d-none", mode !== "home");
   dom.singleProductRow.classList.toggle("d-none", mode !== "single");
   dom.batchModeRow.classList.toggle("d-none", mode !== "batch");
   dom.wizardModeRow.classList.toggle("d-none", mode !== "wizard");
   document.getElementById("flowModeRow")?.classList.toggle("d-none", mode !== "flow");
+  dom.audioModeRow?.classList.toggle("d-none", mode !== "audio");
+  if (mode === "audio") dom.audioModeRow?.dispatchEvent(new Event("show.bs.modal"));
   if (mode !== "home") window.scrollTo({ top: 0, behavior: "smooth" });
 }
 // ============================================================
@@ -4409,10 +4594,10 @@ state.voicePreviewCache = state.voicePreviewCache || {};
 // time the modal opens — reused across prepare-text/auto-tag/generate
 // calls made while it's open, so "cost of this voiceover" is one real,
 // joinable number instead of several disconnected ledger rows.
-document.getElementById("voiceStudioModal")?.addEventListener("show.bs.modal", () => {
+document.getElementById("audioModeRow")?.addEventListener("show.bs.modal", () => {
   state.voiceStudioRunId = crypto.randomUUID();
 });
-document.getElementById("voiceStudioModal")?.addEventListener("show.bs.modal", async () => {
+document.getElementById("audioModeRow")?.addEventListener("show.bs.modal", async () => {
   const userKey = getUserKey();
   if (!userKey) return; // nothing to verify against without a key — the manual recheck button still explains this if they try it directly
   const statusEl = document.getElementById("voiceStudioRecheckStatus");
@@ -4764,15 +4949,19 @@ document.getElementById("voiceCloneSubmitBtn")?.addEventListener("click", async 
     toggleStatusView(false);
   }
 });
-document.getElementById("voiceStudioModal")?.addEventListener("show.bs.modal", renderSavedCustomVoices);
+document.getElementById("audioModeRow")?.addEventListener("show.bs.modal", renderSavedCustomVoices);
 
 // ============================================================
 // SONG STUDIO
 // ============================================================
 // One shared run_id for this Song Studio session, minted fresh every
-// time the modal opens — reused across write-lyrics and generate so
-// "cost of this song" is one real number, not two disconnected rows.
-document.getElementById("songStudioModal")?.addEventListener("show.bs.modal", () => {
+// time Audio Studio is entered — reused across write-lyrics and
+// generate so "cost of this song" is one real number, not two
+// disconnected rows. The Song section itself also mints a fresh one
+// when switched to directly (see audioStudioSwitcher's change handler
+// above) — this one covers arriving with the Song section already
+// selected from a page reload or direct mode entry.
+document.getElementById("audioModeRow")?.addEventListener("show.bs.modal", () => {
   state.songStudioRunId = crypto.randomUUID();
 });
 document.getElementById("songStylePrompt")?.addEventListener("input", (e) => {
@@ -4903,7 +5092,7 @@ async function loadAudioLibrary() {
         : `<p class="text-muted small mb-0">Nothing here yet — everything you generate in Voice Studio, Song Studio, or Sound Effects is saved here automatically.</p>`;
       return;
     }
-    const typeIcon = { voice: "🎙️", song: "🎵", sfx: "🔊" };
+    const typeIcon = { voice: "🎙️", song: "🎵", sfx: "🔊", upload: "📁", mix: "🎛️" };
     listEl.innerHTML = items.map((item) => `
       <div class="border rounded p-2 mb-2" data-audio-item-id="${item.id}">
         <div class="d-flex justify-content-between align-items-center">
@@ -4981,7 +5170,7 @@ document.getElementById("songGenerateVariationsBtn")?.addEventListener("click", 
           </div>
         </div>
         ${v.reasoning ? `<div class="xx-small text-muted mb-1">${escapeHtml(v.reasoning)}</div>` : ""}
-        ${v.error ? `<div class="xx-small text-danger">Failed: ${escapeHtml(v.error)}</div>` : v.audio ? `<audio controls class="w-100 mt-1" src="${v.audio}"></audio>` : ""}
+        ${v.error ? `<div class="xx-small text-danger">Failed: ${escapeHtml(v.error)}</div>` : v.audio ? `<audio controls class="w-100 mt-1" src="${v.audio}"></audio>${formatDurationNote(v.durationMs, v.requestedDurationSeconds)}` : ""}
       </div>`).join("") || `<p class="text-muted small">No results.</p>`;
     state.lastSongVariations = data.results || [];
     await Promise.all(
@@ -5022,13 +5211,14 @@ document.getElementById("songGenerateBtn")?.addEventListener("click", async () =
     });
     await refreshCreditsSummary();
     if (!res.ok) throw new Error(data.error || "Song generation failed.");
-    state.songStudioVersions.unshift({ audio: data.audio, ts: Date.now() });
+    state.songStudioVersions.unshift({ audio: data.audio, ts: Date.now(), durationMs: data.durationMs, requestedDurationSeconds: data.requestedDurationSeconds });
     saveToAudioLibrary({ type: "song", name: `Song — ${style.slice(0, 40)}${style.length > 40 ? "..." : ""}`, audioDataUri: data.audio, modelUsed: data.modelUsed, runId, silent: true });
     resultEl.innerHTML = state.songStudioVersions.map((v, i) => `
       <div class="border rounded p-2 mb-2 ${i === 0 ? "border-primary" : ""}">
         ${i === 0 ? `<div class="xx-small fw-bold text-primary mb-1">Latest</div>` : `<div class="xx-small text-muted mb-1">Earlier version</div>`}
         <audio controls class="w-100 mb-2" src="${v.audio}"></audio>
-        <a href="${v.audio}" data-download-url="${v.audio}" data-download-filename="song-${v.ts}.mp3" class="btn btn-sm btn-dark fw-bold w-100">⬇️ Download</a>
+        ${formatDurationNote(v.durationMs, v.requestedDurationSeconds)}
+        <a href="${v.audio}" data-download-url="${v.audio}" data-download-filename="song-${v.ts}.mp3" class="btn btn-sm btn-dark fw-bold w-100 mt-1">⬇️ Download</a>
       </div>`).join("");
     logActivity("success", "Song generated.");
   } catch (err) {
@@ -5500,12 +5690,21 @@ document.getElementById("flowTalkingAudioMode")?.addEventListener("change", asyn
     if (selectEl) {
       selectEl.innerHTML = `<option value="">Loading...</option>`;
       try {
-        const { res, data } = await fetchJson("/api/audio-library?type=voice");
+        // REAL GAP FIXED: this used to only fetch type=voice, which
+        // completely missed anything produced by the Mixer (saved as
+        // type "mix" regardless of whether the actual content was pure
+        // voice narration, e.g. a combined script with intro/outro) or
+        // by the Combine button's local-fallback path (same "mix" type,
+        // see server.js's saveLocalRenderToLibrary). Any of these could
+        // easily BE the finished narration someone wants here — no
+        // narrow filter, every real audio type shows up.
+        const { res, data } = await fetchJson("/api/audio-library");
         if (!res.ok) throw new Error(data.error);
+        const typeIcon = { voice: "🎙️", song: "🎵", sfx: "🔊", upload: "📁", mix: "🎛️" };
         const items = data.items || [];
         selectEl.innerHTML = items.length
-          ? `<option value="">Pick a saved clip...</option>` + items.map((it) => `<option value="${it.id}">${escapeHtml(it.name)}</option>`).join("")
-          : `<option value="">No saved voice clips yet — generate one in Voice Studio and save it first.</option>`;
+          ? `<option value="">Pick a saved clip...</option>` + items.map((it) => `<option value="${it.id}">${typeIcon[it.type] || ""} ${escapeHtml(it.name)}</option>`).join("")
+          : `<option value="">Nothing in your library yet — generate or combine something first.</option>`;
       } catch (err) {
         selectEl.innerHTML = `<option value="">Couldn't load your library.</option>`;
       }
@@ -5517,7 +5716,7 @@ document.getElementById("flowTalkingLibrarySelect")?.addEventListener("change", 
   const preview = document.getElementById("flowTalkingLibraryPreview");
   if (!id) { preview?.classList.add("d-none"); flowTalkingAudioBase64 = null; return; }
   try {
-    const { res, data } = await fetchJson("/api/audio-library?type=voice");
+    const { res, data } = await fetchJson("/api/audio-library");
     if (!res.ok) throw new Error(data.error);
     const item = (data.items || []).find((it) => String(it.id) === id);
     if (item) {
@@ -5531,8 +5730,34 @@ document.getElementById("flowTalkingLibrarySelect")?.addEventListener("change", 
 document.getElementById("flowTalkingVoiceMode")?.addEventListener("change", (e) => {
   document.getElementById("flowTalkingStandardVoiceSelect")?.classList.toggle("d-none", e.target.value !== "standard");
   document.getElementById("flowTalkingCloneSection")?.classList.toggle("d-none", e.target.value !== "clone");
+  document.getElementById("flowTalkingExistingCloneSection")?.classList.toggle("d-none", e.target.value !== "existing-clone");
   document.getElementById("flowTalkingHeygenVoiceSection")?.classList.toggle("d-none", e.target.value !== "heygen-native");
+  const showEmotion = e.target.value === "clone" || e.target.value === "existing-clone";
+  document.getElementById("flowTalkingCloneEmotionSection")?.classList.toggle("d-none", !showEmotion);
+  document.getElementById("flowTalkingEmotionScopeNote")?.classList.toggle("d-none", !showEmotion);
+  if (e.target.value === "existing-clone") populateFlowTalkingExistingCloneSelect();
 });
+document.getElementById("flowTalkingSpeed")?.addEventListener("input", (e) => {
+  document.getElementById("flowTalkingSpeedValue").textContent = e.target.value;
+});
+document.getElementById("flowTalkingPitch")?.addEventListener("input", (e) => {
+  document.getElementById("flowTalkingPitchValue").textContent = e.target.value;
+});
+// Real "clone once, reuse everywhere" fix — state.customVoices is
+// already loaded app-wide from /api/models (see Voice Studio's own
+// picker doing the same match-by-family lookup), so this needs no new
+// fetch, just the same list surfaced here too. Filtered to MiniMax
+// specifically since that's the only confirmed real cloning family in
+// this app (see Voice Studio's clone section) — a voice cloned for a
+// different family wouldn't actually work on the model this route uses.
+function populateFlowTalkingExistingCloneSelect() {
+  const selectEl = document.getElementById("flowTalkingExistingCloneSelect");
+  if (!selectEl) return;
+  const minimaxClones = (state.customVoices || []).filter((cv) => cv.model_family === "minimax");
+  selectEl.innerHTML = minimaxClones.length
+    ? minimaxClones.map((cv) => `<option value="${escapeHtml(cv.custom_voice_id)}">🎙️ ${escapeHtml(cv.name)}</option>`).join("")
+    : `<option value="">No cloned voices yet — clone one in Voice Studio first, or pick "Clone a voice from a reference clip" above.</option>`;
+}
 document.getElementById("flowTalkingBackgroundType")?.addEventListener("change", (e) => {
   const isColor = e.target.value === "color";
   document.getElementById("flowTalkingBackgroundColor")?.classList.toggle("d-none", !isColor);
@@ -5547,6 +5772,7 @@ document.getElementById("flowTalkingGenerateBtn")?.addEventListener("click", asy
   if (audioMode === "library" && !flowTalkingAudioBase64) return alert("Pick a saved clip from your Audio Library first.");
   if (audioMode === "generate" && !text) return alert("Type what should be said first.");
   if (audioMode === "generate" && voiceMode === "clone" && !flowTalkingCloneAudioBase64) return alert("Upload a reference clip to clone a voice from, or switch to a standard voice.");
+  if (audioMode === "generate" && voiceMode === "existing-clone" && !document.getElementById("flowTalkingExistingCloneSelect")?.value) return alert("Pick one of your already-cloned voices, or switch to a standard voice.");
   const modelId = readModelSelectEl(document.getElementById("flowTalkingModelSelect"));
   const backgroundType = document.getElementById("flowTalkingBackgroundType")?.value;
   const background = document.getElementById("flowTalkingBackgroundSection")?.classList.contains("d-none")
@@ -5573,6 +5799,10 @@ document.getElementById("flowTalkingGenerateBtn")?.addEventListener("click", asy
         targetLanguage: document.getElementById("flowTalkingTargetLanguage")?.value,
         voiceMode, voiceModelId: resolvedTalkingVoice.voiceModel, voiceId: resolvedTalkingVoice.voiceId,
         voiceReferenceAudioBase64: voiceMode === "clone" ? flowTalkingCloneAudioBase64 : null,
+        existingCustomVoiceId: voiceMode === "existing-clone" ? document.getElementById("flowTalkingExistingCloneSelect")?.value : null,
+        voiceEmotion: (voiceMode === "clone" || voiceMode === "existing-clone") ? document.getElementById("flowTalkingEmotion")?.value : null,
+        voiceSpeed: (voiceMode === "clone" || voiceMode === "existing-clone") ? parseFloat(document.getElementById("flowTalkingSpeed")?.value) : null,
+        voicePitch: (voiceMode === "clone" || voiceMode === "existing-clone") ? parseInt(document.getElementById("flowTalkingPitch")?.value) : null,
         useNativeHeygenVoice: voiceMode === "heygen-native",
         heygenVoiceName: document.getElementById("flowTalkingHeygenVoiceName")?.value?.trim() || null,
         background: background?.value ? background : null,
@@ -6268,6 +6498,46 @@ document.getElementById("flowBgmUpload")?.addEventListener("change", (e) => {
   };
   reader.readAsDataURL(file);
 });
+// REAL GAP FIXED: Flow Studio's talking-audio narration had a "pick
+// from Audio Library" option; BGM had none at all — only generate-new
+// or upload-from-computer, so a song or Mixer render you'd already
+// made was completely unreachable here. Populated once when the Audio
+// accordion section is first opened (see the accordion listener below)
+// rather than on every keystroke.
+async function populateFlowBgmLibrarySelect() {
+  const selectEl = document.getElementById("flowBgmLibrarySelect");
+  if (!selectEl) return;
+  selectEl.innerHTML = `<option value="">Loading...</option>`;
+  try {
+    const { res, data } = await fetchJson("/api/audio-library");
+    if (!res.ok) throw new Error(data.error);
+    const typeIcon = { voice: "🎙️", song: "🎵", sfx: "🔊", upload: "📁", mix: "🎛️" };
+    const items = data.items || [];
+    selectEl.innerHTML = items.length
+      ? `<option value="">Pick a saved clip...</option>` + items.map((it) => `<option value="${it.id}">${typeIcon[it.type] || ""} ${escapeHtml(it.name)}</option>`).join("")
+      : `<option value="">Nothing in your library yet.</option>`;
+  } catch {
+    selectEl.innerHTML = `<option value="">Couldn't load your library.</option>`;
+  }
+}
+document.getElementById("flowBgmLibrarySelect")?.addEventListener("change", async (e) => {
+  const id = e.target.value;
+  const preview = document.getElementById("flowBgmLibraryPreview");
+  if (!id) { preview?.classList.add("d-none"); return; }
+  try {
+    const { res, data } = await fetchJson("/api/audio-library");
+    if (!res.ok) throw new Error(data.error);
+    const item = (data.items || []).find((it) => String(it.id) === id);
+    if (item) {
+      flowBgmAudioBase64 = item.audio; // same variable the upload path sets — Generate & Listen and the final render both already read from this
+      if (preview) { preview.src = item.audio; preview.classList.remove("d-none"); }
+      document.getElementById("flowBgmUploadStatus").textContent = `Using "${item.name}" from your library instead of generating.`;
+    }
+  } catch (err) {
+    alert("Couldn't load that clip: " + err.message);
+  }
+});
+document.getElementById("flowAudioCollapse")?.addEventListener("show.bs.collapse", populateFlowBgmLibrarySelect, { once: true });
 // These two were missing entirely — the backend already supports real
 // voice-cloning and BGM-style-matching from a reference clip, but
 // nothing was collecting the file or sending it.
@@ -6345,7 +6615,7 @@ document.querySelectorAll('#voiceStudioSpeed, #voiceStudioPitch').forEach((slide
     document.querySelector(`[data-range-value="${slider.id}"]`).textContent = slider.value;
   });
 });
-document.getElementById("voiceStudioModal")?.addEventListener("show.bs.modal", updateVoiceStudioModelOptions);
+document.getElementById("audioModeRow")?.addEventListener("show.bs.modal", updateVoiceStudioModelOptions);
 
 // ============================================================
 // VOICE SCRIPT EDITOR (Phase 7/8) — the actual replacement for the old
@@ -6359,6 +6629,21 @@ function newVoiceScriptLine() {
   const defaultModel = state.voiceModels?.[0];
   return {
     id: "line-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7),
+    // REAL GAP FIXED: lines were only ever labeled "Line 1", "Line 2"
+    // — meaningless once a script has more than a couple of lines, no
+    // way to tell at a glance which is the intro, which is a specific
+    // character's part, etc. A real, editable name per line, used
+    // everywhere the line gets referenced (saved take names, the
+    // Combine result, etc.) instead of just an index number.
+    name: "",
+    // REAL GAP FIXED: every line used to be exclusively "generate from
+    // text" — no way to drop an existing recording or a past library
+    // clip directly into the sequential script. "external" swaps the
+    // model/voice/text controls for an upload + library picker, and
+    // treats whatever's picked as that line's take directly (free,
+    // no generation call) — combinable and Mixer-usable exactly like
+    // any generated take.
+    sourceType: "generate",
     text: "",
     modelId: defaultModel?.id || "",
     voiceId: defaultModel?.confirmedVoiceIds?.[0]?.id || "",
@@ -6366,6 +6651,11 @@ function newVoiceScriptLine() {
     translateTargetLanguage: "",
     translateStatus: null,
     isTranslating: false,
+    previewText: null,
+    previewStrippedMarkers: [],
+    previewEstimatedSeconds: null,
+    intention: "",
+    targetDurationSeconds: null,
     // Multi-language code-switching within ONE line (e.g. "Welcome!
     // [Hindi]कैसे हो आप[/Hindi] friend.") — a genuinely different mode
     // from the single translateTargetLanguage above: that translates
@@ -6398,6 +6688,84 @@ function estimateSpeechDurationSeconds(text, speed) {
   const wordCount = (text || "").trim().split(/\s+/).filter(Boolean).length;
   if (!wordCount) return 0;
   return wordCount / (2.5 * (speed || 1.0));
+}
+// REAL, achievable duration targeting: the only genuine lever any of
+// these models exposes is the speed multiplier (see
+// supportsEmotionPitchSpeed) — there's no confirmed "generate exactly
+// N seconds" parameter for speech the way some music models have.
+// Inverts the same word-rate estimate used for the display estimate,
+// clamped to the actual real range the speed slider allows (0.5x-2.0x)
+// so this can never silently ask for something the model would reject.
+function computeSpeedForTargetDuration(text, targetSeconds) {
+  const wordCount = (text || "").trim().split(/\s+/).filter(Boolean).length;
+  if (!wordCount || !targetSeconds || targetSeconds <= 0) return null;
+  const rawSpeed = wordCount / (2.5 * targetSeconds);
+  return Math.min(2.0, Math.max(0.5, +rawSpeed.toFixed(1)));
+}
+// Pure arithmetic, no AI call — for models with a real descriptive-tag
+// capability but no formal speed parameter, this is the honest ceiling
+// of duration control: comparing natural pace against the target and
+// suggesting a real pacing tag only when the gap is big enough to
+// matter (small gaps aren't worth cluttering the line with a tag that
+// wouldn't audibly change much).
+function computePacingTag(text, targetSeconds) {
+  const wordCount = (text || "").replace(/\*[^*]+\*/g, "").trim().split(/\s+/).filter(Boolean).length; // strip existing tags — they aren't spoken content, shouldn't count toward pace math
+  if (!wordCount || !targetSeconds) return null;
+  const natural = wordCount / 2.5;
+  if (natural > targetSeconds * 1.3) return "speaking quickly";
+  if (natural < targetSeconds * 0.75) return "speaking slowly";
+  return null;
+}
+function renderPacingControlContent(line, pacing) {
+  return `<div class="d-flex align-items-center gap-2 mt-2">
+    <label class="xx-small text-muted mb-0 text-nowrap">🎯 Target duration</label>
+    <input type="number" class="form-control form-control-sm" style="max-width:80px;" min="0.5" step="0.5" data-line-field="targetDurationSeconds" placeholder="sec" value="${line.targetDurationSeconds ?? ""}">
+    <span data-line-pacing-suggestion>${renderPacingSuggestion(line, pacing)}</span>
+  </div>
+  <div class="xx-small text-muted">No formal speed control on this model — but it reads a real pacing cue like *speaking quickly* or *speaking slowly* directly. Not as precise as MiniMax's actual speed number, but genuinely real.</div>`;
+}
+function renderPacingSuggestion(line, pacing) {
+  if (pacing) return `<button type="button" class="btn btn-sm btn-outline-primary text-nowrap" data-line-action="apply-pacing-tag" data-pacing-tag="${pacing}">+ "*${pacing}*"</button>`;
+  return line.targetDurationSeconds ? `<span class="xx-small text-muted">pace already close to your target</span>` : "";
+}
+function renderLinePreviewContent(line) {
+  if (!line.previewText?.trim()) return `<span class="text-muted">Nothing to preview yet.</span>`;
+  const strippedHtml = line.previewStrippedMarkers?.length
+    ? `<div class="text-warning mt-1">⚠️ "${line.previewStrippedMarkers.join('", "')}" won't be spoken — not supported by this model.</div>`
+    : "";
+  return `<div><strong>👁 Will actually send:</strong> "${escapeHtml(line.previewText)}"</div><div class="text-muted">≈${line.previewEstimatedSeconds ?? 0}s</div>${strippedHtml}`;
+}
+// Debounced — this is a FREE, instant server call (buildInput is a pure
+// transform, no Fal request) but still shouldn't fire on every single
+// keystroke; a short pause after typing is enough to feel live without
+// spamming requests.
+const linePreviewTimers = {};
+function scheduleLinePreview(line) {
+  clearTimeout(linePreviewTimers[line.id]);
+  // Multi-language mode's [Language]...[/Language] tags are parsed and
+  // stripped by a DIFFERENT server-side step (parseMultilingualSegments,
+  // at actual generation time), not by buildInput — this single-model
+  // preview would show the literal tags as if they'd be spoken, which is
+  // actively misleading rather than just incomplete. Skipped honestly
+  // rather than showing a wrong preview.
+  if (line.multilingualMode) return;
+  linePreviewTimers[line.id] = setTimeout(async () => {
+    if (!line.text?.trim() || !line.modelId) return;
+    try {
+      const { res, data } = await fetchJson("/api/voice/preview-text-processing", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: line.text, modelId: line.modelId, voiceId: line.voiceId, language: line.language || undefined, speed: line.speed, pitch: line.pitch, emotion: line.emotion }),
+      });
+      if (!res.ok) return;
+      line.previewText = data.finalSpokenText;
+      line.previewStrippedMarkers = data.strippedMarkers || [];
+      line.previewEstimatedSeconds = data.estimatedSeconds;
+      const lineEl = document.querySelector(`[data-line-id="${line.id}"]`);
+      const previewEl = lineEl?.querySelector("[data-line-preview]");
+      if (previewEl) previewEl.innerHTML = renderLinePreviewContent(line);
+    } catch {} // best-effort — a failed preview shouldn't block anything, real generation will surface any real error
+  }, 400);
 }
 // REAL BUG THIS CATCHES: the language dropdown only sets the model's
 // pronunciation/language_code parameter — it does NOT translate
@@ -6439,6 +6807,7 @@ async function translateLine(line, targetLanguage) {
     });
     if (!res.ok) throw new Error(data.error || "Translation failed.");
     line.text = data.preparedText;
+    line.previewText = null; // stale — refreshed below
     if (data.scriptValidationFailed) {
       line.translateStatus = { warn: true, text: `Couldn't confirm real ${targetLanguage} script even after retrying — check the result before generating.` };
     } else if (data.transliterationDetected) {
@@ -6457,8 +6826,47 @@ async function translateLine(line, targetLanguage) {
   } finally {
     line.isTranslating = false;
     renderVoiceScript();
+    scheduleLinePreview(line);
   }
 }
+// ============================================================
+// REQUIREMENTS-FIRST FILTER — "tell me what you need, only show me
+// options that actually work," applied to every line's model/voice
+// dropdowns rather than showing the full unfiltered catalog and hoping
+// the person picks something compatible. Language filtering checks
+// each model's REAL confirmed/discovered/auto-detected language
+// coverage (the same data Phase 1's dynamic loading already computes) —
+// never a guess. Gender filtering reads the REAL hand-written
+// description text on each curated voice (e.g. "Mature female,
+// measured...") — genuinely present data, not fabricated; a voice with
+// no description (a live-discovered or custom one) is never excluded
+// by a gender filter, since there's no way to honestly know either way.
+// ============================================================
+state.voiceRequirements = state.voiceRequirements || { language: "", gender: "" };
+function populateVoiceRequirementLanguages() {
+  const sel = document.getElementById("voiceRequirementLanguage");
+  if (!sel) return;
+  const current = sel.value;
+  sel.innerHTML = `<option value="">Any language</option>${(state.voiceoverLanguages || []).map((l) => `<option value="${escapeHtml(l)}">${escapeHtml(l)}</option>`).join("")}`;
+  sel.value = current;
+}
+function modelMatchesLanguageRequirement(model, requiredLanguage) {
+  if (!requiredLanguage) return true;
+  const pool = [...(model.confirmedLanguages || []), ...(model.autoDetectedLanguagesSupported || [])];
+  return pool.some((l) => l.toLowerCase().startsWith(requiredLanguage.toLowerCase()));
+}
+function voiceMatchesGenderRequirement(voice, gender) {
+  if (!gender || !voice.description) return true; // no description to check — never excluded, since we can't honestly confirm either way
+  return voice.description.toLowerCase().includes(gender);
+}
+document.getElementById("voiceRequirementLanguage")?.addEventListener("change", (e) => {
+  state.voiceRequirements.language = e.target.value;
+  renderVoiceScript();
+});
+document.getElementById("voiceRequirementGender")?.addEventListener("change", (e) => {
+  state.voiceRequirements.gender = e.target.value;
+  renderVoiceScript();
+});
 function renderVoiceScriptLine(line, index) {
   const model = (state.voiceModels || []).find((m) => m.id === line.modelId) || null;
   // 🇮🇳 = Indian-language-capable (server-sorted first). 🎯 = a model
@@ -6466,7 +6874,19 @@ function renderVoiceScriptLine(line, index) {
   // cover it as one of 30 — a real, useful distinction someone asking
   // for "local/regional voice models" actually wants visible, not
   // buried in a label string.
-  const modelOptions = (state.voiceModels || [])
+  const requirements = state.voiceRequirements || {};
+  const eligibleModels = (state.voiceModels || []).filter((m) => modelMatchesLanguageRequirement(m, requirements.language));
+  // The line's own currently-selected model might not match a filter
+  // just applied — keep it selectable regardless (never silently yank
+  // away what's already chosen), just don't let it look like the ONLY
+  // real option by hiding everything else that would also work.
+  const modelPool = eligibleModels.some((m) => m.id === line.modelId) || !line.modelId
+    ? eligibleModels
+    : [...eligibleModels, ...(state.voiceModels || []).filter((m) => m.id === line.modelId)];
+  const requirementNoteHtml = requirements.language && eligibleModels.length < (state.voiceModels || []).length
+    ? `<div class="xx-small text-muted mb-1">Showing ${eligibleModels.length} of ${(state.voiceModels || []).length} models confirmed for ${escapeHtml(requirements.language)}.</div>`
+    : "";
+  const modelOptions = modelPool
     .map((m) => {
       const badge = `${m.indianLanguageCoverage?.length ? "🇮🇳 " : ""}${m.isDedicatedRegionalModel ? "🎯 " : ""}`;
       return `<option value="${escapeHtml(m.id)}" ${m.id === line.modelId ? "selected" : ""}>${badge}${escapeHtml(m.label)}</option>`;
@@ -6483,6 +6903,7 @@ function renderVoiceScriptLine(line, index) {
     // human-written description yet — flagged honestly with 🆕 rather
     // than pretending they're as vetted as a curated entry.
     const opts = model.confirmedVoiceIds
+      .filter((v) => voiceMatchesGenderRequirement(v, requirements.gender) || v.id === line.voiceId) // never hide the currently-selected voice, same "don't yank away an active choice" rule as the model filter above
       .map((v) => {
         const isLive = v.source === "live";
         const label = isLive ? `🆕 ${v.id} — newly discovered, not yet verified` : `${v.id}${v.description ? ` — ${v.description}` : ""}`;
@@ -6567,6 +6988,33 @@ function renderVoiceScriptLine(line, index) {
     ` : ""}
   `;
 
+  // REAL duration control, not just an estimate: for the 2 models that
+  // actually confirm a speed parameter (see supportsEmotionPitchSpeed),
+  // this auto-computes and applies the speed multiplier needed to hit
+  // the target — the only genuine lever that exists for TTS duration,
+  // since none of these models take a literal "generate N seconds"
+  // parameter the way some music models do. For the other 6 models,
+  // shown honestly disabled rather than pretending it works — no
+  // confirmed speed field means no real way to actively hit a target.
+  const targetDurationHtml = model?.supportsEmotionPitchSpeed
+    ? `<div class="d-flex align-items-center gap-2 mt-2">
+        <label class="xx-small text-muted mb-0 text-nowrap">🎯 Target duration</label>
+        <input type="number" class="form-control form-control-sm" style="max-width:80px;" min="0.5" step="0.5" data-line-field="targetDurationSeconds" placeholder="sec" value="${line.targetDurationSeconds ?? ""}">
+        <span class="xx-small text-muted" data-line-target-speed-note>${line.targetDurationSeconds ? `→ speed set to ${line.speed}x` : "sets speed automatically"}</span>
+      </div>`
+    : model?.markupTagMode === "freeform"
+    // REAL point you made: no confirmed speed PARAMETER doesn't mean no
+    // lever at all — these models read descriptive delivery tags
+    // directly, and "speaking quickly"/"speaking slowly" is a genuine,
+    // real instruction within that same confirmed capability, just not
+    // a formal numeric control. Computed and suggested with zero AI
+    // calls — pure arithmetic on word count vs target, same estimate
+    // math already used elsewhere, so this costs nothing to offer.
+    ? (() => {
+        const pacing = computePacingTag(line.text, line.targetDurationSeconds);
+        return `<div data-line-pacing-container>${renderPacingControlContent(line, pacing)}</div>`;
+      })()
+    : `<div class="xx-small text-muted mt-2">🎯 This model has no confirmed speed parameter or descriptive-tag capability — duration can't be actively influenced, only estimated below. Switch to MiniMax (real speed control) or ElevenLabs/Gemini (pacing tags) for duration control.</div>`;
   const emotionRowHtml = model?.supportsEmotionPitchSpeed
     ? `<div class="row g-2 mt-2">
         <div class="col-4"><label class="xx-small text-muted mb-0">Speed ${line.speed}</label><input type="range" class="form-range" data-line-field="speed" min="0.5" max="2.0" step="0.1" value="${line.speed}"></div>
@@ -6578,6 +7026,15 @@ function renderVoiceScriptLine(line, index) {
   // Recomputed live as text/speed change (see the input listener below),
   // not just at render time, so it stays accurate while typing.
   const durationEstimateHtml = `<div class="xx-small text-muted mt-1" data-line-duration-estimate>≈${estimateSpeechDurationSeconds(line.text, line.speed).toFixed(1)}s estimated (rough — actual pace varies by model/language)</div>`;
+  // Real, free, accurate preview — see /api/voice/preview-text-processing
+  // (a pure text transform, no Fal call, no cost). Shows exactly what
+  // the model will actually receive/speak BEFORE any real generation:
+  // catches a *tag* that this specific model doesn't support (silently
+  // stripped otherwise) and gives a duration estimate off the REAL
+  // spoken text, not the raw typed text. Populated live via a debounced
+  // fetch — see the input listener below — so this starts empty and
+  // fills in shortly after typing pauses.
+  const previewHtml = line.multilingualMode ? "" : `<div class="border rounded p-2 mt-1 mb-1 bg-light xx-small" data-line-preview>${line.previewText != null ? renderLinePreviewContent(line) : `<span class="text-muted">👁 Preview loads as you type...</span>`}</div>`;
 
   const estimatedSecondsNow = estimateSpeechDurationSeconds(line.text, line.speed);
   const variationsHtml = line.variations.length
@@ -6619,19 +7076,41 @@ function renderVoiceScriptLine(line, index) {
   return `
   <div class="card border" data-line-id="${line.id}">
     <div class="card-body p-3">
-      <div class="d-flex justify-content-between align-items-center mb-2">
-        <span class="fw-bold small">Line ${index + 1}</span>
-        <div class="d-flex gap-1">
+      <div class="d-flex justify-content-between align-items-center mb-2 gap-2">
+        <span class="text-muted small flex-shrink-0">${index + 1}.</span>
+        <input type="text" class="form-control form-control-sm fw-bold" data-line-field="name" value="${escapeHtml(line.name || "")}" placeholder="Name this line (e.g. Intro, Priya's part, Call to action)">
+        <div class="d-flex gap-1 flex-shrink-0">
           <button type="button" class="btn btn-sm btn-outline-secondary" data-line-action="moveUp" ${index === 0 ? "disabled" : ""} title="Move up">↑</button>
           <button type="button" class="btn btn-sm btn-outline-secondary" data-line-action="moveDown" title="Move down">↓</button>
           <button type="button" class="btn btn-sm btn-outline-danger" data-line-action="delete" title="Delete line">✕</button>
         </div>
       </div>
+      <div class="btn-group btn-group-sm w-100 mb-2" role="group">
+        <input type="radio" class="btn-check" name="lineSource-${line.id}" id="lineSourceGen-${line.id}" autocomplete="off" ${line.sourceType !== "external" ? "checked" : ""} data-line-field="sourceType" value="generate">
+        <label class="btn btn-outline-dark" for="lineSourceGen-${line.id}">✨ Generate from text</label>
+        <input type="radio" class="btn-check" name="lineSource-${line.id}" id="lineSourceExt-${line.id}" autocomplete="off" ${line.sourceType === "external" ? "checked" : ""} data-line-field="sourceType" value="external">
+        <label class="btn btn-outline-dark" for="lineSourceExt-${line.id}">📁 Use existing audio</label>
+      </div>
+      ${line.sourceType === "external" ? `
+      <div class="border rounded p-2 bg-light mb-2">
+        <div class="xx-small text-muted mb-2">Drop in a recording, an upload, or anything already in your Audio Library — used as this line's take directly, free, no generation call.</div>
+        <div class="d-flex gap-2 mb-2">
+          <label class="btn btn-sm btn-outline-dark flex-grow-1 mb-0" for="extUpload-${line.id}">📁 Upload a file</label>
+          <input type="file" accept="audio/*" class="d-none" data-line-action="external-upload" id="extUpload-${line.id}">
+        </div>
+        <select class="form-select form-select-sm" data-line-action="external-library">
+          <option value="">Or pick from your Audio Library...</option>
+        </select>
+      </div>
+      ${variationsHtml}
+      ` : `
       <textarea class="form-control form-control-sm mb-1" rows="2" data-line-field="text" placeholder="Type this line...">${escapeHtml(line.text)}</textarea>
       ${durationEstimateHtml}
+      ${previewHtml}
       ${translateToolbarHtml}
-      ${buildVoiceMarkupToolbarHtml(model)}
+      ${buildVoiceMarkupToolbarHtml(model, line)}
       <small class="text-muted d-block mb-2">${escapeHtml(model?.markupHint || "Pick a model to see what stage-direction markup it supports.")}</small>
+      ${requirementNoteHtml}
       <div class="row g-2">
         <div class="col-6"><select class="form-select form-select-sm" data-line-field="modelId">${modelOptions}</select></div>
         <div class="col-6">${voiceControlHtml}</div>
@@ -6639,6 +7118,7 @@ function renderVoiceScriptLine(line, index) {
       ${languageRowHtml}
       <div data-line-mismatch-container>${scriptMismatchHtml}</div>
       ${emotionRowHtml}
+      ${targetDurationHtml}
       <div class="d-flex align-items-center gap-2 mt-2">
         ${line.multilingualMode ? "" : `
         <label class="xx-small text-muted mb-0">Takes:</label>
@@ -6649,6 +7129,7 @@ function renderVoiceScriptLine(line, index) {
       </div>
       ${cappedNote}
       ${variationsHtml}
+      `}
     </div>
   </div>`;
 }
@@ -6661,8 +7142,173 @@ function renderVoiceScript() {
   }
   container.innerHTML = state.voiceScript.lines.map((line, i) => renderVoiceScriptLine(line, i)).join("");
 }
-document.getElementById("voiceStudioModal")?.addEventListener("show.bs.modal", () => {
-  if (!state.voiceScript) state.voiceScript = { lines: [], runId: null };
+// Populates one line's "pick from Audio Library" select with every
+// real type (voice/song/sfx/upload/mix) — not narrowed, since any of
+// them could reasonably be dropped into a sequential script (a past
+// combined take, a sound effect between lines, anything).
+async function populateLineExternalLibrarySelect(lineId) {
+  const lineEl = document.querySelector(`[data-line-id="${lineId}"]`);
+  const selectEl = lineEl?.querySelector('[data-line-action="external-library"]');
+  if (!selectEl) return;
+  try {
+    const { res, data } = await fetchJson("/api/audio-library");
+    if (!res.ok) throw new Error(data.error);
+    const typeIcon = { voice: "🎙️", song: "🎵", sfx: "🔊", upload: "📁", mix: "🎛️" };
+    const items = data.items || [];
+    selectEl.innerHTML = `<option value="">Or pick from your Audio Library...</option>` +
+      items.map((it) => `<option value="${it.id}">${typeIcon[it.type] || ""} ${escapeHtml(it.name)}</option>`).join("");
+  } catch {
+    selectEl.innerHTML = `<option value="">Couldn't load your library.</option>`;
+  }
+}
+// Sets an external clip (uploaded or picked from the library) as this
+// line's take directly — same real shape a generated take has
+// ({label, audio, audioUrl}), so Combine and the Mixer both treat it
+// identically, just with audioUrl left null (base64 only) — the
+// Combine handler above already falls back to .audio for exactly this.
+function setLineExternalClip(lineId, audioDataUri, label) {
+  const line = state.voiceScript.lines.find((l) => l.id === lineId);
+  if (!line) return;
+  line.variations = [{ label, audio: audioDataUri, audioUrl: null, isExternal: true }];
+  line.selectedVariationIndex = 0;
+  renderVoiceScript();
+  saveVoiceScriptSession();
+}
+document.getElementById("voiceScriptLines")?.addEventListener("change", (e) => {
+  const lineEl = e.target.closest("[data-line-id]");
+  if (!lineEl) return;
+  const lineId = lineEl.getAttribute("data-line-id");
+  if (e.target.matches('[data-line-action="external-upload"]')) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => setLineExternalClip(lineId, ev.target.result, `📁 ${file.name}`);
+    reader.readAsDataURL(file);
+  } else if (e.target.matches('[data-line-action="external-library"]')) {
+    const id = e.target.value;
+    if (!id) return;
+    const selectedText = e.target.selectedOptions[0]?.textContent || "Library clip";
+    fetchJson("/api/audio-library").then(({ res, data }) => {
+      if (!res.ok) return;
+      const item = (data.items || []).find((it) => String(it.id) === id);
+      if (item) setLineExternalClip(lineId, item.audio, selectedText.trim());
+    });
+  }
+});
+// ============================================================
+// SESSION PERSISTENCE — real ask: "changes shouldn't impact what we
+// already did." Autosaves the script's real structure (text, model,
+// voice, language, emotion, speed, target duration, intention — every
+// setting) plus each take's real Fal-hosted URL to localStorage, so a
+// reload, an accidental modal close, or the browser tab closing doesn't
+// silently discard work. Deliberately does NOT persist the base64 audio
+// blobs themselves (would blow past localStorage's real ~5-10MB quota
+// after a handful of takes) — the real Fal URL survives instead, so a
+// restored take can still be played by re-fetching, and the honest
+// tradeoff is stated in the UI note rather than pretending the blob
+// itself was safely kept.
+// ============================================================
+function saveVoiceScriptSession() {
+  try {
+    const lightweight = {
+      lines: (state.voiceScript?.lines || []).map((l) => ({ ...l, variations: (l.variations || []).map((v) => ({ ...v, audio: null })) })),
+      runId: state.voiceScript?.runId,
+    };
+    localStorage.setItem("voiceScriptSession", JSON.stringify(lightweight));
+  } catch {} // storage quota or private-browsing mode — best-effort only, never blocks the actual feature
+}
+function restoreVoiceScriptSession() {
+  try {
+    const saved = localStorage.getItem("voiceScriptSession");
+    if (!saved) return null;
+    const parsed = JSON.parse(saved);
+    return parsed?.lines?.length ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+let sessionSaveTimer = null;
+function scheduleSessionSave() {
+  clearTimeout(sessionSaveTimer);
+  sessionSaveTimer = setTimeout(saveVoiceScriptSession, 600);
+}
+// ============================================================
+// MIXER SESSION PERSISTENCE — the real fix for a real, longstanding
+// gap: the Mixer's whole arrangement (Main Track, Intro, Outro,
+// Background, Overlays) only ever lived in browser memory, never saved
+// anywhere. Every page reload — including every time a new patch got
+// applied and the server restarted — silently wiped it, with no
+// warning. This isn't new-session-button behavior; it happened
+// automatically, which is exactly the kind of "unnecessary" surprise
+// worth fixing properly rather than working around.
+//
+// Genuinely better than Voice Studio's own session save above: every
+// Mixer item already comes from the real, server-side Audio Library
+// (never lost to a reload), so only a tiny reference (library item id
+// + whatever edit settings were applied) needs to live in localStorage
+// — restoring re-fetches the real audio from the library rather than
+// needing to keep a copy of it, so the restored arrangement is fully
+// playable immediately, not just structurally present.
+// ============================================================
+function mixerItemRef(item) {
+  return item ? { id: item.id, edit: item.edit || null } : null;
+}
+function saveMixerSession() {
+  try {
+    const session = {
+      mainTrack: state.mixerMainTrack.map(mixerItemRef),
+      intro: mixerItemRef(state.mixerIntro),
+      outro: mixerItemRef(state.mixerOutro),
+      background: mixerItemRef(state.mixerBackground),
+      overlays: state.mixerOverlays.map((ov) => ({ item: mixerItemRef(ov.item), delaySeconds: ov.delaySeconds, volume: ov.volume })),
+      backgroundVolume: document.getElementById("mixerBackgroundVolume")?.value,
+      backgroundDuck: document.getElementById("mixerBackgroundDuck")?.checked,
+      durationMode: document.getElementById("mixerDurationMode")?.value,
+    };
+    localStorage.setItem("mixerSession", JSON.stringify(session));
+  } catch {} // storage quota or private-browsing mode — best-effort only, never blocks the actual feature
+}
+let mixerSessionSaveTimer = null;
+function scheduleMixerSessionSave() {
+  clearTimeout(mixerSessionSaveTimer);
+  mixerSessionSaveTimer = setTimeout(saveMixerSession, 600);
+}
+async function restoreMixerSession() {
+  let saved;
+  try {
+    const raw = localStorage.getItem("mixerSession");
+    if (!raw) return;
+    saved = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  await loadMixerLibrary(); // need the real library loaded first so each saved reference can be matched back to its actual playable audio
+  const rehydrate = (ref) => {
+    if (!ref) return null;
+    const libItem = (state.mixerLibraryItems || []).find((it) => String(it.id) === String(ref.id));
+    // A referenced item that's since been deleted from the library
+    // can't be restored — honestly dropped rather than shown broken.
+    return libItem ? { ...libItem, edit: ref.edit || {} } : null;
+  };
+  state.mixerMainTrack = (saved.mainTrack || []).map(rehydrate).filter(Boolean);
+  state.mixerIntro = rehydrate(saved.intro);
+  state.mixerOutro = rehydrate(saved.outro);
+  state.mixerBackground = rehydrate(saved.background);
+  state.mixerOverlays = (saved.overlays || [])
+    .map((ov) => ({ item: rehydrate(ov.item), delaySeconds: ov.delaySeconds, volume: ov.volume }))
+    .filter((ov) => ov.item);
+  if (saved.backgroundVolume != null) { const el = document.getElementById("mixerBackgroundVolume"); if (el) el.value = saved.backgroundVolume; }
+  if (saved.backgroundDuck != null) { const el = document.getElementById("mixerBackgroundDuck"); if (el) el.checked = saved.backgroundDuck; }
+  if (saved.durationMode) { const el = document.getElementById("mixerDurationMode"); if (el) el.value = saved.durationMode; }
+}
+document.getElementById("mixerBackgroundVolume")?.addEventListener("change", scheduleMixerSessionSave);
+document.getElementById("mixerBackgroundDuck")?.addEventListener("change", scheduleMixerSessionSave);
+document.getElementById("mixerDurationMode")?.addEventListener("change", scheduleMixerSessionSave);
+document.getElementById("audioModeRow")?.addEventListener("show.bs.modal", () => {
+  if (!state.voiceScript) {
+    const restored = restoreVoiceScriptSession();
+    state.voiceScript = restored || { lines: [], runId: null };
+  }
   if (!state.voiceScript.runId) state.voiceScript.runId = crypto.randomUUID();
   if (!state.voiceScript.lines.length) state.voiceScript.lines.push(newVoiceScriptLine());
   renderVoiceScript();
@@ -6670,6 +7316,1276 @@ document.getElementById("voiceStudioModal")?.addEventListener("show.bs.modal", (
 document.getElementById("voiceScriptAddLineBtn")?.addEventListener("click", () => {
   state.voiceScript.lines.push(newVoiceScriptLine());
   renderVoiceScript();
+  saveVoiceScriptSession();
+});
+// System-based combine — NOT an AI call, deterministic ffmpeg
+// concatenation of each line's currently-selected take, in script
+// order. Needs the ORIGINAL Fal-hosted URL (audioUrl), not the base64
+// data URI kept for playback — Fal's merge endpoint takes real URLs.
+// Shared by Combine and the Mixer Console — a locally-rendered result
+// comes back as {downloadUrl, sizeBytes} (a real file on this app's own
+// disk, served via /api/flow/download/:filename — the same route
+// video-stitcher.js's local fallback already uses), while a Fal-cloud
+// result comes back as {audio, audioUrl} (base64 + a hosted URL). Both
+// are real, valid outcomes depending on which path actually ran —
+// rendering only one shape would silently break whichever one wasn't
+// anticipated.
+function renderAudioResult(resultEl, data, downloadFilenameBase) {
+  if (data.downloadUrl) {
+    resultEl.innerHTML += `<audio controls class="w-100 mb-1" src="${data.downloadUrl}"></audio><a href="${data.downloadUrl}" download class="btn btn-sm btn-dark fw-bold w-100">⬇️ Download (${(data.sizeBytes / 1024).toFixed(0)} KB)</a>`;
+  } else if (data.audio) {
+    resultEl.innerHTML += `<audio controls class="w-100 mb-1" src="${data.audio}"></audio><a href="${data.audio}" data-download-url="${data.audio}" data-download-filename="${downloadFilenameBase}-${Date.now()}.mp3" class="btn btn-sm btn-dark fw-bold w-100">⬇️ Download</a>`;
+  }
+  // Real "use it anywhere afterward" fix: every combine/mix path now
+  // auto-saves server-side (see server.js's saveLocalRenderToLibrary) —
+  // this note applies to any of them uniformly, so a result from the
+  // Mixer, a plain sequential combine, or a background mix all get the
+  // same visible confirmation and path back into the library, instead
+  // of each one growing its own copy of this same message.
+  if (data.libraryItemId) {
+    resultEl.innerHTML += `<div class="xx-small text-success mt-1">✅ Saved to your Audio Library — reusable in any Main Track, Intro, Outro, Background, or Overlay slot in the Mixer from now on.</div>`;
+  }
+}
+// ============================================================
+// MIXER CONSOLE — arrange anything already in the Audio Library
+// (voice takes, songs, SFX — all three, not just songs like the
+// Combine picker above) onto a Main track (sequential) plus one
+// optional Background track (looped, volume-reduced, plays under the
+// whole main track). Renders via /api/audio/mixer/render — 100% local
+// ffmpeg, no AI call, no per-render API cost.
+// ============================================================
+state.mixerMainTrack = state.mixerMainTrack || []; // array of library item objects, in play order
+state.mixerBackground = state.mixerBackground || null; // one library item object, or null
+
+document.getElementById("mixerFfmpegWarning")?.addEventListener("click", (e) => {
+  if (e.target.closest("#mixerFfmpegRecheckBtn")) loadMixerLibrary();
+});
+
+// ============================================================
+// PREVIEW — "play and see what it is" before committing to a full
+// render. One shared <audio> object (not a native <audio> per row —
+// with 4 different lists that can all reference the same library item,
+// N embedded players would be both visually heavy and impossible to
+// keep in sync about which one is "the" currently-playing instance).
+// A single ▶/⏸ toggle button next to every item, everywhere it
+// appears, all driven by the same shared player.
+// ============================================================
+let mixerPreviewAudio = null;
+let mixerPreviewKey = null;
+let mixerPlayheadRaf = null;
+function toggleMixerPreview(key, src) {
+  if (mixerPreviewAudio && mixerPreviewKey === key && !mixerPreviewAudio.paused) {
+    mixerPreviewAudio.pause();
+    mixerPreviewKey = null;
+    updateMixerPreviewButtons();
+    stopPlayheadTracking();
+    return;
+  }
+  if (mixerPreviewAudio) mixerPreviewAudio.pause();
+  stopAllDomAudioExcept(null); // this new player is detached (new Audio()), so its own "play" event never reaches document's capture listener — stop real DOM audio explicitly here instead
+  if (globalPreviewAudio && !globalPreviewAudio.paused) globalPreviewAudio.pause();
+  mixerPreviewAudio = new Audio(src);
+  mixerPreviewKey = key;
+  mixerPreviewAudio.play();
+  mixerPreviewAudio.addEventListener("ended", () => {
+    mixerPreviewKey = null;
+    updateMixerPreviewButtons();
+    stopPlayheadTracking();
+  });
+  updateMixerPreviewButtons();
+  startPlayheadTracking(key);
+}
+// ============================================================
+// PLAYHEAD — real seek visualization: while the shared preview player
+// is playing a clip, if that same clip's waveform is currently loaded
+// (see loadWaveformForPanel), a moving line tracks actual playback
+// position across the real waveform, and the position is genuinely
+// seekable — click anywhere on the waveform (below the trim-selection
+// area) to jump playback there, not just eyeball where you are.
+// ============================================================
+function startPlayheadTracking(key) {
+  stopPlayheadTracking();
+  const tick = () => {
+    if (!mixerPreviewAudio || mixerPreviewKey !== key) return;
+    Object.keys(waveformCache).forEach((editRef) => {
+      const item = resolveEditRef(editRef);
+      if (item && `${item.type}:${item.id}` === key) drawPlayheadOverlay(editRef, mixerPreviewAudio.currentTime, waveformCache[editRef].duration);
+    });
+    mixerPlayheadRaf = requestAnimationFrame(tick);
+  };
+  mixerPlayheadRaf = requestAnimationFrame(tick);
+}
+function stopPlayheadTracking() {
+  if (mixerPlayheadRaf) cancelAnimationFrame(mixerPlayheadRaf);
+  mixerPlayheadRaf = null;
+}
+function drawPlayheadOverlay(editRef, currentTime, duration) {
+  const canvas = document.querySelector(`[data-waveform-canvas="${editRef}"]`);
+  if (!canvas || !duration) return;
+  renderWaveformCanvas(editRef); // redraw the base waveform+selection first, then the playhead on top — simplest way to avoid trailing line artifacts from the previous frame
+  const ctx = canvas.getContext("2d");
+  const x = (currentTime / duration) * canvas.width;
+  ctx.strokeStyle = "#dc3545";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x, 0);
+  ctx.lineTo(x, canvas.height);
+  ctx.stroke();
+}
+function updateMixerPreviewButtons() {
+  document.querySelectorAll("#mixerConsoleTabPane [data-mixer-preview]").forEach((btn) => {
+    const isPlaying = mixerPreviewKey && btn.getAttribute("data-mixer-preview") === mixerPreviewKey;
+    btn.textContent = isPlaying ? "⏸" : "▶";
+  });
+}
+document.getElementById("mixerConsoleTabPane")?.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-mixer-preview]");
+  if (!btn) return;
+  toggleMixerPreview(btn.getAttribute("data-mixer-preview"), btn.getAttribute("data-mixer-preview-src"));
+});
+function previewButtonHtml(item) {
+  const key = `${item.type}:${item.id}`;
+  return `<button type="button" class="btn btn-sm btn-outline-dark py-0 px-1" data-mixer-preview="${escapeHtml(key)}" data-mixer-preview-src="${item.audio}" title="Play">▶</button>`;
+}
+// ============================================================
+// PER-CLIP EDITING — real, professional controls (trim, remove
+// silence, fade in/out), attached independently to whichever slot a
+// clip is placed in (the same song used as background AND an overlay
+// can have completely different edits on each). editRef addresses
+// which state reference a panel belongs to: "intro", "outro", "bg",
+// "main:<index>", or "overlay:<index>" — one generic system instead of
+// four separate ones for the four different lists this can appear in.
+// ============================================================
+function resolveEditRef(ref) {
+  if (ref === "intro") return state.mixerIntro;
+  if (ref === "outro") return state.mixerOutro;
+  if (ref === "bg") return state.mixerBackground;
+  if (ref === "revoice-region") return state.revoiceRegionItem;
+  const [kind, idxStr] = ref.split(":");
+  const idx = parseInt(idxStr);
+  if (kind === "main") return state.mixerMainTrack[idx];
+  if (kind === "overlay") return state.mixerOverlays[idx]?.item;
+  return null;
+}
+function editButtonHtml(editRef) {
+  return `<button type="button" class="btn btn-sm btn-outline-dark py-0 px-1" data-edit-toggle="${editRef}" title="Trim, remove silence, fade in/out">✏️</button>`;
+}
+// ============================================================
+// WAVEFORM + DRAG-TO-SELECT — the real "Instagram-style" segment
+// picker: decode the clip once (Web Audio API, client-side, no server
+// round-trip), draw real min/max peaks per pixel column on canvas, and
+// let the person drag the highlighted region to choose which part of a
+// long clip (e.g. a 2-minute song) actually plays — dragging the whole
+// region moves it while KEEPING ITS WIDTH FIXED (exactly the Instagram
+// "slide your favorite 15 seconds" interaction), dragging either edge
+// resizes it. The numeric trimStart/trimEnd fields already in the edit
+// panel stay the single source of truth — this is a visual layer on
+// top of them, always in sync both directions.
+// ============================================================
+const waveformCache = {}; // editRef -> { peaks, duration, audio }
+async function loadWaveformForPanel(editRef) {
+  const item = resolveEditRef(editRef);
+  const statusEl = document.querySelector(`[data-waveform-status="${editRef}"]`);
+  const canvas = document.querySelector(`[data-waveform-canvas="${editRef}"]`);
+  if (!item?.audio || !canvas) return;
+  const cached = waveformCache[editRef];
+  if (cached && cached.audio === item.audio) {
+    renderWaveformCanvas(editRef);
+    initWaveformDrag(editRef);
+    return;
+  }
+  if (statusEl) statusEl.textContent = "Loading waveform...";
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) throw new Error("This browser doesn't support Web Audio API.");
+    const audioCtx = new AudioContextClass();
+    const response = await fetch(item.audio);
+    const arrayBuffer = await response.arrayBuffer();
+    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+    const raw = audioBuffer.getChannelData(0);
+    const targetBins = 400;
+    const samplesPerBin = Math.max(1, Math.floor(raw.length / targetBins));
+    const peaks = [];
+    for (let i = 0; i < targetBins; i++) {
+      let min = 0, max = 0;
+      const start = i * samplesPerBin;
+      for (let j = 0; j < samplesPerBin; j++) {
+        const idx = start + j;
+        if (idx >= raw.length) break;
+        const v = raw[idx];
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+      peaks.push([min, max]);
+    }
+    waveformCache[editRef] = { peaks, duration: audioBuffer.duration, audio: item.audio };
+    audioCtx.close?.();
+    if (statusEl) statusEl.textContent = `${audioBuffer.duration.toFixed(1)}s — drag the highlighted region to pick a segment, or drag its edges to resize`;
+    renderWaveformCanvas(editRef);
+    initWaveformDrag(editRef);
+  } catch (err) {
+    if (statusEl) statusEl.textContent = "Couldn't load waveform: " + err.message + " (numeric trim fields below still work normally)";
+  }
+}
+function renderWaveformCanvas(editRef) {
+  const canvas = document.querySelector(`[data-waveform-canvas="${editRef}"]`);
+  const cached = waveformCache[editRef];
+  const item = resolveEditRef(editRef);
+  if (!canvas || !cached || !item) return;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.max(200, Math.floor(rect.width));
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const barWidth = w / cached.peaks.length;
+  ctx.fillStyle = "#adb5bd";
+  cached.peaks.forEach(([min, max], i) => {
+    const x = i * barWidth;
+    const yMin = (1 - (max + 1) / 2) * h;
+    const yMax = (1 - (min + 1) / 2) * h;
+    ctx.fillRect(x, yMin, Math.max(1, barWidth - 0.5), Math.max(1, yMax - yMin));
+  });
+  const edit = item.edit || {};
+  const selStart = edit.trimStart || 0;
+  const selEnd = edit.trimEnd || cached.duration;
+  const x1 = (selStart / cached.duration) * w;
+  const x2 = (selEnd / cached.duration) * w;
+  ctx.fillStyle = "rgba(13,110,253,0.25)";
+  ctx.fillRect(x1, 0, x2 - x1, h);
+  ctx.strokeStyle = "#0d6efd";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x1, 0, Math.max(1, x2 - x1), h);
+}
+let waveformDragState = null;
+const lastSeekPosition = {}; // editRef -> seconds, real "seeker" tracking for the boost-window shortcut
+function initWaveformDrag(editRef) {
+  const canvas = document.querySelector(`[data-waveform-canvas="${editRef}"]`);
+  if (!canvas || canvas.dataset.dragInit) return; // wire listeners once per canvas element
+  canvas.dataset.dragInit = "1";
+  const getTimeFromClientX = (clientX) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = Math.min(rect.width, Math.max(0, clientX - rect.left));
+    const cached = waveformCache[editRef];
+    return cached ? (x / rect.width) * cached.duration : 0;
+  };
+  const handleDown = (e) => {
+    const cached = waveformCache[editRef];
+    const item = resolveEditRef(editRef);
+    if (!cached || !item) return;
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const t = getTimeFromClientX(clientX);
+    item.edit = item.edit || {};
+    const selStart = item.edit.trimStart || 0;
+    const selEnd = item.edit.trimEnd || cached.duration;
+    const rect = canvas.getBoundingClientRect();
+    const handleZonePx = 10;
+    const startPx = (selStart / cached.duration) * rect.width;
+    const endPx = (selEnd / cached.duration) * rect.width;
+    const xPx = clientX - rect.left;
+    let mode = "move";
+    if (Math.abs(xPx - startPx) < handleZonePx) mode = "left";
+    else if (Math.abs(xPx - endPx) < handleZonePx) mode = "right";
+    waveformDragState = { editRef, mode, startT: t, initialStart: selStart, initialEnd: selEnd, moved: false, downClientX: clientX };
+    e.preventDefault();
+  };
+  const handleMove = (e) => {
+    if (!waveformDragState || waveformDragState.editRef !== editRef) return;
+    const cached = waveformCache[editRef];
+    const item = resolveEditRef(editRef);
+    if (!cached || !item) return;
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    if (Math.abs(clientX - waveformDragState.downClientX) > 3) waveformDragState.moved = true; // beyond a few px is a genuine drag, not a click
+    const t = getTimeFromClientX(clientX);
+    item.edit = item.edit || {};
+    if (waveformDragState.mode === "left") {
+      item.edit.trimStart = Math.max(0, Math.min(t, (item.edit.trimEnd || cached.duration) - 0.1));
+    } else if (waveformDragState.mode === "right") {
+      item.edit.trimEnd = Math.min(cached.duration, Math.max(t, (item.edit.trimStart || 0) + 0.1));
+    } else {
+      // "move" — shifts the whole window, keeping its width FIXED — the
+      // real Instagram-style interaction: pick a segment length once,
+      // then slide it anywhere in the track.
+      const width = waveformDragState.initialEnd - waveformDragState.initialStart;
+      const delta = t - waveformDragState.startT;
+      let newStart = waveformDragState.initialStart + delta;
+      newStart = Math.max(0, Math.min(newStart, cached.duration - width));
+      item.edit.trimStart = newStart;
+      item.edit.trimEnd = newStart + width;
+    }
+    renderWaveformCanvas(editRef);
+    syncEditPanelNumericInputs(editRef);
+    e.preventDefault();
+  };
+  // A real click (no meaningful drag) is a SEEK, not a selection change
+  // — jumps the shared preview player to that exact point on the real
+  // waveform and starts it playing from there, same as clicking
+  // anywhere on a real seek bar. A genuine drag (trim-selection) never
+  // triggers this, since waveformDragState.moved only becomes true past
+  // a few pixels of real movement.
+  const handleUp = (e) => {
+    const state = waveformDragState;
+    waveformDragState = null;
+    if (!state || state.moved || state.editRef !== editRef) return;
+    const item = resolveEditRef(editRef);
+    if (!item?.audio) return;
+    lastSeekPosition[editRef] = state.startT; // real "seeker" position tracked for the boost-window shortcut below
+    if (mixerPreviewAudio && mixerPreviewKey === `${item.type}:${item.id}`) {
+      mixerPreviewAudio.currentTime = state.startT;
+      if (mixerPreviewAudio.paused) mixerPreviewAudio.play();
+    } else {
+      toggleMixerPreview(`${item.type}:${item.id}`, item.audio);
+      if (mixerPreviewAudio) mixerPreviewAudio.currentTime = state.startT;
+    }
+  };
+  canvas.addEventListener("mousedown", handleDown);
+  canvas.addEventListener("touchstart", handleDown, { passive: false });
+  document.addEventListener("mousemove", handleMove);
+  document.addEventListener("touchmove", handleMove, { passive: false });
+  canvas.addEventListener("mouseup", handleUp);
+  canvas.addEventListener("touchend", handleUp);
+}
+function syncEditPanelNumericInputs(editRef) {
+  const item = resolveEditRef(editRef);
+  const panel = document.querySelector(`[data-edit-panel="${editRef}"]`);
+  if (!item || !panel) return;
+  const startInput = panel.querySelector('[data-edit-field="trimStart"]');
+  const endInput = panel.querySelector('[data-edit-field="trimEnd"]');
+  if (startInput) startInput.value = item.edit.trimStart != null ? item.edit.trimStart.toFixed(2) : "";
+  if (endInput) endInput.value = item.edit.trimEnd != null ? item.edit.trimEnd.toFixed(2) : "";
+}
+function editPanelHtml(editRef, edit) {
+  edit = edit || {};
+  return `<div class="border-top mt-1 pt-1 d-none" data-edit-panel="${editRef}">
+    <div class="position-relative mb-1" data-waveform-wrap="${editRef}">
+      <canvas class="w-100 bg-light rounded" height="56" data-waveform-canvas="${editRef}"></canvas>
+      <div class="xx-small text-muted" data-waveform-status="${editRef}">Waveform loads when you open this panel...</div>
+    </div>
+    <div class="xx-small text-muted mb-1">Trim/fade times take fractions of a second for millisecond precision (e.g. 1.25 = 1250ms). Drag the highlighted region above, or type exact values below — both stay in sync.</div>
+    <div class="d-flex gap-1 mb-1 flex-wrap">
+      <input type="number" class="form-control form-control-sm" placeholder="trim start s" min="0" step="0.01" value="${edit.trimStart ?? ""}" data-edit-field="trimStart" style="width:100px;" title="Trim start (seconds, e.g. 1.250 = 1250ms)">
+      <input type="number" class="form-control form-control-sm" placeholder="trim end s" min="0" step="0.01" value="${edit.trimEnd ?? ""}" data-edit-field="trimEnd" style="width:100px;" title="Trim end (seconds)">
+      <input type="number" class="form-control form-control-sm" placeholder="fade in s" min="0" step="0.01" value="${edit.fadeIn ?? ""}" data-edit-field="fadeIn" style="width:100px;" title="Fade in duration (seconds)">
+      <input type="number" class="form-control form-control-sm" placeholder="fade out s" min="0" step="0.01" value="${edit.fadeOut ?? ""}" data-edit-field="fadeOut" style="width:100px;" title="Fade out duration (seconds)">
+    </div>
+    <div class="d-flex gap-2 mb-1 align-items-center flex-wrap">
+      <div class="form-check xx-small mb-0">
+        <input class="form-check-input" type="checkbox" ${edit.removeSilence ? "checked" : ""} data-edit-field="removeSilence" id="rs-${editRef}">
+        <label class="form-check-label xx-small" for="rs-${editRef}">Remove silence</label>
+      </div>
+      <label class="xx-small text-muted mb-0">below</label>
+      <input type="number" class="form-control form-control-sm" min="-60" max="0" step="1" placeholder="-40" value="${edit.silenceThresholdDb ?? ""}" data-edit-field="silenceThresholdDb" style="width:65px;" title="Silence threshold in dB — closer to 0 catches quieter sounds too. -40dB is the real industry-standard default for speech.">
+      <label class="xx-small text-muted mb-0">dB for</label>
+      <input type="number" class="form-control form-control-sm" min="0.05" max="5" step="0.05" placeholder="0.5" value="${edit.silenceMinDuration ?? ""}" data-edit-field="silenceMinDuration" style="width:65px;" title="Minimum silence duration to count (seconds). 0.5s is standard — long enough to skip natural mid-sentence breathing room.">
+      <label class="xx-small text-muted mb-0">s+</label>
+      <div class="form-check xx-small mb-0">
+        <input class="form-check-input" type="checkbox" ${edit.denoise ? "checked" : ""} data-edit-field="denoise" id="dn-${editRef}">
+        <label class="form-check-label xx-small" for="dn-${editRef}" title="Real background-noise reduction (ffmpeg's afftdn filter)">🔇 Reduce noise</label>
+      </div>
+      <div class="form-check xx-small mb-0">
+        <input class="form-check-input" type="checkbox" ${edit.reverse ? "checked" : ""} data-edit-field="reverse" id="rv-${editRef}">
+        <label class="form-check-label xx-small" for="rv-${editRef}">⏪ Reverse</label>
+      </div>
+      <div class="form-check xx-small mb-0">
+        <input class="form-check-input" type="checkbox" ${edit.normalize ? "checked" : ""} data-edit-field="normalize" id="nm-${editRef}">
+        <label class="form-check-label xx-small" for="nm-${editRef}" title="One-click loudness leveling (EBU R128 standard, -16 LUFS) — the real mechanism behind 'Studio Sound' toggles">🎚️ Normalize volume</label>
+      </div>
+      <label class="xx-small text-muted mb-0">Boost</label>
+      <input type="number" class="form-control form-control-sm" min="1" max="3" step="0.1" placeholder="1.0" value="${edit.boost ?? ""}" data-edit-field="boost" style="width:65px;" title="Amplify a too-quiet clip, 1.0-3.0x (real gain, ffmpeg's volume filter)">
+      <label class="xx-small text-muted mb-0">only from</label>
+      <input type="number" class="form-control form-control-sm" min="0" step="0.01" placeholder="whole clip" value="${edit.boostStart ?? ""}" data-edit-field="boostStart" style="width:80px;" title="Boost only from this second onward, not the whole clip — leave blank to boost the whole thing">
+      <label class="xx-small text-muted mb-0">to</label>
+      <input type="number" class="form-control form-control-sm" min="0" step="0.01" placeholder="s" value="${edit.boostEnd ?? ""}" data-edit-field="boostEnd" style="width:65px;" title="Boost stops at this second">
+      <button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" data-boost-use-playhead="${editRef}" title="Fill in the boost window from where you last clicked/sought on the waveform above">🎯 Use seek position</button>
+      <div class="form-check xx-small mb-0">
+        <input class="form-check-input" type="checkbox" ${edit.clarity ? "checked" : ""} data-edit-field="clarity" id="cl-${editRef}">
+        <label class="form-check-label xx-small" for="cl-${editRef}" title="Real presence/clarity EQ boost (~3kHz, the standard broadcast technique for speech intelligibility) — not just louder, clearer">✨ Clarity boost</label>
+      </div>
+      <label class="xx-small text-muted mb-0">Speed</label>
+      <input type="number" class="form-control form-control-sm" min="0.25" max="4" step="0.05" placeholder="1.0" value="${edit.speed ?? ""}" data-edit-field="speed" style="width:70px;" title="Playback speed, 0.25-4.0x — pitch stays natural (time-stretch, not resample)">
+      <label class="xx-small text-muted mb-0">Loop</label>
+      <input type="number" class="form-control form-control-sm" min="1" max="20" step="1" placeholder="1" value="${edit.loopCount ?? ""}" data-edit-field="loopCount" style="width:60px;" title="Repeat this clip N times">
+    </div>
+    <div class="d-flex align-items-center gap-2">
+      <button type="button" class="btn btn-sm btn-outline-primary" data-edit-preview="${editRef}">▶ Preview edit</button>
+      <button type="button" class="btn btn-sm btn-outline-secondary" data-edit-compare="${editRef}" title="Play the original, unedited clip for a real A/B comparison">🔁 Compare original</button>
+      <span class="xx-small" data-edit-preview-result="${editRef}"></span>
+    </div>
+  </div>`;
+}
+document.getElementById("mixerConsoleTabPane")?.addEventListener("click", async (e) => {
+  const toggleBtn = e.target.closest("[data-edit-toggle]");
+  if (toggleBtn) {
+    const ref = toggleBtn.getAttribute("data-edit-toggle");
+    const panels = document.querySelectorAll(`[data-edit-panel="${CSS.escape(ref)}"]`);
+    panels.forEach((panel) => panel.classList.toggle("d-none"));
+    // Loads (or just re-renders, if already decoded) the waveform only
+    // when the panel is actually opened — decoding audio client-side
+    // isn't free, no reason to do it for every item up front.
+    const nowOpen = panels[0] && !panels[0].classList.contains("d-none");
+    if (nowOpen) loadWaveformForPanel(ref);
+    return;
+  }
+  const previewBtn = e.target.closest("[data-edit-preview]");
+  if (previewBtn) {
+    const ref = previewBtn.getAttribute("data-edit-preview");
+    const item = resolveEditRef(ref);
+    if (!item) return;
+    const resultEl = document.querySelector(`[data-edit-preview-result="${CSS.escape(ref)}"]`);
+    const originalLabel = previewBtn.innerHTML;
+    previewBtn.disabled = true;
+    previewBtn.innerHTML = "Rendering...";
+    try {
+      const { res, data } = await fetchJson("/api/audio/mixer/edit-preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source: item.audio, edit: item.edit || {} }),
+      });
+      if (!res.ok) throw new Error(data.error || "Preview failed.");
+      if (resultEl) resultEl.innerHTML = `<audio controls src="${data.downloadUrl}" style="height:28px; vertical-align:middle;"></audio>`;
+    } catch (err) {
+      if (resultEl) resultEl.innerHTML = `<span class="text-danger">${escapeHtml(err.message)}</span>`;
+    } finally {
+      previewBtn.disabled = false;
+      previewBtn.innerHTML = originalLabel;
+    }
+    return;
+  }
+  const compareBtn = e.target.closest("[data-edit-compare]");
+  if (compareBtn) {
+    const ref = compareBtn.getAttribute("data-edit-compare");
+    const item = resolveEditRef(ref);
+    if (!item?.audio) return;
+    // Plays the RAW, unedited source directly — real A/B comparison
+    // against whatever's showing in the "Preview edit" result above,
+    // using the same shared player everything else in the Mixer uses
+    // (so it correctly stops whatever else was playing).
+    toggleMixerPreview(`compare:${ref}`, item.audio);
+    return;
+  }
+  const boostSeekBtn = e.target.closest("[data-boost-use-playhead]");
+  if (boostSeekBtn) {
+    const ref = boostSeekBtn.getAttribute("data-boost-use-playhead");
+    const panel = document.querySelector(`[data-edit-panel="${ref}"]`);
+    const pos = lastSeekPosition[ref];
+    if (pos == null) return alert("Click somewhere on the waveform above first to set a seek position.");
+    const startInput = panel?.querySelector('[data-edit-field="boostStart"]');
+    const endInput = panel?.querySelector('[data-edit-field="boostEnd"]');
+    const item = resolveEditRef(ref);
+    if (item) {
+      item.edit = item.edit || {};
+      item.edit.boostStart = +pos.toFixed(2);
+      item.edit.boostEnd = +Math.min(pos + 3, waveformCache[ref]?.duration || pos + 3).toFixed(2); // a real, sensible default window (3s) starting right where they sought to — always editable afterward
+      if (startInput) startInput.value = item.edit.boostStart;
+      if (endInput) endInput.value = item.edit.boostEnd;
+    }
+    return;
+  }
+});
+document.getElementById("mixerConsoleTabPane")?.addEventListener("input", (e) => {
+  const field = e.target.getAttribute("data-edit-field");
+  if (!field) return;
+  const panel = e.target.closest("[data-edit-panel]");
+  const ref = panel?.getAttribute("data-edit-panel");
+  const item = ref ? resolveEditRef(ref) : null;
+  if (!item) return;
+  item.edit = item.edit || {};
+  if (field === "removeSilence" || field === "reverse" || field === "normalize" || field === "clarity" || field === "denoise") item.edit[field] = e.target.checked;
+  else item.edit[field] = e.target.value ? parseFloat(e.target.value) : undefined;
+  // Keep the visual selection in sync when the numeric fields are typed
+  // directly, not just when dragging on the waveform.
+  if ((field === "trimStart" || field === "trimEnd") && waveformCache[ref]) renderWaveformCanvas(ref);
+});
+function renderMixerIntroOutro() {
+  scheduleMixerSessionSave();
+  const typeIcon = { voice: "🎙️", song: "🎵", sfx: "🔊", upload: "📁", mix: "🎛️" };
+  const introEl = document.getElementById("mixerIntroSlot");
+  if (introEl) {
+    introEl.innerHTML = state.mixerIntro
+      ? `<div class="d-flex align-items-center gap-1">${previewButtonHtml(state.mixerIntro)}<span class="xx-small flex-grow-1">${typeIcon[state.mixerIntro.type] || ""} ${escapeHtml(state.mixerIntro.name)}</span>${editButtonHtml("intro")}<button type="button" class="btn btn-sm btn-outline-danger py-0 px-1" data-mixer-action="clear-intro">✕</button></div>${editPanelHtml("intro", state.mixerIntro.edit)}`
+      : `<span class="text-muted xx-small">No intro set.</span>`;
+  }
+  const outroEl = document.getElementById("mixerOutroSlot");
+  if (outroEl) {
+    outroEl.innerHTML = state.mixerOutro
+      ? `<div class="d-flex align-items-center gap-1">${previewButtonHtml(state.mixerOutro)}<span class="xx-small flex-grow-1">${typeIcon[state.mixerOutro.type] || ""} ${escapeHtml(state.mixerOutro.name)}</span>${editButtonHtml("outro")}<button type="button" class="btn btn-sm btn-outline-danger py-0 px-1" data-mixer-action="clear-outro">✕</button></div>${editPanelHtml("outro", state.mixerOutro.edit)}`
+      : `<span class="text-muted xx-small">No outro set.</span>`;
+  }
+}
+document.getElementById("mixerIntroSlot")?.addEventListener("click", (e) => {
+  if (e.target.closest('[data-mixer-action="clear-intro"]')) { state.mixerIntro = null; renderMixerIntroOutro(); }
+});
+document.getElementById("mixerOutroSlot")?.addEventListener("click", (e) => {
+  if (e.target.closest('[data-mixer-action="clear-outro"]')) { state.mixerOutro = null; renderMixerIntroOutro(); }
+});
+// ============================================================
+// LOCAL UPLOAD — "what if we had some local audios to work around" —
+// reads the file entirely client-side (FileReader, no upload-size
+// limit imposed by any API), saves it into the SAME Audio Library
+// every generated clip already lives in (a new real "upload" type, not
+// a second separate storage system) so it shows up in the Mixer's
+// library list exactly like anything else and persists across
+// sessions, not just for this one render.
+// ============================================================
+document.getElementById("mixerUploadInput")?.addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  const label = document.querySelector('label[for="mixerUploadInput"]');
+  const originalLabel = label?.innerHTML;
+  if (label) label.innerHTML = "📁 Uploading...";
+  try {
+    const dataUri = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error("Couldn't read that file."));
+      reader.readAsDataURL(file);
+    });
+    const { res, data } = await fetchJson("/api/audio-library", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "upload", name: file.name.replace(/\.[^/.]+$/, ""), audioDataUri: dataUri }),
+    });
+    if (!res.ok) throw new Error(data.error || "Upload failed.");
+    await loadMixerLibrary();
+  } catch (err) {
+    alert("Couldn't add that file: " + err.message);
+  } finally {
+    if (label) label.innerHTML = originalLabel;
+    e.target.value = ""; // allow re-selecting the same file later
+  }
+});
+
+// ============================================================
+// AUDIO TOOLS — standalone utilities, real ffmpeg-backed offline
+// processing (except Re-voice, a genuine AI call). Each tool's
+// "pick from library" select shares the same typeIcon convention and
+// full-library fetch already used throughout the Mixer.
+// ============================================================
+async function populateAudioToolsLibrarySelects() {
+  const typeIcon = { voice: "🎙️", song: "🎵", sfx: "🔊", upload: "📁", mix: "🎛️" };
+  try {
+    const { res, data } = await fetchJson("/api/audio-library");
+    if (!res.ok) return;
+    const items = data.items || [];
+    state.audioToolsLibraryItems = items;
+    const optionsHtml = items.map((it) => `<option value="${it.id}">${typeIcon[it.type] || ""} ${escapeHtml(it.name)}</option>`).join("");
+    const selects = [
+      { id: "toolsConvertSource", placeholder: "Pick a clip from your library..." },
+      { id: "toolsRingtoneSource", placeholder: "Pick a clip from your library..." },
+      { id: "toolsRevoiceSource", placeholder: "Source clip (what to convert)..." },
+    ];
+    selects.forEach(({ id, placeholder }) => {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = `<option value="">${placeholder}</option>${optionsHtml}`;
+    });
+    // REAL FIX: the target-voice picker used to show the SAME full
+    // library as everything else — songs, SFX, Mixer renders, even
+    // other AI-generated TTS takes, none of which make sense as a
+    // voice-conversion TARGET (converting audio to sound like a
+    // synthesized voice, or a song, isn't what this tool is for). Only
+    // real human voice references belong here.
+    //
+    // SECOND REAL FIX, this round: this used to silently show NOTHING
+    // for any voice cloned before the previous fix (which started
+    // saving the actual reference recording alongside the clone) —
+    // confusing, since your named voices (like "vemuri") would just
+    // vanish with no explanation. Now every voice in state.customVoices
+    // (the real, authoritative source of your saved clones) is listed
+    // by name, cross-referenced against the library for its actual
+    // reference audio. Found -> selectable. Not found (cloned before
+    // the fix, recording genuinely never kept) -> shown anyway, but
+    // disabled with a clear reason and a real next step, instead of
+    // just disappearing.
+    const targetSelect = document.getElementById("toolsRevoiceTarget");
+    if (targetSelect) {
+      const uploadItems = items.filter((it) => it.type === "upload");
+      const matchedVoiceIds = new Set();
+      const customVoiceOptions = (state.customVoices || []).map((cv) => {
+        const ref = uploadItems.find((it) => it.name === `${cv.name} (voice reference)`);
+        if (ref) matchedVoiceIds.add(ref.id);
+        return ref
+          ? `<option value="${ref.id}">🎙️ ${escapeHtml(cv.name)}</option>`
+          : `<option value="" disabled>🎙️ ${escapeHtml(cv.name)} — no reference saved (cloned before this feature existed; re-clone or upload a sample of this voice below)</option>`;
+      }).join("");
+      // Anything else uploaded that ISN'T already matched to a named
+      // custom voice above (a plain "upload a voice sample" you did
+      // directly, not through cloning) — still real, still usable.
+      const otherUploads = uploadItems.filter((it) => !matchedVoiceIds.has(it.id));
+      const otherOptionsHtml = otherUploads.map((it) => `<option value="${it.id}">📁 ${escapeHtml(it.name)}</option>`).join("");
+      targetSelect.innerHTML = `<option value="">Target voice (whose voice to use)...</option>${customVoiceOptions}${otherOptionsHtml}`;
+    }
+  } catch {} // best-effort — tools still usable via upload where applicable, just without the library shortcuts
+}
+function findAudioToolsLibraryItem(id) {
+  return (state.audioToolsLibraryItems || []).find((it) => String(it.id) === id);
+}
+function renderToolResult(elId, data, filenameBase) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  el.innerHTML = `<audio controls class="w-100 mb-1" src="${data.downloadUrl}"></audio><a href="${data.downloadUrl}" download class="btn btn-sm btn-dark fw-bold w-100">⬇️ Download (${(data.sizeBytes / 1024).toFixed(0)} KB)</a>`;
+  if (data.libraryItemId) el.innerHTML += `<div class="xx-small text-success mt-1">✅ Saved to your Audio Library too.</div>`;
+}
+// ============================================================
+// TOOL UPLOADS — real "works on outside-the-app audio too, not just
+// what this app generated" fix: every tool below (Convert, Ringtone,
+// Re-voice's source AND target) now takes a direct file upload as a
+// genuine alternative to picking from the library, not just Extract-
+// from-video. An upload always takes priority over whatever's picked
+// in the library dropdown for that same slot — resolveToolSource
+// checks the upload first, falls back to the library selection.
+// ============================================================
+state.audioToolsUploads = state.audioToolsUploads || {};
+function wireToolUpload(uploadInputId, statusId, selectId, stateKey) {
+  document.getElementById(uploadInputId)?.addEventListener("change", (e) => {
+    const file = e.target.files?.[0];
+    const statusEl = document.getElementById(statusId);
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      state.audioToolsUploads[stateKey] = ev.target.result;
+      if (statusEl) statusEl.textContent = `Using uploaded file "${file.name}" (overrides the library pick above).`;
+      const selectEl = document.getElementById(selectId);
+      if (selectEl) selectEl.value = ""; // visually clear the library pick so it's obvious which source will actually be used
+    };
+    reader.readAsDataURL(file);
+  });
+  // Picking from the library again after an upload should let the
+  // library win back — otherwise the upload would silently and
+  // permanently shadow the dropdown for the rest of the session.
+  document.getElementById(selectId)?.addEventListener("change", (e) => {
+    if (e.target.value) {
+      delete state.audioToolsUploads[stateKey];
+      const statusEl = document.getElementById(statusId);
+      if (statusEl) statusEl.textContent = "";
+    }
+  });
+}
+wireToolUpload("toolsConvertUpload", "toolsConvertUploadStatus", "toolsConvertSource", "convertSource");
+wireToolUpload("toolsRingtoneUpload", "toolsRingtoneUploadStatus", "toolsRingtoneSource", "ringtoneSource");
+wireToolUpload("toolsRevoiceSourceUpload", "toolsRevoiceSourceUploadStatus", "toolsRevoiceSource", "revoiceSource");
+wireToolUpload("toolsRevoiceTargetUpload", "toolsRevoiceTargetUploadStatus", "toolsRevoiceTarget", "revoiceTarget");
+function resolveToolSource(stateKey, selectId) {
+  if (state.audioToolsUploads[stateKey]) return state.audioToolsUploads[stateKey];
+  const item = findAudioToolsLibraryItem(document.getElementById(selectId)?.value);
+  return item ? item.audio : null;
+}
+// ============================================================
+// REGION SELECTOR — reuses the exact waveform+drag system already
+// proven in the Mixer's edit panel (resolveEditRef now recognizes a
+// "revoice-region" key pointing at state.revoiceRegionItem — see
+// resolveEditRef above), rather than a second parallel implementation.
+// Its .edit.trimStart/trimEnd fields double as the SELECTED REGION
+// markers here — never sent through applyEditsToLocalFile as real
+// edits, only read directly as the region bounds for the two backend
+// routes below.
+// ============================================================
+function loadRevoiceSourceWaveform() {
+  const source = resolveToolSource("revoiceSource", "toolsRevoiceSource");
+  const regionSection = document.getElementById("toolsRevoiceRegionSection");
+  const regionBtn = document.getElementById("toolsRevoiceRegionBtn");
+  const showCorrectBtn = document.getElementById("toolsRevoiceShowCorrectBtn");
+  if (!source) {
+    regionSection?.classList.add("d-none");
+    regionBtn?.classList.add("d-none");
+    showCorrectBtn?.classList.add("d-none");
+    return;
+  }
+  state.revoiceRegionItem = { type: "revoice", id: "region", name: "Selected clip", audio: source, edit: {} };
+  regionSection?.classList.remove("d-none");
+  loadWaveformForPanel("revoice-region");
+}
+document.getElementById("toolsRevoiceSource")?.addEventListener("change", loadRevoiceSourceWaveform);
+document.getElementById("toolsRevoiceSourceUpload")?.addEventListener("change", () => setTimeout(loadRevoiceSourceWaveform, 50)); // small delay lets the FileReader in wireToolUpload finish first
+// A meaningful region selection (not just the default full range) reveals
+// the region-only actions — checked whenever the waveform selection changes.
+function checkRevoiceRegionSelected() {
+  const item = state.revoiceRegionItem;
+  const cached = waveformCache["revoice-region"];
+  const hasRegion = item?.edit?.trimStart != null && item?.edit?.trimEnd != null && cached
+    && (item.edit.trimStart > 0.05 || item.edit.trimEnd < cached.duration - 0.05);
+  document.getElementById("toolsRevoiceRegionBtn")?.classList.toggle("d-none", !hasRegion);
+  document.getElementById("toolsRevoiceShowCorrectBtn")?.classList.toggle("d-none", !hasRegion);
+  if (!hasRegion) document.getElementById("toolsRevoiceCorrectSection")?.classList.add("d-none");
+}
+// Polls after any waveform interaction rather than hooking deep into
+// the shared drag handlers — simplest way to react to a selection
+// change without touching code the Mixer's edit panel also depends on.
+document.getElementById("toolsRevoiceRegionSection")?.addEventListener("mouseup", () => setTimeout(checkRevoiceRegionSelected, 50));
+document.getElementById("toolsRevoiceRegionSection")?.addEventListener("touchend", () => setTimeout(checkRevoiceRegionSelected, 50));
+
+document.getElementById("toolsRevoiceShowCorrectBtn")?.addEventListener("click", async () => {
+  document.getElementById("toolsRevoiceCorrectSection")?.classList.remove("d-none");
+  const selectEl = document.getElementById("toolsCorrectVoiceSelect");
+  if (!selectEl || selectEl.dataset.populated) return;
+  selectEl.dataset.populated = "1";
+  const groups = [];
+  if ((state.customVoices || []).length) {
+    groups.push(`<optgroup label="Your cloned voices">${state.customVoices.map((cv) => `<option value="custom:${cv.custom_voice_id}">🎙️ ${escapeHtml(cv.name)}</option>`).join("")}</optgroup>`);
+  }
+  const standardVoices = (state.voiceModels || []).find((m) => m.id === "fal-ai/minimax/speech-02-hd")?.confirmedVoiceIds || [];
+  groups.push(`<optgroup label="Standard voices (MiniMax)">${standardVoices.map((v) => `<option value="standard:${v.id}">${escapeHtml(v.label || v.id)}</option>`).join("")}</optgroup>`);
+  selectEl.innerHTML = `<option value="">Pick a voice...</option>${groups.join("")}`;
+});
+document.getElementById("toolsRevoiceRegionBtn")?.addEventListener("click", async () => {
+  const source = resolveToolSource("revoiceSource", "toolsRevoiceSource");
+  const targetVoiceAudio = resolveToolSource("revoiceTarget", "toolsRevoiceTarget");
+  const region = state.revoiceRegionItem?.edit;
+  if (!source || region?.trimStart == null) return;
+  if (!targetVoiceAudio) return alert("Pick a target voice, or upload a sample of the voice you want.");
+  const userKey = getUserKey();
+  if (!userKey) return alert("This is a real paid AI call — add your Fal API key in Settings first.");
+  const btn = document.getElementById("toolsRevoiceRegionBtn");
+  const originalLabel = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = "🔄 Re-voicing region...";
+  try {
+    const { res, data } = await fetchJson("/api/audio/mixer/revoice-region", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceAudio: source, targetVoiceAudio, regionStart: region.trimStart || 0, regionEnd: region.trimEnd, userApiKey: userKey }),
+    });
+    if (!res.ok) throw new Error(data.error || "Region re-voicing failed.");
+    await refreshCreditsSummary();
+    renderToolResult("toolsRevoiceResult", data, "region-revoiced");
+  } catch (err) {
+    document.getElementById("toolsRevoiceResult").innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalLabel;
+  }
+});
+document.getElementById("toolsCorrectRegionBtn")?.addEventListener("click", async () => {
+  const source = resolveToolSource("revoiceSource", "toolsRevoiceSource");
+  const region = state.revoiceRegionItem?.edit;
+  const correctedText = document.getElementById("toolsCorrectText")?.value?.trim();
+  const voiceChoice = document.getElementById("toolsCorrectVoiceSelect")?.value;
+  if (!source || region?.trimStart == null) return;
+  if (!correctedText) return alert("Type the corrected text for this region.");
+  if (!voiceChoice) return alert("Pick a voice for the correction.");
+  const userKey = getUserKey();
+  if (!userKey) return alert("This is a real paid AI call — add your Fal API key in Settings first.");
+  const [voiceKind, voiceIdValue] = voiceChoice.split(":");
+  const btn = document.getElementById("toolsCorrectRegionBtn");
+  const originalLabel = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = "✏️ Correcting region...";
+  try {
+    const { res, data } = await fetchJson("/api/audio/mixer/correct-region", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sourceAudio: source,
+        correctedText,
+        modelId: voiceKind === "custom" ? "fal-ai/minimax/speech-02-hd" : undefined,
+        voiceId: voiceIdValue,
+        regionStart: region.trimStart || 0,
+        regionEnd: region.trimEnd,
+        userApiKey: userKey,
+      }),
+    });
+    if (!res.ok) throw new Error(data.error || "Region correction failed.");
+    await refreshCreditsSummary();
+    renderToolResult("toolsCorrectResult", data, "region-corrected");
+  } catch (err) {
+    document.getElementById("toolsCorrectResult").innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalLabel;
+  }
+});
+
+// --- Extract audio from video ---
+let toolsVideoBase64 = null;
+document.getElementById("toolsVideoUpload")?.addEventListener("change", (e) => {
+  const file = e.target.files?.[0];
+  const btn = document.getElementById("toolsExtractBtn");
+  const status = document.getElementById("toolsVideoStatus");
+  if (!file) { btn.disabled = true; return; }
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    toolsVideoBase64 = ev.target.result;
+    if (status) status.textContent = `Ready: "${file.name}"`;
+    if (btn) btn.disabled = false;
+  };
+  reader.readAsDataURL(file);
+});
+document.getElementById("toolsExtractBtn")?.addEventListener("click", async () => {
+  if (!toolsVideoBase64) return;
+  const btn = document.getElementById("toolsExtractBtn");
+  const originalLabel = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = "🎬 Extracting...";
+  try {
+    const { res, data } = await fetchJson("/api/audio/tools/extract-from-video", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: toolsVideoBase64, format: document.getElementById("toolsVideoFormat")?.value || "mp3" }),
+    });
+    if (!res.ok) throw new Error(data.error || "Extraction failed.");
+    renderToolResult("toolsExtractResult", data, "extracted-audio");
+    populateAudioToolsLibrarySelects(); // the extracted clip is now in the library too — refresh so it's immediately pickable in the other tools below
+  } catch (err) {
+    document.getElementById("toolsExtractResult").innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalLabel;
+  }
+});
+
+// --- Convert format ---
+document.getElementById("toolsConvertBtn")?.addEventListener("click", async () => {
+  const source = resolveToolSource("convertSource", "toolsConvertSource");
+  if (!source) return alert("Pick a clip from your library or upload a file first.");
+  const btn = document.getElementById("toolsConvertBtn");
+  const originalLabel = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = "🔁 Converting...";
+  try {
+    const { res, data } = await fetchJson("/api/audio/tools/convert-format", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, format: document.getElementById("toolsConvertFormat")?.value || "mp3" }),
+    });
+    if (!res.ok) throw new Error(data.error || "Conversion failed.");
+    renderToolResult("toolsConvertResult", data, "converted-audio");
+  } catch (err) {
+    document.getElementById("toolsConvertResult").innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalLabel;
+  }
+});
+
+// --- Ringtone maker ---
+document.getElementById("toolsRingtoneBtn")?.addEventListener("click", async () => {
+  const source = resolveToolSource("ringtoneSource", "toolsRingtoneSource");
+  if (!source) return alert("Pick a clip from your library or upload a song/file first.");
+  const btn = document.getElementById("toolsRingtoneBtn");
+  const originalLabel = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = "📱 Making ringtone...";
+  try {
+    const startVal = parseFloat(document.getElementById("toolsRingtoneStart")?.value);
+    const endVal = parseFloat(document.getElementById("toolsRingtoneEnd")?.value);
+    const { res, data } = await fetchJson("/api/audio/tools/make-ringtone", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source,
+        trimStart: isNaN(startVal) ? 0 : startVal,
+        trimEnd: isNaN(endVal) ? undefined : endVal,
+        platform: document.getElementById("toolsRingtonePlatform")?.value || "android",
+      }),
+    });
+    if (!res.ok) throw new Error(data.error || "Ringtone creation failed.");
+    renderToolResult("toolsRingtoneResult", data, "ringtone");
+  } catch (err) {
+    document.getElementById("toolsRingtoneResult").innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalLabel;
+  }
+});
+
+// --- Re-voice (real AI voice conversion) ---
+document.getElementById("toolsRevoiceBtn")?.addEventListener("click", async () => {
+  const sourceAudio = resolveToolSource("revoiceSource", "toolsRevoiceSource");
+  const targetVoiceAudio = resolveToolSource("revoiceTarget", "toolsRevoiceTarget");
+  if (!sourceAudio) return alert("Pick the clip you want to convert, or upload one.");
+  if (!targetVoiceAudio) return alert("Pick a target voice, or upload a sample of the voice you want — any person's voice, doesn't need to already be cloned in this app.");
+  const userKey = getUserKey();
+  if (!userKey) return alert("This is a real paid AI call — add your Fal API key in Settings first.");
+  const btn = document.getElementById("toolsRevoiceBtn");
+  const originalLabel = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = "🔄 Re-voicing (real AI call)...";
+  try {
+    const { res, data } = await fetchJson("/api/audio/mixer/revoice", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceAudio, targetVoiceAudio, userApiKey: userKey }),
+    });
+    if (!res.ok) throw new Error(data.error || "Re-voicing failed.");
+    await refreshCreditsSummary();
+    const resultEl = document.getElementById("toolsRevoiceResult");
+    resultEl.innerHTML = `<audio controls class="w-100 mb-1" src="${data.audio}"></audio><a href="${data.audio}" data-download-url="${data.audio}" data-download-filename="revoiced-${Date.now()}.mp3" class="btn btn-sm btn-dark fw-bold w-100">⬇️ Download</a>`;
+    saveToAudioLibrary({ type: "voice", name: `Re-voiced clip — ${new Date().toLocaleString()}`, audioDataUri: data.audio, silent: true });
+  } catch (err) {
+    document.getElementById("toolsRevoiceResult").innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalLabel;
+  }
+});
+
+async function loadMixerLibrary() {
+  const listEl = document.getElementById("mixerLibraryList");
+  const warningEl = document.getElementById("mixerFfmpegWarning");
+  if (!listEl) return;
+  try {
+    const { res: ffRes, data: ffData } = await fetchJson("/api/audio/mixer/ffmpeg-status");
+    const available = ffRes.ok && !!ffData.localFfmpegAvailable;
+    if (warningEl) {
+      warningEl.classList.toggle("d-none", available);
+      // Real npm-native dependency (ffmpeg-static) — if this still
+      // shows, npm install genuinely hasn't been run, not something
+      // that needs a manual OS-level install step.
+      if (!available) warningEl.innerHTML = `⚠️ ffmpeg isn't set up on this server yet. Run <code>npm install</code> in the project folder (it's a real npm dependency — ffmpeg-static — not a separate manual install), then restart the server. <button type="button" class="btn btn-sm btn-outline-dark mt-1" id="mixerFfmpegRecheckBtn">🔄 Recheck</button>`;
+    }
+  } catch {}
+  const typeFilter = document.getElementById("mixerLibraryTypeFilter")?.value || "";
+  try {
+    const { res, data } = await fetchJson(`/api/audio-library${typeFilter ? `?type=${typeFilter}` : ""}`);
+    if (!res.ok) return;
+    state.mixerLibraryItems = data.items || [];
+    const typeIcon = { voice: "🎙️", song: "🎵", sfx: "🔊", upload: "📁", mix: "🎛️" };
+    listEl.innerHTML = state.mixerLibraryItems.length
+      ? state.mixerLibraryItems.map((item) => `
+        <div class="d-flex align-items-center gap-1 border rounded p-1">
+          <span class="xx-small flex-grow-1 text-truncate">${typeIcon[item.type] || ""} ${escapeHtml(item.name)}</span>
+          ${previewButtonHtml(item)}
+          <select class="form-select form-select-sm py-0" style="width:auto; font-size:0.72rem;" data-mixer-add-select data-item-id="${item.id}">
+            <option value="">Add as...</option>
+            <option value="intro">⏮ Intro</option>
+            <option value="main">➕ Main</option>
+            <option value="outro">⏭ Outro</option>
+            <option value="bg">🎧 Background</option>
+            <option value="overlay">⏱ Overlay</option>
+          </select>
+        </div>`).join("")
+      : `<span class="xx-small text-muted">Nothing in your library yet — generate a voice take, song, or SFX first.</span>`;
+  } catch {}
+}
+function renderMixerMainTrack() {
+  scheduleMixerSessionSave();
+  const listEl = document.getElementById("mixerMainTrackList");
+  if (!listEl) return;
+  if (!state.mixerMainTrack.length) {
+    listEl.innerHTML = `<span class="text-muted xx-small" id="mixerMainTrackEmpty">Add clips from your library on the left.</span>`;
+    return;
+  }
+  const typeIcon = { voice: "🎙️", song: "🎵", sfx: "🔊", upload: "📁", mix: "🎛️" };
+  listEl.innerHTML = state.mixerMainTrack.map((item, i) => `
+    <div class="border rounded p-1">
+    <div class="d-flex align-items-center gap-1">
+      <span class="xx-small text-muted">${i + 1}.</span>
+      <span class="xx-small flex-grow-1 text-truncate">${typeIcon[item.type] || ""} ${escapeHtml(item.name)}</span>
+      ${previewButtonHtml(item)}
+      ${editButtonHtml(`main:${i}`)}
+      <button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" data-mixer-track-action="up" data-track-index="${i}" ${i === 0 ? "disabled" : ""}>↑</button>
+      <button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" data-mixer-track-action="down" data-track-index="${i}" ${i === state.mixerMainTrack.length - 1 ? "disabled" : ""}>↓</button>
+      <button type="button" class="btn btn-sm btn-outline-danger py-0 px-1" data-mixer-track-action="remove" data-track-index="${i}">✕</button>
+    </div>
+    ${editPanelHtml(`main:${i}`, item.edit)}
+    </div>`).join("");
+}
+function renderMixerBackground() {
+  scheduleMixerSessionSave();
+  const slotEl = document.getElementById("mixerBackgroundTrackSlot");
+  if (!slotEl) return;
+  const typeIcon = { voice: "🎙️", song: "🎵", sfx: "🔊", upload: "📁", mix: "🎛️" };
+  slotEl.innerHTML = state.mixerBackground
+    ? `<div class="d-flex align-items-center gap-1"><span class="xx-small flex-grow-1">${typeIcon[state.mixerBackground.type] || ""} ${escapeHtml(state.mixerBackground.name)}</span>${previewButtonHtml(state.mixerBackground)}${editButtonHtml("bg")}<button type="button" class="btn btn-sm btn-outline-danger py-0 px-1" data-mixer-action="clear-bg">✕</button></div>${editPanelHtml("bg", state.mixerBackground.edit)}`
+    : `<span class="text-muted xx-small">No background clip set.</span>`;
+}
+// ============================================================
+// TIMED OVERLAYS — the actual "canvas" piece: any number of clips,
+// each independently placed at an exact second on top of the whole
+// mix, not looped (a background loops; an overlay is a one-shot hit —
+// real, different ffmpeg behavior, see audio-mixer.js's mixLayers).
+// ============================================================
+state.mixerOverlays = state.mixerOverlays || []; // array of { item, delaySeconds, volume }
+function renderMixerOverlays() {
+  scheduleMixerSessionSave();
+  const listEl = document.getElementById("mixerOverlaysList");
+  if (!listEl) return;
+  const typeIcon = { voice: "🎙️", song: "🎵", sfx: "🔊", upload: "📁", mix: "🎛️" };
+  if (!state.mixerOverlays.length) {
+    listEl.innerHTML = `<span class="text-muted xx-small" id="mixerOverlaysEmpty">Click ⏱ on a library item to place it at a specific moment.</span>`;
+    return;
+  }
+  listEl.innerHTML = state.mixerOverlays.map((ov, i) => `
+    <div class="border rounded p-1" data-overlay-index="${i}">
+    <div class="d-flex align-items-center gap-1">
+      <span class="xx-small flex-grow-1 text-truncate">${typeIcon[ov.item.type] || ""} ${escapeHtml(ov.item.name)}</span>
+      ${previewButtonHtml(ov.item)}
+      ${editButtonHtml(`overlay:${i}`)}
+      <label class="xx-small text-muted mb-0">at</label>
+      <input type="number" class="form-control form-control-sm" style="width:60px;" min="0" step="0.5" value="${ov.delaySeconds}" data-overlay-field="delaySeconds">
+      <label class="xx-small text-muted mb-0">s, vol</label>
+      <input type="range" class="form-range" style="max-width:70px;" min="0" max="1" step="0.05" value="${ov.volume}" data-overlay-field="volume">
+      <button type="button" class="btn btn-sm btn-outline-danger py-0 px-1" data-mixer-overlay-remove="1">✕</button>
+    </div>
+    ${editPanelHtml(`overlay:${i}`, ov.item.edit)}
+    </div>`).join("");
+}
+document.getElementById("mixerOverlaysList")?.addEventListener("input", (e) => {
+  const row = e.target.closest("[data-overlay-index]");
+  const field = e.target.getAttribute("data-overlay-field");
+  if (!row || !field) return;
+  const i = parseInt(row.getAttribute("data-overlay-index"));
+  state.mixerOverlays[i][field] = parseFloat(e.target.value) || 0;
+});
+document.getElementById("mixerOverlaysList")?.addEventListener("click", (e) => {
+  if (!e.target.closest("[data-mixer-overlay-remove]")) return;
+  const row = e.target.closest("[data-overlay-index]");
+  state.mixerOverlays.splice(parseInt(row.getAttribute("data-overlay-index")), 1);
+  renderMixerOverlays();
+});
+document.getElementById("mixerLibraryTypeFilter")?.addEventListener("change", loadMixerLibrary);
+state.mixerIntro = state.mixerIntro || null; // one library item object with attached edit options, or null
+state.mixerOutro = state.mixerOutro || null;
+document.getElementById("mixerLibraryList")?.addEventListener("change", (e) => {
+  const sel = e.target.closest("[data-mixer-add-select]");
+  if (!sel || !sel.value) return;
+  const itemId = sel.getAttribute("data-item-id");
+  const item = (state.mixerLibraryItems || []).find((i) => String(i.id) === itemId);
+  if (!item) return;
+  const itemWithEdit = { ...item, edit: {} }; // each placement gets its OWN independent edit options — trimming this clip as an intro shouldn't affect the same clip used elsewhere
+  if (sel.value === "main") {
+    state.mixerMainTrack.push(itemWithEdit);
+    renderMixerMainTrack();
+  } else if (sel.value === "bg") {
+    state.mixerBackground = itemWithEdit;
+    renderMixerBackground();
+  } else if (sel.value === "overlay") {
+    state.mixerOverlays.push({ item: itemWithEdit, delaySeconds: 0, volume: 0.8 });
+    renderMixerOverlays();
+  } else if (sel.value === "intro") {
+    state.mixerIntro = itemWithEdit;
+    renderMixerIntroOutro();
+  } else if (sel.value === "outro") {
+    state.mixerOutro = itemWithEdit;
+    renderMixerIntroOutro();
+  }
+  sel.value = ""; // reset so the same dropdown can be used again immediately
+});
+document.getElementById("mixerBackgroundTrackSlot")?.addEventListener("click", (e) => {
+  if (e.target.closest('[data-mixer-action="clear-bg"]')) {
+    state.mixerBackground = null;
+    renderMixerBackground();
+  }
+});
+document.getElementById("mixerMainTrackList")?.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-mixer-track-action]");
+  if (!btn) return;
+  const idx = parseInt(btn.getAttribute("data-track-index"));
+  const action = btn.getAttribute("data-mixer-track-action");
+  if (action === "remove") state.mixerMainTrack.splice(idx, 1);
+  else if (action === "up" && idx > 0) [state.mixerMainTrack[idx - 1], state.mixerMainTrack[idx]] = [state.mixerMainTrack[idx], state.mixerMainTrack[idx - 1]];
+  else if (action === "down" && idx < state.mixerMainTrack.length - 1) [state.mixerMainTrack[idx + 1], state.mixerMainTrack[idx]] = [state.mixerMainTrack[idx], state.mixerMainTrack[idx + 1]];
+  renderMixerMainTrack();
+});
+document.getElementById("mixerRenderBtn")?.addEventListener("click", async () => {
+  const resultEl = document.getElementById("mixerRenderResult");
+  if (!state.mixerMainTrack.length) return alert("Add at least one clip to the Main track first.");
+  const btn = document.getElementById("mixerRenderBtn");
+  btn.disabled = true;
+  const originalLabel = btn.innerHTML;
+  btn.innerHTML = "🎛️ Rendering...";
+  resultEl.innerHTML = "";
+  // Shapes an item (with whatever edit options were set on it in the
+  // UI) into exactly what the backend's normalizeClientSource expects
+  // — a bare source string when there are no real edits to apply, or
+  // {source, edit} when there are, so an unedited clip isn't sent
+  // through an extra no-op processing pass.
+  const toSourceEntry = (item) => (item.edit && Object.keys(item.edit).length ? { source: item.audio, edit: item.edit } : item.audio);
+  try {
+    const { res, data } = await fetchJson("/api/audio/mixer/render", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        introSource: state.mixerIntro ? toSourceEntry(state.mixerIntro) : null,
+        mainTrackSources: state.mixerMainTrack.map(toSourceEntry),
+        outroSource: state.mixerOutro ? toSourceEntry(state.mixerOutro) : null,
+        backgroundSource: state.mixerBackground ? toSourceEntry(state.mixerBackground) : null,
+        backgroundVolume: parseFloat(document.getElementById("mixerBackgroundVolume")?.value) || 0.25,
+        backgroundDuck: !!document.getElementById("mixerBackgroundDuck")?.checked,
+        mixDuration: document.getElementById("mixerDurationMode")?.value || "matchMain",
+        overlays: state.mixerOverlays.map((ov) => ({ ...toSourceEntryAsObject(ov.item), delaySeconds: ov.delaySeconds, volume: ov.volume })),
+      }),
+    });
+    if (!res.ok) throw new Error(data.error || "Render failed.");
+    // libraryItemId is deliberately stripped from what renderAudioResult
+    // sees here — it's handled below instead with a richer "keep
+    // editing" action, so the same result doesn't show two near-
+    // identical "saved to library" messages.
+    renderAudioResult(resultEl, { ...data, libraryItemId: null }, "mixer-render");
+    // Real fix for "what if I want to edit the final output": the
+    // render just got auto-saved to the Audio Library server-side (see
+    // /api/audio/mixer/render) — refresh the library so it's right
+    // there, and offer a direct one-click path to load it back in for
+    // more editing (trim/reverse/speed/loop/fade) rather than leaving
+    // the person to hunt for it themselves.
+    if (data.libraryItemId) {
+      resultEl.innerHTML += `<div class="xx-small text-success mt-1">✅ Saved to your library as a mix — <button type="button" class="btn btn-link btn-sm p-0 xx-small" id="mixerKeepEditingBtn">✏️ keep editing this result</button></div>`;
+      document.getElementById("mixerKeepEditingBtn")?.addEventListener("click", async () => {
+        await loadMixerLibrary();
+        const newItem = (state.mixerLibraryItems || []).find((i) => String(i.id) === String(data.libraryItemId));
+        if (!newItem) return alert("Couldn't find the saved mix — check the library list on the left.");
+        state.mixerMainTrack = [{ ...newItem, edit: {} }];
+        state.mixerIntro = null;
+        state.mixerOutro = null;
+        state.mixerBackground = null;
+        state.mixerOverlays = [];
+        renderMixerMainTrack();
+        renderMixerIntroOutro();
+        renderMixerBackground();
+        renderMixerOverlays();
+        resultEl.innerHTML = `<div class="xx-small text-muted">Loaded into the Main Track above — click ✏️ on it to trim, fade, reverse, change speed, or loop this mix, then render again.</div>`;
+      });
+    }
+    // Same real fix as the Combine button above — a Mixer render used
+    // to be a dead end for video too, only reachable indirectly later
+    // via Flow Studio's Audio Library picker. This works directly from
+    // the downloadUrl every Mixer render actually returns (100% local
+    // ffmpeg, never a cloud base64 shape), fetched and converted the
+    // same way an uploaded file is.
+    resultEl.innerHTML += `<button type="button" class="btn btn-sm btn-outline-dark w-100 mt-1" id="mixerUseInFlowBtn">🎬 Use this in Flow Studio for a video</button>`;
+    document.getElementById("mixerUseInFlowBtn")?.addEventListener("click", async (e) => {
+      const useBtn = e.target;
+      const originalUseLabel = useBtn.innerHTML;
+      useBtn.disabled = true;
+      useBtn.innerHTML = "Loading...";
+      try {
+        const blob = await (await fetch(data.downloadUrl)).blob();
+        const audioBase64 = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => reject(new Error("Couldn't read the rendered mix."));
+          reader.readAsDataURL(blob);
+        });
+        flowTalkingAudioBase64 = audioBase64;
+        const preview = document.getElementById("flowTalkingAudioPreview");
+        if (preview) { preview.src = audioBase64; preview.classList.remove("d-none"); }
+        const audioModeSelect = document.getElementById("flowTalkingAudioMode");
+        if (audioModeSelect) { audioModeSelect.value = "finished"; audioModeSelect.dispatchEvent(new Event("change")); }
+        showAppMode("flow");
+        const scenarioSelect = document.getElementById("flowScenario");
+        if (scenarioSelect) { scenarioSelect.value = "talking"; scenarioSelect.dispatchEvent(new Event("change")); }
+        logActivity("success", "Mixer render loaded into Flow Studio's talking-video section.");
+      } catch (err) {
+        alert("Couldn't send this to Flow Studio: " + err.message);
+      } finally {
+        useBtn.disabled = false;
+        useBtn.innerHTML = originalUseLabel;
+      }
+    });
+  } catch (err) {
+    resultEl.innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalLabel;
+  }
+});
+// Overlays need {source, edit} as an object (not the string-or-object
+// shorthand) since delaySeconds/volume get spread alongside it.
+function toSourceEntryAsObject(item) {
+  return item.edit && Object.keys(item.edit).length ? { source: item.audio, edit: item.edit } : { source: item.audio };
+}
+document.querySelector('#audioStudioTabs [data-bs-target="#mixerConsoleTabPane"]')?.addEventListener("shown.bs.tab", () => {
+  loadMixerLibrary();
+  renderMixerMainTrack();
+  renderMixerBackground();
+  renderMixerOverlays();
+  renderMixerIntroOutro();
+});
+document.getElementById("voiceScriptCombineBtn")?.addEventListener("click", async () => {
+  const resultEl = document.getElementById("voiceScriptCombineResult");
+  const selectedTakes = state.voiceScript.lines
+    .map((line) => (line.selectedVariationIndex != null ? line.variations[line.selectedVariationIndex] : null))
+    .filter(Boolean);
+  const missing = state.voiceScript.lines.length - selectedTakes.length;
+  const songId = document.getElementById("voiceScriptSongPicker")?.value;
+  const songPosition = document.getElementById("voiceScriptSongPosition")?.value || "end";
+  const song = songId ? (state.songLibraryItems || []).find((s) => String(s.id) === songId) : null;
+  const minRequired = song ? 1 : 2;
+  if (selectedTakes.length < minRequired) return alert(song ? "Generate and select a take on at least 1 line first." : "Generate and select a take on at least 2 lines first.");
+  // REAL GAP FIXED: this used to require every take to have a live Fal
+  // URL, which silently blocked combining an uploaded/library-picked
+  // line (only ever has base64, never a hosted URL) alongside generated
+  // ones. The backend already normalizes base64 data URIs through the
+  // same toFalImageUrl path proven for library songs — this just stops
+  // blocking that case on the frontend too.
+  if (!selectedTakes.every((v) => v.audioUrl || v.audio)) {
+    return alert("One or more selected takes have no usable audio at all (an older take generated before this feature, or a take whose URL may have aged out) — regenerate or re-add that line and try again.");
+  }
+  const btn = document.getElementById("voiceScriptCombineBtn");
+  btn.disabled = true;
+  const originalLabel = btn.innerHTML;
+  btn.innerHTML = "🔗 Combining...";
+  resultEl.innerHTML = missing > 0 ? `<div class="xx-small text-warning mb-1">${missing} line(s) have no selected take — combining the ${selectedTakes.length} that do, in order.</div>` : "";
+  try {
+    // Song comes from the Audio Library as base64 only (no live Fal
+    // URL was ever kept for it) — passed straight through as-is; the
+    // backend normalizes it via the SAME toFalImageUrl pattern already
+    // proven for BGM elsewhere in this app, no upload step needed.
+    // Each take now prefers its real audioUrl but falls back to its
+    // base64 audio (an uploaded/library-picked external line) — same
+    // normalization handles either one correctly server-side.
+    let orderedUrls = selectedTakes.map((v) => v.audioUrl || v.audio);
+    if (song) orderedUrls = songPosition === "start" ? [song.audio, ...orderedUrls] : [...orderedUrls, song.audio];
+    const { res, data } = await fetchJson("/api/voice/script/combine", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audioUrls: orderedUrls, runId: state.voiceScript.runId, userApiKey: getUserKey() }),
+    });
+    if (!res.ok) throw new Error(data.error || "Combine failed.");
+    await refreshCreditsSummary();
+    // data.audio only exists on the Fal-cloud path — the local
+    // fallback returns downloadUrl instead (see renderAudioResult) and
+    // has no base64 to hand the Audio Library, so only save there when
+    // it's actually present rather than storing "undefined".
+    if (data.audio) {
+      saveToAudioLibrary({ type: "voice", name: `Combined script — ${state.voiceScript.lines.length} lines${song ? " + song" : ""}`, audioDataUri: data.audio, runId: state.voiceScript.runId, silent: true });
+    }
+    renderAudioResult(resultEl, data, "combined-script");
+    // REAL GAP FIXED: a combine result used to be a dead end for video —
+    // it was technically reachable later via Flow Studio's Audio
+    // Library picker (now that both save paths actually reach the
+    // library — see server.js's saveLocalRenderToLibrary), but nothing
+    // here told you that, or did it for you. This works from EITHER
+    // result shape (cloud base64 or the local-fallback's downloadUrl —
+    // fetched and converted the same way an uploaded file is) so it's
+    // real regardless of which path actually ran.
+    resultEl.innerHTML += `<button type="button" class="btn btn-sm btn-outline-dark w-100 mt-1" id="voiceScriptUseInFlowBtn">🎬 Use this in Flow Studio for a video</button>`;
+    document.getElementById("voiceScriptUseInFlowBtn")?.addEventListener("click", async (e) => {
+      const useBtn = e.target;
+      const originalUseLabel = useBtn.innerHTML;
+      useBtn.disabled = true;
+      useBtn.innerHTML = "Loading...";
+      try {
+        let audioBase64 = data.audio;
+        if (!audioBase64 && data.downloadUrl) {
+          const blob = await (await fetch(data.downloadUrl)).blob();
+          audioBase64 = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = () => reject(new Error("Couldn't read the combined file."));
+            reader.readAsDataURL(blob);
+          });
+        }
+        flowTalkingAudioBase64 = audioBase64;
+        const preview = document.getElementById("flowTalkingAudioPreview");
+        if (preview) { preview.src = audioBase64; preview.classList.remove("d-none"); }
+        const audioModeSelect = document.getElementById("flowTalkingAudioMode");
+        if (audioModeSelect) { audioModeSelect.value = "finished"; audioModeSelect.dispatchEvent(new Event("change")); }
+        showAppMode("flow");
+        const scenarioSelect = document.getElementById("flowScenario");
+        if (scenarioSelect) { scenarioSelect.value = "talking"; scenarioSelect.dispatchEvent(new Event("change")); }
+        logActivity("success", "Combined audio loaded into Flow Studio's talking-video section.");
+      } catch (err) {
+        alert("Couldn't send this to Flow Studio: " + err.message);
+      } finally {
+        useBtn.disabled = false;
+        useBtn.innerHTML = originalUseLabel;
+      }
+    });
+  } catch (err) {
+    resultEl.innerHTML += `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalLabel;
+  }
 });
 // Field edits — text/select/range inputs, delegated so it works for any
 // number of lines without binding listeners individually.
@@ -6706,6 +8622,7 @@ document.getElementById("voiceScriptLines")?.addEventListener("input", (e) => {
   if (field === "speed" || field === "pitch") line[field] = parseFloat(e.target.value);
   else if (field === "variationCount") line[field] = parseInt(e.target.value);
   else if (field === "multilingualMode") line[field] = e.target.checked;
+  else if (field === "targetDurationSeconds") line[field] = e.target.value ? parseFloat(e.target.value) : null;
   else line[field] = e.target.value;
   if (field === "modelId") {
     // Model changed — voice/emotion/language options are model-specific,
@@ -6715,7 +8632,16 @@ document.getElementById("voiceScriptLines")?.addEventListener("input", (e) => {
     line.voiceId = newModel?.confirmedVoiceIds?.[0]?.id || "";
     line.emotion = "neutral";
     line.language = "";
+    line.previewText = null; // stale preview belonged to the old model — clear rather than show wrong data until the new one loads
     renderVoiceScript();
+    scheduleLinePreview(line);
+  } else if (field === "sourceType") {
+    // Swaps the entire line body between "generate from text" and
+    // "use existing audio" — same full-rebuild reasoning as a model
+    // change, since these aren't just different field values, they're
+    // genuinely different control sets.
+    renderVoiceScript();
+    if (line.sourceType === "external") populateLineExternalLibrarySelect(line.id);
   } else if (field === "multilingualMode") {
     // Toggling this changes several parts of the line's own controls
     // (language row hidden, multilingual box shown, Generate button
@@ -6735,6 +8661,38 @@ document.getElementById("voiceScriptLines")?.addEventListener("input", (e) => {
     const estEl = lineEl.querySelector("[data-line-duration-estimate]");
     if (estEl) estEl.textContent = `≈${estimateSpeechDurationSeconds(line.text, line.speed).toFixed(1)}s estimated (rough — actual pace varies by model/language)`;
   }
+  if ((field === "text" || field === "targetDurationSeconds") && line.targetDurationSeconds) {
+    // Real duration control acting: text length changed (or the target
+    // itself changed) while a target is set — recompute and actually
+    // APPLY the speed needed to approximate it, live, and reflect that
+    // in both the speed slider itself and its label so it's never a
+    // silent change the person has to go hunting for.
+    const computed = computeSpeedForTargetDuration(line.text, line.targetDurationSeconds);
+    if (computed != null) {
+      line.speed = computed;
+      const speedSlider = lineEl.querySelector('[data-line-field="speed"]');
+      if (speedSlider) speedSlider.value = computed;
+      const speedLabel = lineEl.querySelector('label:has(+ [data-line-field="speed"])');
+      if (speedLabel) speedLabel.textContent = `Speed ${computed}`;
+      const estEl2 = lineEl.querySelector("[data-line-duration-estimate]");
+      if (estEl2) estEl2.textContent = `≈${estimateSpeechDurationSeconds(line.text, line.speed).toFixed(1)}s estimated (rough — actual pace varies by model/language)`;
+    }
+    const noteEl = lineEl.querySelector("[data-line-target-speed-note]");
+    if (noteEl) noteEl.textContent = computed != null ? `→ speed set to ${computed}x` : "text too short to compute a speed for this target";
+  } else if (field === "targetDurationSeconds" && !line.targetDurationSeconds) {
+    // Target cleared — reset the note, leave whatever speed was last
+    // computed in place rather than silently reverting it.
+    const noteEl = lineEl.querySelector("[data-line-target-speed-note]");
+    if (noteEl) noteEl.textContent = "sets speed automatically";
+  }
+  if (field === "text" || field === "targetDurationSeconds") {
+    // Freeform-tag-model pacing suggestion — only the suggestion <span>
+    // updates, never the number input itself, so typing a target
+    // duration digit-by-digit doesn't lose focus every keystroke (that
+    // would happen if the whole container got replaced instead).
+    const suggestionEl = lineEl.querySelector("[data-line-pacing-suggestion]");
+    if (suggestionEl) suggestionEl.innerHTML = renderPacingSuggestion(line, computePacingTag(line.text, line.targetDurationSeconds));
+  }
   if (field === "text" || field === "language") {
     // Live script-mismatch check — same non-destructive-update pattern.
     // A full render here would be fine too (language is a <select>, not
@@ -6750,6 +8708,10 @@ document.getElementById("voiceScriptLines")?.addEventListener("input", (e) => {
     const btn = lineEl.querySelector('[data-line-action="translate"]');
     if (btn) btn.disabled = !line.translateTargetLanguage;
   }
+  if (["text", "voiceId", "language", "speed", "pitch", "emotion", "targetDurationSeconds"].includes(field)) {
+    scheduleLinePreview(line);
+  }
+  if (field !== "voiceSearch") scheduleSessionSave();
 });
 document.getElementById("voiceScriptLines")?.addEventListener("click", async (e) => {
   const lineEl = e.target.closest("[data-line-id]");
@@ -6782,11 +8744,17 @@ document.getElementById("voiceScriptLines")?.addEventListener("click", async (e)
       const { res, data } = await fetchJson("/api/voice/suggest-markup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: line.text, modelId: line.modelId, textModel: getTextModel(), userApiKey: getUserKey(), runId: state.voiceScript.runId }),
+        body: JSON.stringify({ text: line.text, modelId: line.modelId, intention: line.intention || undefined, textModel: getTextModel(), userApiKey: getUserKey(), runId: state.voiceScript.runId }),
       });
       if (!res.ok) throw new Error(data.error || "Couldn't get AI suggestions.");
       line.text = data.taggedText;
+      // Unified control, real per-model result: for a model with
+      // confirmedEmotions (MiniMax), the intention ALSO picks the
+      // closest real emotion — validated server-side against the
+      // actual list, so this can't silently set something invalid.
+      if (data.emotion) line.emotion = data.emotion;
       renderVoiceScript();
+      scheduleLinePreview(line);
     } catch (err) {
       alert("AI markup suggestion failed: " + err.message);
       btn.disabled = false;
@@ -6819,6 +8787,17 @@ document.getElementById("voiceScriptLines")?.addEventListener("click", async (e)
     await translateLine(line, baseLang);
     return;
   }
+  // Pacing tag insert — deterministic, no AI call. Inserted at the very
+  // start of the line (a pacing cue applies to the whole delivery, not
+  // one phrase, unlike the word-level markup toolbar tags above it).
+  if (e.target.closest("[data-line-action=\"apply-pacing-tag\"]")) {
+    const tag = e.target.closest("[data-line-action=\"apply-pacing-tag\"]").getAttribute("data-pacing-tag");
+    line.text = `*${tag}* ${line.text}`.trim();
+    renderVoiceScript();
+    scheduleLinePreview(line);
+    scheduleSessionSave();
+    return;
+  }
   // Voice preview — real backend (isPreview flag on /api/voice/generate,
   // with its own persisted server-side cache) that already existed but
   // had no reachable trigger anywhere in the active UI. Cached client-
@@ -6830,7 +8809,7 @@ document.getElementById("voiceScriptLines")?.addEventListener("click", async (e)
     if (!line.modelId || !line.voiceId) return alert("Pick a model and voice first.");
     const cacheKey = `${line.modelId}:${line.voiceId}`;
     if (state.voicePreviewCache[cacheKey]) {
-      new Audio(state.voicePreviewCache[cacheKey]).play();
+      playAudioExclusively(state.voicePreviewCache[cacheKey]);
       return;
     }
     const originalLabel = btn.innerHTML;
@@ -6847,7 +8826,7 @@ document.getElementById("voiceScriptLines")?.addEventListener("click", async (e)
       });
       if (!res.ok) throw new Error(data.error || "Preview failed.");
       state.voicePreviewCache[cacheKey] = data.audio;
-      new Audio(data.audio).play();
+      playAudioExclusively(data.audio);
     } catch (err) {
       alert("Voice preview failed: " + err.message);
     } finally {
@@ -6885,6 +8864,7 @@ document.getElementById("voiceScriptLines")?.addEventListener("click", async (e)
   if (lineAction === "delete") {
     state.voiceScript.lines.splice(lineIndex, 1);
     renderVoiceScript();
+    saveVoiceScriptSession();
     return;
   }
   if (lineAction === "moveUp" && lineIndex > 0) {
@@ -6931,7 +8911,7 @@ document.getElementById("voiceScriptLines")?.addEventListener("click", async (e)
         });
         if (!res.ok) throw new Error(data.error || "Multi-language generation failed.");
         line.variations = [{
-          label: "Multi-language", audio: data.audio, durationMs: data.durationMs, modelUsed: data.modelUsed,
+          label: "Multi-language", audio: data.audio, audioUrl: data.audioUrl, durationMs: data.durationMs, modelUsed: data.modelUsed,
           error: null, segments: data.segments || [],
         }];
         line.cappedReason = null;
@@ -6965,12 +8945,13 @@ document.getElementById("voiceScriptLines")?.addEventListener("click", async (e)
         line.variations
           .filter((v) => v.audio && !v.error)
           .map((v) => saveToAudioLibrary({
-            type: "voice", name: `Line ${lineIndex + 1} — ${v.label}`, audioDataUri: v.audio,
+            type: "voice", name: `${line.name?.trim() || `Line ${lineIndex + 1}`} — ${v.label}`, audioDataUri: v.audio,
             modelUsed: v.modelUsed, voiceUsed: v.voiceId, runId: state.voiceScript.runId,
             metadata: { emotion: v.emotion, label: v.label }, silent: true,
           })),
       );
       await refreshCreditsSummary();
+      saveVoiceScriptSession();
     } catch (err) {
       alert("Couldn't generate takes: " + err.message);
     } finally {
@@ -6987,6 +8968,7 @@ document.getElementById("voiceScriptLines")?.addEventListener("click", async (e)
     if (variationAction === "use") {
       line.selectedVariationIndex = vIndex;
       renderVoiceScript();
+      saveVoiceScriptSession();
     } else if (variationAction === "download") {
       const v = line.variations[vIndex];
       if (v?.audio) {
@@ -7117,7 +9099,6 @@ function renderVoiceStudioResults(sourceText) {
       preview.classList.remove("d-none");
     }
     logActivity("success", "Audio ready in Flow Studio's talking-video section.");
-    bootstrap.Modal.getInstance(document.getElementById("voiceStudioModal"))?.hide();
     document.getElementById("flowModeNavBtn")?.click();
     document.getElementById("flowScenario").value = "talking";
     document.getElementById("flowScenario").dispatchEvent(new Event("change"));
