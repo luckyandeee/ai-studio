@@ -25,6 +25,29 @@ const liveStatusCache = new Map();
 let lastRefreshAttempt = null;
 let lastRefreshError = null;
 let isVerifying = false; // true while refreshModelLiveStatus is actively running — lets the UI show a real "this is happening right now" state instead of silence, especially now that a single rate-limited call can take 57+ seconds to resolve
+// Real, lightweight rate-limit visibility — genuinely missing before:
+// this app could tell you a check failed, but never specifically that
+// it was a 429, or what Fal actually asked for. Updated directly
+// inside fetchFalApi below whenever a 429 is seen, regardless of which
+// call path triggered it.
+let last429At = null;
+let last429RetryAfterSeconds = null;
+// REAL GAP FOUND AND FIXED HERE: retries were already correctly removed
+// from WITHIN a single call (registry checks use retries:1, meaning
+// zero wait/retry happens inside fetchFalApi at all for that path) —
+// but nothing stopped a genuinely NEW call, from a DIFFERENT trigger
+// entirely (a fresh "Check now" click, the next scheduled interval),
+// from firing again seconds later, straight back into a window Fal
+// explicitly just told us to wait out. This is the real fix: honor
+// that told wait BEFORE attempting anything new at all, regardless of
+// which trigger is asking — not another retry, a genuine "not yet" gate
+// checked once, up front, by every entry point below.
+function isWithinFalCooldown() {
+  if (!last429At || !last429RetryAfterSeconds) return { onCooldown: false };
+  const cooldownEndsAt = new Date(last429At).getTime() + last429RetryAfterSeconds * 1000;
+  const remainingMs = cooldownEndsAt - Date.now();
+  return remainingMs > 0 ? { onCooldown: true, remainingMs, cooldownEndsAt: new Date(cooldownEndsAt).toISOString() } : { onCooldown: false };
+}
 
 // ============================================================
 // PERSISTENCE — the cache survives server restarts now, stored in the
@@ -76,11 +99,13 @@ async function fetchFalApi(url, { retries = 2, maxWaitMs = 5000 } = {}) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     const res = await fetch(url, { headers: authHeaders() });
     if (res.status !== 429) return res;
-    if (attempt === retries) return res; // out of attempts — let the caller handle the final failure
     const retryAfterHeader = res.headers.get("retry-after");
+    last429At = new Date().toISOString();
+    last429RetryAfterSeconds = retryAfterHeader ? parseFloat(retryAfterHeader) : null;
+    if (attempt === retries) return res; // out of attempts — let the caller handle the final failure
     const rawWaitMs = retryAfterHeader ? parseFloat(retryAfterHeader) * 1000 : 2000 * Math.pow(2, attempt - 1);
     const waitMs = Math.min(rawWaitMs, maxWaitMs);
-    console.warn(`[Model Catalog] Rate limited (429) — waiting ${Math.round(waitMs / 1000)}s before retry ${attempt + 1}/${retries}${rawWaitMs > maxWaitMs ? ` (Fal asked for ${Math.round(rawWaitMs / 1000)}s, capped here)` : ""}...`);
+    console.log(`[Model Catalog] Rate limited (429) — waiting ${Math.round(waitMs / 1000)}s before retry ${attempt + 1}/${retries}${rawWaitMs > maxWaitMs ? ` (Fal asked for ${Math.round(rawWaitMs / 1000)}s, capped here)` : ""}...`);
     await new Promise((r) => setTimeout(r, waitMs));
   }
 }
@@ -131,62 +156,141 @@ function extractGuideMetadata(live) {
 // take down anything that depends on the cache; it just leaves the
 // previous (or empty) cache in place and records the error for
 // diagnostics.
+//
+// ============================================================
+// REAL REDESIGN, replacing the previous fix that made things WORSE under
+// real pressure — confirmed directly against real production output: a
+// batch 404 triggered recursive splitting, which triggered a real 429,
+// which triggered MULTIPLE independent 8-34-58s retry waits stacking up
+// back to back, on BOTH the automatic startup check AND a manual
+// "Check now" click. That's a genuine risk of Fal rate-limiting or
+// blocking this app's key, not just a slow refresh — worth fixing
+// properly, not patching again.
+//
+// New strategy, in priority order:
+// 1. Cross-reference every model ID against the browse cache FIRST —
+//    genuinely zero extra API calls, since that data is already sitting
+//    in memory. The browse cache queries by category/search text
+//    (status=active), never by a specific endpoint_id list, so it's
+//    structurally immune to the "one bad ID 404s the whole batch"
+//    problem — it just returns whatever's really out there. For any
+//    curated model that shows up there, that alone is real confirmation
+//    it's active, at zero cost.
+// 2. Only the (usually much smaller) remainder — IDs the browse cache
+//    doesn't happen to cover — gets a SINGLE live batch attempt. No
+//    recursive splitting, no isolating exactly which ID is bad anymore
+//    — that precision isn't worth the retry-storm risk it created.
+// 3. On ANY failure from that single attempt — 404, 429, anything —
+//    stop immediately and mark the rest "unverified" for this pass.
+//    Never retry through a rate limit for a non-critical background
+//    check; the next scheduled attempt (or an explicit "Check now"
+//    later) tries again on its own, once real breathing room has
+//    passed.
+// ============================================================
 let verifyProgressDetail = null;
 async function refreshModelLiveStatus(modelIds, { thorough = false } = {}) {
+  // REAL GAP FOUND AND FIXED HERE: isVerifying was already tracked and
+  // exposed for UI display, but never actually CHECKED — it recorded
+  // that a check was in progress without ever preventing a second,
+  // overlapping one from starting. refreshBrowseCatalog already had
+  // this exact guard (browseCache.fetching, checked synchronously
+  // before any await — safe in Node's single-threaded model); this
+  // mirrors that same proven pattern here. Matters most when the
+  // 6-hour periodic interval happens to land while a "Check now" click
+  // is still mid-flight — without this, both would run concurrently,
+  // doubling live-check call volume at exactly the moment concurrent
+  // pressure is already highest.
+  if (isVerifying) {
+    console.log(`[Model Catalog] A registry check is already in progress — skipping this overlapping request rather than running two at once.`);
+    return { ok: true, checkedCount: 0, flaggedCount: 0, unindexedCount: 0, skippedAsAlreadyRunning: true };
+  }
   lastRefreshAttempt = new Date().toISOString();
   isVerifying = true;
   verifyProgressDetail = thorough ? "Checking the registry against Fal's live catalog..." : null;
   try {
-    const chunks = [];
-    for (let i = 0; i < modelIds.length; i += 50) chunks.push(modelIds.slice(i, i + 50));
-    const found = new Map();
-    for (const chunk of chunks) {
-      // Fast mode (the default — every automatic background check, at
-      // startup and every 6h) makes ONE attempt with a short cap and
-      // moves on quickly, so it can never turn into the kind of
-      // multi-minute silent wait that made a normal server restart feel
-      // broken. Thorough mode (only reachable via someone explicitly
-      // clicking "Check now", with a real loading screen visible — see
-      // app.js) gets more retry patience, since a person is actively
-      // waiting and can see exactly why.
-      const { models } = await findModelsLive(chunk, thorough ? { retries: 3, maxWaitMs: 15000 } : { retries: 1, maxWaitMs: 3000 });
-      models.forEach((m) => found.set(m.endpoint_id, m));
-    }
-    const notInBatch = modelIds.filter((id) => !found.has(id));
-    if (notInBatch.length && thorough) {
-      // The exhaustive individual re-check ONLY runs in thorough mode
-      // now. This is the slow-but-complete path someone explicitly asked
-      // for — it used to run automatically on every single server
-      // restart, which is exactly what turned a quick startup into a
-      // multi-minute wait full of surprise 429 backoffs nobody asked to
-      // sit through.
-      console.log(`[Model Catalog] ${notInBatch.length} model(s) missed the batch lookup — double-checking individually (thorough check)...`);
-      for (let i = 0; i < notInBatch.length; i++) {
-        const id = notInBatch[i];
-        verifyProgressDetail = `Double-checking ${i + 1} of ${notInBatch.length}: ${id}`;
-        try {
-          const { models } = await findModelsLive([id], { retries: 3, maxWaitMs: 15000 });
-          if (models[0]) {
-            found.set(id, models[0]);
-            console.log(`[Model Catalog] "${id}" WAS found via individual lookup — batch query missed it.`);
-          }
-        } catch {
-          // leave it unresolved — falls through to "missing" below
-        }
-        await new Promise((r) => setTimeout(r, 1000));
+    const browseCacheMap = new Map(browseCache.models.map((m) => [m.id, m]));
+    const resolvedViaBrowseCache = new Set();
+    const needsLiveCheck = [];
+    modelIds.forEach((id) => {
+      if (browseCacheMap.has(id)) resolvedViaBrowseCache.add(id);
+      else needsLiveCheck.push(id);
+    });
+    console.log(`[Model Catalog] Resolved ${resolvedViaBrowseCache.size}/${modelIds.length} model(s) directly from the already-fetched browse cache — zero extra Fal calls. ${needsLiveCheck.length} genuinely need a live check.`);
+
+    const found = new Map(); // id -> Fal's raw shape (metadata + openapi), only for genuinely live-checked IDs
+    let stoppedEarly = false;
+    if (needsLiveCheck.length) {
+      // Real fix, distinct from "no retries" (already true): even with
+      // zero retries WITHIN one call, nothing previously stopped a
+      // genuinely NEW call — from a fresh "Check now" click, or the
+      // next scheduled interval — from firing straight back into a
+      // window Fal just told us to wait out. Checked once, up front,
+      // before attempting anything — not another retry, a real "not
+      // yet" gate.
+      const cooldown = isWithinFalCooldown();
+      if (cooldown.onCooldown) {
+        console.log(`[Model Catalog] Still inside Fal's own requested wait window from a recent rate limit (${Math.ceil(cooldown.remainingMs / 1000)}s remaining, until ${cooldown.cooldownEndsAt}) — skipping the live check entirely this pass rather than attempting straight back into it. These stay pending verification.`);
+        stoppedEarly = true;
       }
-    } else if (notInBatch.length) {
-      console.log(`[Model Catalog] ${notInBatch.length} model(s) not confirmed by the quick automatic check — left as "unverified" (NOT removed from dropdowns). Settings → Model Catalog → "Check now" runs the full check if you want certainty.`);
+    }
+    if (needsLiveCheck.length && !stoppedEarly) {
+      const chunks = [];
+      for (let i = 0; i < needsLiveCheck.length; i += 50) chunks.push(needsLiveCheck.slice(i, i + 50));
+      for (const chunk of chunks) {
+        try {
+          const { models } = await findModelsLive(chunk, { retries: 1, maxWaitMs: thorough ? 8000 : 3000 });
+          models.forEach((m) => found.set(m.endpoint_id, m));
+        } catch (err) {
+          console.log(`[Model Catalog] Live check for ${chunk.length} remaining model(s) didn't complete this pass (${err.message}) — not retrying or splitting further to avoid repeated calls. They're marked pending verification, not broken; the next scheduled check tries again.`);
+          stoppedEarly = true;
+          break; // real backoff — do not attempt any further chunks this pass, respect whatever just happened (404 or 429 alike)
+        }
+      }
+    }
+    if (needsLiveCheck.length && !stoppedEarly) {
+      const stillMissing = needsLiveCheck.filter((id) => !found.has(id));
+      if (stillMissing.length) {
+        console.log(`[Model Catalog] ${stillMissing.length} model(s) not independently confirmed this pass — pending verification (not removed, not treated as broken).`);
+      }
     }
     const checkedAt = new Date().toISOString();
     modelIds.forEach((id) => {
+      if (resolvedViaBrowseCache.has(id)) {
+        // Browse-cache data is already the same extractGuideMetadata
+        // shape liveStatusCache entries use — just missing openapi (the
+        // browse fetch never requested expand=openapi-3.0), so this
+        // preserves whatever example snippet a PRIOR live check already
+        // cached for this ID rather than wiping it out.
+        const browseEntry = browseCacheMap.get(id);
+        const priorEntry = liveStatusCache.get(id);
+        liveStatusCache.set(id, {
+          status: "active", // the browse query itself filters status=active — showing up here IS the confirmation
+          exampleCode: priorEntry?.exampleCode || null,
+          checkedAt,
+          displayName: browseEntry.displayName,
+          description: browseEntry.description,
+          category: browseEntry.category,
+          tags: browseEntry.tags,
+          licenseType: browseEntry.licenseType,
+          thumbnailUrl: browseEntry.thumbnailUrl,
+          thumbnailAnimatedUrl: browseEntry.thumbnailAnimatedUrl,
+          updatedAt: browseEntry.updatedAt,
+          durationEstimate: browseEntry.durationEstimate,
+          modelUrl: browseEntry.modelUrl,
+          capabilities: browseEntry.capabilities,
+        });
+        return;
+      }
       const live = found.get(id);
       if (!live) {
         // "missing" only after a THOROUGH check still couldn't find it —
         // "unverified" means the fast pass simply didn't dig deeper, not
         // that anything is actually wrong. Neither one removes a model
         // from the dropdowns; only an explicit "deprecated" does that.
-        const status = thorough ? "missing" : "unverified";
+        // A backoff-interrupted pass (stoppedEarly) is always
+        // "unverified," even in thorough mode — a rate limit is not the
+        // same signal as a real, completed, still-couldn't-find-it check.
+        const status = thorough && !stoppedEarly ? "missing" : "unverified";
         liveStatusCache.set(id, { status, displayName: null, description: null, category: null, exampleCode: null, checkedAt });
       } else {
         let exampleCode = null;
@@ -205,26 +309,33 @@ async function refreshModelLiveStatus(modelIds, { thorough = false } = {}) {
     });
     lastRefreshError = null;
     persistRegistryCache();
-    // Only "deprecated" is a trustworthy removal signal (see the
-    // corresponding filter in server.js's GET /api/models) — Fal
-    // explicitly has that entry cataloged and marked it deprecated.
-    // "missing" (thorough check still couldn't find it) and "unverified"
-    // (fast check didn't confirm it, wasn't dug into further) both do
-    // NOT mean broken — confirmed in production, every one of these
-    // models is real and works. Neither ever removes a model from the
-    // dropdowns.
+    // REAL GAP FOUND AND FIXED HERE: this used to report counts computed
+    // over the ENTIRE accumulated liveStatusCache (every model ever
+    // checked across every past session), while the "N model(s)
+    // refreshed" figure in the same line was scoped to just THIS call's
+    // modelIds — two different denominators in one sentence, exactly
+    // the kind of count mismatch that's confusing to read. Also phrased
+    // every non-100%-clean result as an implicit problem ("X not
+    // confirmed...") rather than a normal status. Rescoped to just this
+    // call's modelIds, and reworded into a calm summary line — a model
+    // "pending verification" isn't broken, it just hasn't been
+    // independently double-checked yet, and framing it as a warning
+    // every single refresh was misleading about what's actually true.
+    const thisCallStatuses = modelIds.map((id) => liveStatusCache.get(id)?.status);
+    const deprecatedCount = thisCallStatuses.filter((s) => s === "deprecated").length;
+    const verifiedCount = thisCallStatuses.filter((s) => s === "active").length;
+    const pendingCount = modelIds.length - deprecatedCount - verifiedCount;
+    console.log(
+      `[Model Catalog] Catalog ready · ${modelIds.length} models · ${verifiedCount} verified · ${pendingCount} pending verification` +
+        (deprecatedCount ? ` · ${deprecatedCount} deprecated (removed: ${thisCallStatuses.map((s, i) => (s === "deprecated" ? modelIds[i] : null)).filter(Boolean).join(", ")})` : ""),
+    );
+    // Kept for the return value below and any other consumer that reads
+    // the full accumulated cache (e.g. Settings → Model Catalog) — just
+    // no longer conflated with the per-call log line above.
     const removed = [...liveStatusCache.entries()].filter(([, v]) => v.status === "deprecated");
     const notInDiscoveryIndex = [...liveStatusCache.entries()].filter(([, v]) => v.status === "missing");
     const notYetVerified = [...liveStatusCache.entries()].filter(([, v]) => v.status === "unverified");
     const unindexed = [...liveStatusCache.entries()].filter(([, v]) => v.status === "unknown");
-    console.log(
-      `[Model Catalog] Refreshed ${modelIds.length} model(s) against Fal's live API (${thorough ? "thorough" : "fast"} check).` +
-        (removed.length ? ` ${removed.length} confirmed deprecated and removed (${removed.map(([id]) => id).join(", ")}).` : "") +
-        (notInDiscoveryIndex.length ? ` ${notInDiscoveryIndex.length} not found even after a thorough check but KEPT available (${notInDiscoveryIndex.map(([id]) => id).join(", ")}).` : "") +
-        (notYetVerified.length ? ` ${notYetVerified.length} not confirmed by this quick check, kept available as usual (run "Check now" for certainty).` : "") +
-        (unindexed.length ? ` ${unindexed.length} not yet fully indexed by Fal but still available (${unindexed.map(([id]) => id).join(", ")}).` : "") +
-        (!removed.length && !notInDiscoveryIndex.length && !notYetVerified.length && !unindexed.length ? ` All confirmed active.` : ""),
-    );
     return { ok: true, checkedCount: modelIds.length, flaggedCount: removed.length, unindexedCount: unindexed.length + notInDiscoveryIndex.length + notYetVerified.length };
   } catch (err) {
     lastRefreshError = err.message;
@@ -260,7 +371,14 @@ function getLiveStatus(modelId) {
 // the self-reported category on real Fal model pages (ElevenLabs TTS,
 // Chatterbox Speech-to-Speech, etc.) — not guessed. Image/video
 // categories were already covered; audio was the real, confirmed gap.
-const BROWSE_CATEGORIES = ["image-to-image", "text-to-image", "image-to-video", "text-to-video", "text-to-speech", "text-to-audio", "speech-to-speech", "text-to-music"];
+// REAL GAP FOUND AND FIXED HERE: confirmed directly from Fal's own docs
+// example values that "image-editing" is a real, valid category
+// (fal.ai/docs/documentation/setting-up/mcp lists it explicitly
+// alongside text-to-image, image-to-video, etc.) — this app's own
+// upscale/outpaint/photo-restoration utility models fall under exactly
+// this category and had zero category-level coverage before, only
+// relying on the (fuzzier, less reliable) search-term safety net.
+const BROWSE_CATEGORIES = ["image-to-image", "text-to-image", "image-to-video", "text-to-video", "text-to-speech", "text-to-audio", "speech-to-speech", "text-to-music", "image-editing"];
 // Safety net for categories this app doesn't know the exact slug for —
 // Fal's own /models search matches free text against name, description,
 // AND category, so a plain-language term still finds relevant models
@@ -268,7 +386,16 @@ const BROWSE_CATEGORIES = ["image-to-image", "text-to-image", "image-to-video", 
 // Fal renames/adds one. Deliberately not relied on alone (category
 // filtering above is more precise when it works) — this exists purely
 // to catch what a wrong/missing category guess would otherwise lose.
-const DISCOVERY_SAFETY_NET_TERMS = ["voice clone", "sound effect generator", "talking avatar", "lip sync", "video background removal", "music generation"];
+// REAL GAP FOUND AND FIXED HERE: checked the exact model IDs that
+// consistently failed to resolve in a real production log, and traced
+// several of them (upscalers, outpainting, photo restoration) to having
+// ZERO search-term coverage at all here, not just bad luck with Fal's
+// per-term result limit — these categories were simply never searched
+// for, so they could never be resolved for free from the browse cache
+// and always needed a separate live check. Added the missing terms so
+// they get picked up by this list's own already-well-paced (1.5s/term)
+// refresh cycle going forward.
+const DISCOVERY_SAFETY_NET_TERMS = ["voice clone", "sound effect generator", "talking avatar", "lip sync", "video background removal", "music generation", "image upscaler", "outpainting", "photo restoration"];
 let browseCache = { models: [], lastFetched: null, fetching: false, error: null };
 
 function loadPersistedBrowseCache() {
@@ -284,11 +411,28 @@ function persistBrowseCache() {
 }
 
 async function fetchOneCategory(category) {
-  const params = new URLSearchParams({ category, limit: "40", status: "active" });
-  const res = await fetchFalApi(`${API_BASE}/models?${params.toString()}`);
+  // REAL REVERSAL, and a real lesson: the previous version of this
+  // comment argued a real, honored wait "costs nothing a person
+  // notices" for a background refresh — confirmed directly wrong in
+  // production. A single rate-limited item retrying with a real
+  // honored wait can cost up to 60 real seconds before even moving to
+  // the next item; with several items hitting this in the same sweep
+  // (confirmed: two separate 21s and 43s waits logged back to back
+  // during one "Check now" click), the whole operation can silently
+  // stretch to multiple minutes with zero visible progress — which is
+  // its own real UX problem, arguably worse than the rate limit itself.
+  // Matches the registry check's already-correct policy now: zero
+  // retries within a single call. A 429 fails that ONE item
+  // immediately, records the real Retry-After via last429At (see
+  // isWithinFalCooldown), and the sweep's own adaptive backoff +
+  // 2-consecutive-429s early stop + the cooldown gate on the NEXT
+  // attempt do the actual work of respecting Fal's rate limit — none
+  // of which require sitting still inside a single call to do it.
+  const params = new URLSearchParams({ category, limit: "100", status: "active" });
+  const res = await fetchFalApi(`${API_BASE}/models?${params.toString()}`, { retries: 1 });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`category=${category} returned ${res.status}: ${body.slice(0, 150)}`);
+    throw Object.assign(new Error(`category=${category} returned ${res.status}: ${body.slice(0, 150)}`), { status: res.status });
   }
   const { models } = await res.json();
   return models.map((m) => ({ id: m.endpoint_id, ...extractGuideMetadata(m) }));
@@ -297,11 +441,11 @@ async function fetchOneCategory(category) {
 // description, AND category, so this catches anything a wrong/missing
 // category guess above would otherwise miss entirely.
 async function fetchOneSearchTerm(term) {
-  const params = new URLSearchParams({ q: term, limit: "20", status: "active" });
-  const res = await fetchFalApi(`${API_BASE}/models?${params.toString()}`);
+  const params = new URLSearchParams({ q: term, limit: "40", status: "active" }); // same real reasoning as fetchOneCategory's limit increase above
+  const res = await fetchFalApi(`${API_BASE}/models?${params.toString()}`, { retries: 1 }); // same real reversal as fetchOneCategory above — zero retries, not a long honored wait
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`q="${term}" returned ${res.status}: ${body.slice(0, 150)}`);
+    throw Object.assign(new Error(`q="${term}" returned ${res.status}: ${body.slice(0, 150)}`), { status: res.status });
   }
   const { models } = await res.json();
   return models.map((m) => ({ id: m.endpoint_id, ...extractGuideMetadata(m) }));
@@ -309,31 +453,99 @@ async function fetchOneSearchTerm(term) {
 
 async function refreshBrowseCatalog() {
   if (browseCache.fetching) return browseCache; // don't stack concurrent refreshes
+  // Same real fix as refreshModelLiveStatus above — checked once, up
+  // front, before this function does anything at all (including
+  // setting fetching=true), so a "Check now" click or a periodic
+  // interval landing inside Fal's own requested wait window is a
+  // genuine no-op instead of walking straight back into the same limit.
+  const cooldown = isWithinFalCooldown();
+  if (cooldown.onCooldown) {
+    console.log(`[Model Catalog] Still inside Fal's own requested wait window from a recent rate limit (${Math.ceil(cooldown.remainingMs / 1000)}s remaining, until ${cooldown.cooldownEndsAt}) — skipping the browse refresh entirely this pass.`);
+    return browseCache;
+  }
   browseCache.fetching = true;
   const failures = []; // { category, reason } — the actual error, not just a name
   const allModels = [];
+  // REAL FIX FOR A REAL ROOT CAUSE: ... (see comment above)
+  // IMPORTANT CORRECTNESS DETAIL: incremental saves below deliberately
+  // do NOT touch lastFetched — only the very last save, after every
+  // category and search term has actually finished, updates it. If
+  // incremental saves stamped "now" on every partial step, an
+  // interrupted refresh would look FULLY fresh to the next restart's
+  // freshness check (age ≈ 0), permanently skipping the remaining
+  // un-fetched categories until the next 72h cycle — quietly worse than
+  // the original bug, since it would look done when it wasn't. Partial
+  // model data is still genuinely worth keeping (better coverage than
+  // nothing), it just can't be allowed to claim "fully refreshed."
+  const priorLastFetched = browseCache.lastFetched;
+  const persistProgress = () => {
+    const seen = new Set();
+    const deduped = allModels.filter((m) => (seen.has(m.id) ? false : (seen.add(m.id), true)));
+    browseCache = {
+      models: deduped,
+      lastFetched: priorLastFetched, // unchanged until the real completion below — see correctness note above
+      fetching: true, // still mid-refresh — only the final call below sets this false
+      error: failures.length ? failures.map((f) => `${f.category}: ${f.reason}`).join(" | ") : null,
+    };
+    persistBrowseCache();
+  };
+  // Real exponential backoff with jitter — see the loop below for full
+  // reasoning. consecutive429s resets to 0 on any real success;
+  // stoppedEarlyOnRateLimit short-circuits the rest of this sweep
+  // (both loops) once rate limiting is clearly still active, rather
+  // than grinding through the remaining items into the same wall.
+  let consecutive429s = 0;
+  let stoppedEarlyOnRateLimit = false;
+  function backoffDelayMs(consecutiveFailures) {
+    const base = 3000 * Math.pow(2, consecutiveFailures); // 3s, 6s, 12s, ... doubling per consecutive 429
+    const capped = Math.min(base, 20000);
+    const jitter = Math.random() * 1000; // real jitter — avoids this process (and anything else sharing the key) waiting the exact same round number every time
+    return capped + jitter;
+  }
   for (const category of BROWSE_CATEGORIES) {
     try {
       const models = await fetchOneCategory(category);
       allModels.push(...models);
+      consecutive429s = 0; // a real success resets the backoff — no reason to stay cautious once Fal's clearly not rate-limiting us anymore
     } catch (err) {
       failures.push({ category, reason: err.message });
+      if (err.status === 429) consecutive429s++;
     }
-    // Small gap between categories — sequential and gently paced, not a
-    // burst of simultaneous requests. This runs shortly after the
-    // registry check's own individual-lookup retries (see
-    // refreshModelLiveStatus above), so back-to-back call volume at
-    // startup is real and worth spacing out, not just here.
-    await new Promise((r) => setTimeout(r, 1500)); // real gap — 400ms wasn't enough, confirmed by actual 429s
+    persistProgress();
+    // REAL GAP FOUND AND FIXED HERE: this used to pace every item at
+    // the same fixed 3s regardless of what just happened — plowing
+    // ahead at full speed immediately after a real 429 is exactly
+    // backwards. Real exponential backoff now: each consecutive 429
+    // doubles the gap before the next item (capped at 20s), with a
+    // small random jitter so this process isn't waiting the exact same
+    // round number every time. Two 429s in a row stops the WHOLE sweep
+    // early rather than grinding through the remaining items at a
+    // rate limit that's clearly still active — safe to do, since
+    // whatever's already been fetched is already saved (see
+    // persistProgress above), nothing is lost by stopping.
+    if (consecutive429s >= 2) {
+      console.log(`[Model Catalog] Hit rate limits ${consecutive429s} times in a row — stopping this sweep early rather than continuing to push against it. Whatever was already fetched is saved; the rest picks up on the next scheduled refresh.`);
+      stoppedEarlyOnRateLimit = true;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, backoffDelayMs(consecutive429s)));
   }
-  for (const term of DISCOVERY_SAFETY_NET_TERMS) {
+  for (const term of stoppedEarlyOnRateLimit ? [] : DISCOVERY_SAFETY_NET_TERMS) {
     try {
       const models = await fetchOneSearchTerm(term);
       allModels.push(...models);
+      consecutive429s = 0;
     } catch (err) {
       failures.push({ category: `q="${term}"`, reason: err.message });
+      if (err.status === 429) consecutive429s++;
     }
-    await new Promise((r) => setTimeout(r, 1500));
+    persistProgress();
+    if (consecutive429s >= 2) {
+      console.log(`[Model Catalog] Hit rate limits ${consecutive429s} times in a row — stopping this sweep early rather than continuing to push against it. Whatever was already fetched is saved; the rest picks up on the next scheduled refresh.`);
+      stoppedEarlyOnRateLimit = true;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, backoffDelayMs(consecutive429s)));
   }
   // De-dupe (some models can legitimately appear in more than one category)
   const seen = new Set();
@@ -451,10 +663,46 @@ function persistDiscoveredModels() {
   db.setSettingJson(DISCOVERED_MODELS_KEY, [...discoveredModelsCache.values()]);
 }
 
+// ============================================================
+// REAL GAP FOUND AND FIXED HERE: discovery sync and enrichment both
+// already had their own sensible 30-minute setInterval for a
+// long-running server — genuinely fine on its own. The actual problem
+// was separate: the STARTUP path called both of these unconditionally,
+// 5 seconds after every single boot, regardless of whether the last
+// run was 30 minutes ago or 30 seconds ago. In an active nodemon dev
+// environment restarting on every file save, that meant up to ~19
+// real Fal calls (a discovery batch + up to 8 individual fallbacks +
+// up to 10 enrichment LLM calls) firing again and again, seconds
+// apart, every single restart — exactly the "feels like hammering
+// Fal" pattern being asked about, and a real, additional one beyond
+// the registry/browse cache fix from earlier. This tracks the last
+// time each actually ran (persisted, survives restarts) so the
+// startup path can skip re-triggering something that just ran
+// recently, the same freshness-check principle already proven for
+// the registry and browse caches above — just applied here too.
+const DISCOVERY_SYNC_COOLDOWN_KEY = "discovery_sync_last_run";
+const ENRICHMENT_COOLDOWN_KEY = "enrichment_last_run";
+const SYNC_COOLDOWN_MS = 30 * 60 * 1000; // matches the periodic interval's own natural cadence
+function isOnCooldown(key, cooldownMs) {
+  const lastRun = db.getSettingJson(key);
+  if (!lastRun?.at) return false;
+  return Date.now() - new Date(lastRun.at).getTime() < cooldownMs;
+}
+function markRan(key) {
+  db.setSettingJson(key, { at: new Date().toISOString() });
+}
+
 async function syncDiscoveredModels(curatedIds) {
+  // See the cooldown mechanism's own comment above (DISCOVERY_SYNC_COOLDOWN_KEY)
+  // — skips the whole operation, including its own real Fal calls,
+  // if this already ran within the cooldown window, regardless of
+  // whether this call came from the startup path or the periodic
+  // interval.
+  if (isOnCooldown(DISCOVERY_SYNC_COOLDOWN_KEY, SYNC_COOLDOWN_MS)) return { newlyDiscovered: 0, remaining: 0, skippedOnCooldown: true };
   const curatedSet = new Set(curatedIds);
   const candidates = browseCache.models.filter((m) => !curatedSet.has(m.id) && !discoveredModelsCache.has(m.id));
   if (!candidates.length) return { newlyDiscovered: 0, remaining: 0 };
+  markRan(DISCOVERY_SYNC_COOLDOWN_KEY);
   const toProcess = candidates.slice(0, DISCOVERY_BATCH_SIZE);
   // Real, confirmed bug fixed here: this used to call getSingleModelDetail
   // once PER candidate — a separate API call for each of up to
@@ -654,8 +902,12 @@ Return ONLY this JSON, no markdown fences: {"bestFor": "...", "familyGuess": "..
 const ENRICHMENT_BATCH_SIZE = 10;
 async function enrichDiscoveredModels(apiKey) {
   if (!apiKey) return { enriched: 0, remaining: 0 };
+  // Same real cooldown fix as syncDiscoveredModels above — see
+  // ENRICHMENT_COOLDOWN_KEY's comment there for the full reasoning.
+  if (isOnCooldown(ENRICHMENT_COOLDOWN_KEY, SYNC_COOLDOWN_MS)) return { enriched: 0, remaining: 0, skippedOnCooldown: true };
   const candidates = [...discoveredModelsCache.values()].filter((m) => m.classification?.classified && !m.excluded && !m.aiEnrichment);
   if (!candidates.length) return { enriched: 0, remaining: 0 };
+  markRan(ENRICHMENT_COOLDOWN_KEY);
   const toProcess = candidates.slice(0, ENRICHMENT_BATCH_SIZE);
   let enriched = 0;
   for (const model of toProcess) {
@@ -760,7 +1012,18 @@ async function getSingleModelDetail(modelId) {
   } catch {
     exampleCode = null;
   }
-  return { id: modelId, exampleCode, ...extractGuideMetadata(m) };
+  const guide = { id: modelId, exampleCode, ...extractGuideMetadata(m) };
+  // REAL GAP FOUND AND FIXED HERE: this already did a genuine, targeted,
+  // single-model live confirmation — exactly the "lazy verification on
+  // selection/use" mechanism worth having — but the confirmation was
+  // thrown away instead of updating the registry. A model sitting
+  // "pending verification" that someone then actually clicks to view
+  // stayed "pending" forever afterward, even though this call just
+  // proved it's real and active. Now promotes it the same way a real
+  // batch verification would.
+  liveStatusCache.set(modelId, { status: m.metadata?.status || "active", exampleCode, checkedAt: new Date().toISOString(), ...extractGuideMetadata(m) });
+  persistRegistryCache();
+  return guide;
 }
 
 // Guide info for the frontend "Model Guide" panel — description,
@@ -784,6 +1047,19 @@ function getRefreshMeta() {
     isBrowsing: browseCache.fetching,
     browseLastFetched: browseCache.lastFetched,
     browseCount: browseCache.models.length,
+    last429At,
+    last429RetryAfterSeconds,
+    // Real, computed prediction — not a separately-tracked value that
+    // could drift out of sync with the actual freshness windows
+    // (REGISTRY_FRESHNESS_MS / BROWSE_FRESHNESS_MS) elsewhere in this
+    // file. Whichever of the two caches is due to expire first is
+    // genuinely when the next automatic background refresh happens.
+    nextCatalogRefresh: (() => {
+      const registryDue = lastRefreshAttempt ? new Date(lastRefreshAttempt).getTime() + REGISTRY_FRESHNESS_MS : null;
+      const browseDue = browseCache.lastFetched ? new Date(browseCache.lastFetched).getTime() + BROWSE_FRESHNESS_MS : null;
+      const candidates = [registryDue, browseDue].filter((t) => t != null);
+      return candidates.length ? new Date(Math.min(...candidates)).toISOString() : null;
+    })(),
   };
 }
 

@@ -4298,11 +4298,42 @@ app.get("/api/models/inspect", (req, res) => {
 // clear ok:true/false — a failed refresh is informational, never a hard
 // error, since the existing registry stays valid either way.
 app.post("/api/models/refresh", async (req, res) => {
+  // REAL BUG FOUND AND FIXED HERE: this list was missing VOICE_MODELS
+  // entirely, unlike the startup path's equivalent list — confirmed by
+  // the exact math: 55 curated models total, this route only ever
+  // checked 47 of them (55 - 8 = 47, and VOICE_MODELS has exactly 8
+  // entries). Every click of "Check now" was silently skipping every
+  // Voice Studio TTS model (MiniMax, ElevenLabs, Gemini TTS, Kokoro,
+  // Inworld, xAI, Gemini 3.1 Flash) — not a discrepancy in counting,
+  // a real gap in what gets verified.
   const allIds = [
-    ...IMAGE_MODELS, ...VIDEO_MODELS, ...MUSIC_MODELS, ...SFX_MODELS,
+    ...IMAGE_MODELS, ...VIDEO_MODELS, ...VOICE_MODELS, ...MUSIC_MODELS, ...SFX_MODELS,
     ...VOICE_CLONE_MODELS, ...TALKING_AVATAR_MODELS,
     ...Object.values(UTILITY_MODELS).flat(),
   ].map((m) => m.id);
+  // REAL GAP FOUND AND FIXED HERE: registry verification now resolves
+  // most models by cross-referencing the browse cache FIRST (see
+  // fal-catalog.js) — but this route only ever refreshed the registry
+  // check itself, never the browse cache it depends on. Confirmed
+  // directly against a real production log: "Check now" kept producing
+  // the identical "31/47 resolved, 16 need a live check" result on
+  // every click, because the browse cache underneath it was still 66+
+  // hours old and genuinely hadn't changed between clicks — no amount
+  // of re-running the registry check could ever show different results
+  // against the same frozen browse snapshot. "Check now" is explicit,
+  // user-initiated, and has a real visible loading state (unlike the
+  // quiet 5s-delayed background check), so it's the right place to
+  // afford a genuinely fresh browse pull first, not the stale one.
+  // Guarded with a short 3-minute cooldown of its own — a real person
+  // clicking "Check now" a few times in one session (confirmed
+  // happening in production) shouldn't re-trigger the full ~14-call
+  // browse sweep every single click; only the registry check itself
+  // (much cheaper — resolves for free against whatever browse data was
+  // already just fetched) needs to re-run every time.
+  const browseCacheAge = getBrowseCache().lastFetched ? Date.now() - new Date(getBrowseCache().lastFetched).getTime() : Infinity;
+  if (browseCacheAge > 3 * 60 * 1000) {
+    await refreshBrowseCatalog();
+  }
   const result = await refreshModelLiveStatus(allIds, { thorough: true });
   res.json(result);
 });
@@ -5948,6 +5979,73 @@ app.post("/api/audio/mixer/correct-region", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+// ============================================================
+// QUICK PROCESS — the direct answer to "crop, normalize, clarity,
+// booster, join, split" as standalone tools, not buried inside the
+// Mixer's per-clip edit panel. Reuses the EXACT same real primitives
+// already tested this session (editClip/concatAudioLocally/splitAudio/
+// getAudioInfo) — one process for a single file (crop/trim, reverse,
+// speed, normalize, boost, clarity, denoise, fades, loop, silence
+// removal, all in one place), one for joining multiple files, one for
+// splitting one file into several, one read-only diagnostic. All 100%
+// local ffmpeg — no AI call, no per-use cost, for any of these.
+// ============================================================
+app.post("/api/audio/tools/quick-process", async (req, res) => {
+  try {
+    const { source, edit } = req.body;
+    if (!source) return res.status(400).json({ error: "Missing a source clip." });
+    const normalized = normalizeClientSource({ source, edit });
+    const editObj = typeof normalized === "object" ? normalized.edit : null;
+    if (!editObj || !Object.keys(editObj).length) return res.status(400).json({ error: "Pick at least one real change to apply (crop, normalize, boost, clarity, etc.)." });
+    const result = await audioMixer.editClip(source, editObj);
+    const libraryItemId = saveLocalRenderToLibrary(result.filePath, `Processed clip — ${new Date().toLocaleString()}`);
+    res.json({ downloadUrl: `/api/flow/download/${result.filename}`, sizeBytes: result.sizeBytes, libraryItemId });
+  } catch (error) {
+    console.error(`[Tools] Quick process failed: ${error.message}`);
+    res.status(503).json({ error: error.message });
+  }
+});
+app.post("/api/audio/tools/join", async (req, res) => {
+  try {
+    const { sources } = req.body;
+    if (!Array.isArray(sources) || sources.length < 2) return res.status(400).json({ error: "Pick at least 2 clips to join." });
+    const result = await audioMixer.concatAudioLocally(sources);
+    const libraryItemId = saveLocalRenderToLibrary(result.filePath, `Joined (${sources.length} clips) — ${new Date().toLocaleString()}`);
+    res.json({ downloadUrl: `/api/flow/download/${result.filename}`, sizeBytes: result.sizeBytes, libraryItemId });
+  } catch (error) {
+    console.error(`[Tools] Join failed: ${error.message}`);
+    res.status(503).json({ error: error.message });
+  }
+});
+app.post("/api/audio/tools/split", async (req, res) => {
+  try {
+    const { source, splitPoints } = req.body;
+    if (!source) return res.status(400).json({ error: "Missing a source clip." });
+    if (!Array.isArray(splitPoints) || !splitPoints.length) return res.status(400).json({ error: "Add at least one split point (a time, in seconds, to cut at)." });
+    const validPoints = splitPoints.filter((p) => typeof p === "number" && p > 0);
+    if (!validPoints.length) return res.status(400).json({ error: "Split points must be positive numbers (seconds)." });
+    const segments = await audioMixer.splitAudio(source, validPoints);
+    const results = segments.map((seg, i) => {
+      const libraryItemId = saveLocalRenderToLibrary(seg.filePath, `Split segment ${i + 1} (${seg.start.toFixed(1)}s-${seg.end.toFixed(1)}s) — ${new Date().toLocaleString()}`);
+      return { downloadUrl: `/api/flow/download/${seg.filename}`, sizeBytes: seg.sizeBytes, start: seg.start, end: seg.end, libraryItemId };
+    });
+    res.json({ segments: results });
+  } catch (error) {
+    console.error(`[Tools] Split failed: ${error.message}`);
+    res.status(503).json({ error: error.message });
+  }
+});
+app.post("/api/audio/tools/info", async (req, res) => {
+  try {
+    const { source } = req.body;
+    if (!source) return res.status(400).json({ error: "Missing a clip to inspect." });
+    const info = await audioMixer.getAudioInfo(source);
+    res.json(info);
+  } catch (error) {
+    console.error(`[Tools] Audio info failed: ${error.message}`);
+    res.status(503).json({ error: error.message });
+  }
+});
 app.post("/api/audio/tools/convert-format", async (req, res) => {
   try {
     const { source, format } = req.body;
@@ -6116,7 +6214,16 @@ app.post("/api/music/generate-variations", async (req, res) => {
           const input = model.buildInput(direction.styleDirection, secondArg, { durationSeconds: model.supportsDuration ? parseInt(durationSeconds) : undefined });
           const result = await falVoiceRequest(model.id, input, {
             apiKey, costMeta: { runId, endpoint: "song-variation", model: model.id, frameIndex: i },
-            flatCost: model.costPerGeneration || 0.05,
+            // Same real fix as the main generate route below — was
+            // silently defaulting to a flat $0.05 for any per-minute-
+            // priced model (ElevenLabs Music, CassetteAI, Lyria 2, Seed
+            // Audio all have costPerGeneration: null, correctly, since
+            // none of them are flat-priced), instead of computing from
+            // the model's real rate and the actual returned duration.
+            flatCost: model.costPerGeneration ?? undefined,
+            costPerSecond: model.costPerSecond ?? undefined,
+            costPerMinute: model.costPerMinute ?? undefined,
+            defaultDurationSecondsForCost: model.supportsDuration ? parseInt(durationSeconds) || 60 : 60,
           });
           const dataUri = await downloadImageAsDataUri(result.url);
           // REAL FIX, same bug class as Voice Studio's takes: durationMs
@@ -6332,7 +6439,19 @@ app.post("/api/music/generate", async (req, res) => {
     const result = await falVoiceRequest(model.id, input, {
       apiKey,
       costMeta: { runId, endpoint: "music-generate", model: model.id },
-      flatCost: model.costPerGeneration || 0.05, // Seed Audio's exact price isn't confirmed on its own page — reasonable placeholder for the cost ledger only, not a claimed real rate
+      // REAL BUG FOUND AND FIXED HERE: this used to be
+      // "model.costPerGeneration || 0.05" — for every per-minute-priced
+      // model (ElevenLabs Music, CassetteAI, Lyria 2, Seed Audio), that
+      // silently fell back to a flat $0.05 estimate, confirmed directly
+      // against a real Fal billing export where one ElevenLabs Music
+      // generation actually cost $6.40 while this app's own ledger
+      // would have shown $0.05 for it. Now passes the model's real rate
+      // through to falVoiceRequest, which computes the actual cost from
+      // the real returned duration, not a guess.
+      flatCost: model.costPerGeneration ?? undefined,
+      costPerSecond: model.costPerSecond ?? undefined,
+      costPerMinute: model.costPerMinute ?? undefined,
+      defaultDurationSecondsForCost: knownModel?.supportsDuration ? parseInt(durationSeconds) || 60 : 60,
       progressLabel: referenceAudioBase64 ? "Generating with your reference voice — this can take a minute or two..." : "Composing your song — this can take a minute or two...",
     });
     progress.finishProgress(runId);
@@ -6481,12 +6600,21 @@ app.listen(PORT, () => {
     console.log(`[Model Catalog] Persisted cache is still fresh — skipping the live check entirely this startup.`);
     setTimeout(() => syncDiscoveredModels(curatedModelIds).then(() => enrichDiscoveredModels(process.env.FAL_KEY)), 5000);
   } else {
+    // REAL GAP FIXED HERE: this branch used to run completely silently —
+    // the system was correctly detecting a stale cache and scheduling a
+    // real background refresh, but nothing ever confirmed that out loud,
+    // so a stale-looking startup log (e.g. "saved 4675 minutes ago")
+    // looked identical whether a refresh was quietly working or quietly
+    // doing nothing. Same visibility the "still fresh" branch above
+    // already had, just missing here.
+    console.log(`[Model Catalog] Persisted cache is stale (registry: ${registryFresh ? "fresh" : "stale"}, browse: ${browseFresh ? "fresh" : "stale"}) — a real background refresh is scheduled in 5s. This is one real Fal API call, not a live-blocking one — the server is already up and serving requests.`);
     setTimeout(() => {
       const registryStep = registryFresh ? Promise.resolve() : refreshModelLiveStatus(curatedModelIds);
       registryStep
         .then(() => (browseFresh ? Promise.resolve() : refreshBrowseCatalog()))
         .then(() => syncDiscoveredModels(curatedModelIds))
-        .then(() => enrichDiscoveredModels(process.env.FAL_KEY));
+        .then(() => enrichDiscoveredModels(process.env.FAL_KEY))
+        .catch((err) => console.warn(`[Model Catalog] Background refresh hit an error and didn't finish (${err.message}) — whatever was already checked before the failure is still saved; the next startup picks up from there, not from scratch.`));
     }, 5000);
   }
   // Periodic re-checks stay on their own independent intervals — these

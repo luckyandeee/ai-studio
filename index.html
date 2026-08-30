@@ -1223,11 +1223,19 @@
                         <input type="text" class="form-control form-control-sm mt-1 d-none" id="songLyricsModelCustom" placeholder="e.g. any other Fal music model ID">
                         <p class="xx-small text-muted mb-0 mt-1" id="songLyricsModelHint"></p>
                     </div>
-                    <div class="mb-3 d-none" id="songDurationSection">
-                        <label class="form-label small fw-semibold mb-1">Length required <span class="text-muted fw-normal">(real, confirmed control for this model)</span></label>
-                        <div class="d-flex align-items-center gap-2">
+                    <div class="mb-3" id="songDurationSection">
+                        <label class="form-label small fw-semibold mb-1">🕐 Song length <span class="text-muted fw-normal">so you know the real limit before generating</span></label>
+                        <div class="d-flex align-items-center gap-2 mb-1" id="songDurationSliderWrap">
                             <input type="range" class="form-range" id="songDurationSlider" min="10" max="180" value="60" style="flex:1;">
                             <span class="small fw-semibold" id="songDurationValue" style="min-width:48px;">60s</span>
+                        </div>
+                        <p class="xx-small text-muted mb-0" id="songDurationNote"></p>
+                        <div class="d-none mt-2" id="songDurationSoftHintWrap">
+                            <label class="xx-small text-muted mb-1">This model has no real duration parameter, but its prompt understands natural language — you can still ask for a rough length as a real hint, it's just not a guaranteed constraint the way the slider above is.</label>
+                            <div class="d-flex align-items-center gap-2">
+                                <input type="number" class="form-control form-control-sm" id="songDurationSoftHint" min="10" max="600" step="5" placeholder="e.g. 90" style="max-width:100px;">
+                                <span class="xx-small text-muted">seconds — leave blank to let the model decide</span>
+                            </div>
                         </div>
                     </div>
                     <hr class="my-4">
@@ -1287,6 +1295,7 @@
                         <input type="text" class="form-control form-control-sm mb-2 d-none" id="songRefModelCustom" placeholder="e.g. another reference-voice model ID">
                         <label class="form-label xx-small fw-semibold mb-1">What should happen <span class="text-muted fw-normal">(mention @Audio1 to reference your voice clip)</span></label>
                         <textarea class="form-control form-control-sm" id="songRefPrompt" rows="3" placeholder="e.g. Upbeat radio-style intro music, then @Audio1 says: welcome to our summer sale..."></textarea>
+                        <p class="xx-small text-muted mb-2">🕐 Real confirmed ceiling for this model: up to 120 seconds (2 minutes) — no direct duration control, this is just the max to expect.</p>
                         <button type="button" class="btn btn-primary w-100 fw-bold mt-2" id="songRefGenerateBtn">🎤 Generate with My Voice</button>
                         <div class="mt-3" id="songRefResult"></div>
                     </div>
@@ -1481,6 +1490,76 @@
                                 <button type="button" class="btn btn-sm btn-outline-secondary w-100 mb-2 d-none" id="toolsRevoiceShowCorrectBtn">✏️ Or replace the region with corrected text instead</button>
                                 <div class="mt-2" id="toolsRevoiceResult"></div>
                                 <div class="mt-2" id="toolsCorrectResult"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <hr class="my-4">
+                    <div class="row g-4">
+                        <div class="col-md-6">
+                            <div class="border rounded p-3 mb-3 bg-light">
+                                <h6 class="fw-bold small mb-2">✂️ Crop &amp; Quick Process <span class="text-muted fw-normal">(trim, normalize, boost, clarity, denoise — one place, no Mixer needed)</span></h6>
+                                <select class="form-select form-select-sm mb-1" id="toolsQuickSource">
+                                    <option value="">Pick a clip from your library...</option>
+                                </select>
+                                <label class="btn btn-sm btn-outline-secondary w-100 mb-2" for="toolsQuickUpload">📁 Or upload a file</label>
+                                <input type="file" accept="audio/*" class="d-none" id="toolsQuickUpload">
+                                <p class="xx-small text-muted mb-2" id="toolsQuickUploadStatus"></p>
+                                <div class="row g-2 mb-2">
+                                    <div class="col-6">
+                                        <label class="xx-small text-muted mb-0">Crop start (s)</label>
+                                        <input type="number" class="form-control form-control-sm" id="toolsQuickTrimStart" min="0" step="0.01" placeholder="whole clip">
+                                    </div>
+                                    <div class="col-6">
+                                        <label class="xx-small text-muted mb-0">Crop end (s)</label>
+                                        <input type="number" class="form-control form-control-sm" id="toolsQuickTrimEnd" min="0" step="0.01" placeholder="whole clip">
+                                    </div>
+                                </div>
+                                <div class="d-flex flex-wrap gap-3 mb-2">
+                                    <div class="form-check"><input class="form-check-input" type="checkbox" id="toolsQuickNormalize"><label class="form-check-label xx-small" for="toolsQuickNormalize">🎚️ Normalize</label></div>
+                                    <div class="form-check"><input class="form-check-input" type="checkbox" id="toolsQuickClarity"><label class="form-check-label xx-small" for="toolsQuickClarity">✨ Clarity</label></div>
+                                    <div class="form-check"><input class="form-check-input" type="checkbox" id="toolsQuickDenoise"><label class="form-check-label xx-small" for="toolsQuickDenoise">🔇 Denoise</label></div>
+                                </div>
+                                <label class="xx-small text-muted mb-0">Boost (1.0 = off)</label>
+                                <input type="range" class="form-range mb-2" id="toolsQuickBoost" min="1" max="3" step="0.1" value="1">
+                                <button type="button" class="btn btn-primary w-100 fw-bold" id="toolsQuickProcessBtn">✂️ Apply</button>
+                                <div class="mt-2" id="toolsQuickResult"></div>
+                            </div>
+                            <div class="border rounded p-3 mb-3 bg-light">
+                                <h6 class="fw-bold small mb-2">✂️ Split Into Segments</h6>
+                                <select class="form-select form-select-sm mb-1" id="toolsSplitSource">
+                                    <option value="">Pick a clip from your library...</option>
+                                </select>
+                                <label class="btn btn-sm btn-outline-secondary w-100 mb-2" for="toolsSplitUpload">📁 Or upload a file</label>
+                                <input type="file" accept="audio/*" class="d-none" id="toolsSplitUpload">
+                                <p class="xx-small text-muted mb-2" id="toolsSplitUploadStatus"></p>
+                                <label class="xx-small text-muted mb-0">Split at these times (seconds, comma-separated)</label>
+                                <input type="text" class="form-control form-control-sm mb-2" id="toolsSplitPoints" placeholder="e.g. 30, 90, 150">
+                                <button type="button" class="btn btn-primary w-100 fw-bold" id="toolsSplitBtn">✂️ Split</button>
+                                <div class="mt-2" id="toolsSplitResult"></div>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="border rounded p-3 mb-3 bg-light">
+                                <h6 class="fw-bold small mb-2">🔗 Join Multiple Clips <span class="text-muted fw-normal">(quick sequential join — for background music/overlays, use the Mixer instead)</span></h6>
+                                <div id="toolsJoinList" class="d-flex flex-column gap-1 mb-2" style="max-height:160px; overflow-y:auto;"></div>
+                                <select class="form-select form-select-sm mb-1" id="toolsJoinAdd">
+                                    <option value="">Add a clip from your library...</option>
+                                </select>
+                                <label class="btn btn-sm btn-outline-secondary w-100 mb-2" for="toolsJoinUpload">📁 Or add an uploaded file</label>
+                                <input type="file" accept="audio/*" class="d-none" id="toolsJoinUpload">
+                                <button type="button" class="btn btn-primary w-100 fw-bold" id="toolsJoinBtn">🔗 Join (in this order)</button>
+                                <div class="mt-2" id="toolsJoinResult"></div>
+                            </div>
+                            <div class="border rounded p-3 mb-3 bg-light">
+                                <h6 class="fw-bold small mb-2">ℹ️ Audio Info <span class="text-muted fw-normal">(real format/codec/bitrate — helpful for "why won't this upload/send" questions)</span></h6>
+                                <select class="form-select form-select-sm mb-1" id="toolsInfoSource">
+                                    <option value="">Pick a clip from your library...</option>
+                                </select>
+                                <label class="btn btn-sm btn-outline-secondary w-100 mb-2" for="toolsInfoUpload">📁 Or upload a file</label>
+                                <input type="file" accept="audio/*" class="d-none" id="toolsInfoUpload">
+                                <p class="xx-small text-muted mb-2" id="toolsInfoUploadStatus"></p>
+                                <button type="button" class="btn btn-primary w-100 fw-bold" id="toolsInfoBtn">ℹ️ Inspect</button>
+                                <div class="mt-2" id="toolsInfoResult"></div>
                             </div>
                         </div>
                     </div>

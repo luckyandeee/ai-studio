@@ -740,4 +740,71 @@ async function spliceRegion(fullClipSource, regionStart, regionEnd, replacementS
   }
 }
 
-module.exports = { checkFfmpegAvailable, mixVoiceWithMusic, concatAudioLocally, mixLayers, renderMixConsole, editClip, probeDuration, downloadOrDecodeToFile, convertAudioFormat, extractAudioFromVideo, makeRingtone, spliceRegion, AUDIO_FORMAT_CODECS, OUTPUTS_DIR };
+// Real, read-only diagnostic — the actual answer to "why did this file
+// get rejected somewhere" (exactly the WhatsApp/re-voice issue this
+// session traced and fixed): ffprobe's own real stream/format data,
+// not a guess. Genuinely useful before sending a file anywhere that
+// validates strictly.
+async function getAudioInfo(source) {
+  if (!(await checkFfmpegAvailable())) {
+    throw new Error("ffmpeg isn't available — run npm install in the project folder and restart the server.");
+  }
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "audio-info-"));
+  try {
+    const srcPath = path.join(workDir, "src");
+    await downloadOrDecodeToFile(source, srcPath);
+    const binary = resolvedFfprobeBinary || ffprobeStaticPath || "ffprobe";
+    const { stdout } = await new Promise((resolve, reject) => {
+      execFile(binary, [
+        "-v", "error",
+        "-show_entries", "format=format_name,format_long_name,duration,size,bit_rate:stream=codec_name,codec_long_name,sample_rate,channels,channel_layout",
+        "-of", "json",
+        srcPath,
+      ], (err, out, errOut) => (err ? reject(new Error(errOut || err.message)) : resolve({ stdout: out })));
+    });
+    const parsed = JSON.parse(stdout);
+    const format = parsed.format || {};
+    const stream = (parsed.streams || [])[0] || {};
+    return {
+      containerFormat: format.format_long_name || format.format_name || "unknown",
+      codec: stream.codec_long_name || stream.codec_name || "unknown",
+      durationSeconds: format.duration ? parseFloat(format.duration) : null,
+      sizeBytes: format.size ? parseInt(format.size) : null,
+      bitrateKbps: format.bit_rate ? Math.round(parseInt(format.bit_rate) / 1000) : null,
+      sampleRateHz: stream.sample_rate ? parseInt(stream.sample_rate) : null,
+      channels: stream.channels || null,
+      channelLayout: stream.channel_layout || null,
+    };
+  } finally {
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// Real complement to concatAudioLocally (join): cuts ONE clip into N
+// pieces at the given split points, each a real trim via the SAME
+// proven editClip primitive — genuinely useful for turning one long
+// recording into separate chapters/segments.
+async function splitAudio(source, splitPoints) {
+  if (!(await checkFfmpegAvailable())) {
+    throw new Error("ffmpeg isn't available — run npm install in the project folder and restart the server.");
+  }
+  const sortedPoints = [...new Set(splitPoints)].sort((a, b) => a - b).filter((p) => p > 0);
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "audio-split-"));
+  try {
+    const srcPath = path.join(workDir, "src");
+    await downloadOrDecodeToFile(source, srcPath);
+    const duration = await probeDuration(srcPath);
+    if (duration == null) throw new Error("Couldn't measure the source clip's duration.");
+    const bounds = [0, ...sortedPoints.filter((p) => p < duration), duration];
+    const segments = [];
+    for (let i = 0; i < bounds.length - 1; i++) {
+      const segment = await editClip(srcPath, { trimStart: bounds[i], trimEnd: bounds[i + 1] });
+      segments.push({ filename: segment.filename, filePath: segment.filePath, sizeBytes: segment.sizeBytes, start: bounds[i], end: bounds[i + 1] });
+    }
+    return segments;
+  } finally {
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+module.exports = { checkFfmpegAvailable, mixVoiceWithMusic, concatAudioLocally, mixLayers, renderMixConsole, editClip, probeDuration, downloadOrDecodeToFile, convertAudioFormat, extractAudioFromVideo, makeRingtone, spliceRegion, getAudioInfo, splitAudio, AUDIO_FORMAT_CODECS, OUTPUTS_DIR };

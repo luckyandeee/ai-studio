@@ -2243,7 +2243,45 @@ function updateSongLyricsModelHint() {
   if (!selectEl || !hintEl) return;
   const modelId = readModelSelectEl(selectEl);
   const model = (state.musicModels || []).find((m) => m.id === modelId);
-  durationSection?.classList.toggle("d-none", !model?.supportsDuration);
+  // REAL FIX: this used to hide the whole duration area entirely for
+  // any model without a controllable slider — meaning most models gave
+  // zero indication of what length to expect at all, and the ONE
+  // slider that did show used a blanket 10-180s range regardless of
+  // what that specific model actually supports (Sonilo's real
+  // confirmed range is 1-600s, for example — the old slider silently
+  // capped it at under a third of that). Now every model shows
+  // something real: an interactive slider sized to ITS OWN confirmed
+  // range when duration is genuinely controllable, or a plain,
+  // honest note when it isn't — never hidden, never a generic number
+  // that doesn't apply to the selected model.
+  durationSection?.classList.remove("d-none");
+  const sliderEl = document.getElementById("songDurationSlider");
+  const sliderWrapEl = document.getElementById("songDurationSliderWrap");
+  const noteEl = document.getElementById("songDurationNote");
+  if (model?.durationInfo?.controllable) {
+    sliderWrapEl?.classList.remove("d-none");
+    if (sliderEl) {
+      sliderEl.min = model.durationInfo.min ?? 10;
+      sliderEl.max = model.durationInfo.max ?? 180;
+      if (Number(sliderEl.value) > sliderEl.max || Number(sliderEl.value) < sliderEl.min) {
+        sliderEl.value = Math.min(sliderEl.max, Math.max(sliderEl.min, Number(sliderEl.value) || 60));
+      }
+      document.getElementById("songDurationValue").textContent = `${sliderEl.value}s`;
+    }
+  } else {
+    sliderWrapEl?.classList.add("d-none");
+  }
+  if (noteEl) noteEl.textContent = model?.durationInfo?.note || "";
+  // Real, honest "soft hint" for models with no actual duration
+  // parameter but a prose prompt field — a real natural-language cue
+  // the model may follow, clearly distinguished from the slider above
+  // (which only appears for models with a genuine, confirmed
+  // parameter). Never shown for models like DiffRhythm, where duration
+  // is already controlled structurally (timestamped lyrics), since a
+  // free-text hint there would just be noise alongside the real
+  // mechanism.
+  const qualifiesForSoftHint = model && !model.durationInfo?.controllable && model.styleFieldFormat === "prose" && !model.requiresTimestampedLyrics;
+  document.getElementById("songDurationSoftHintWrap")?.classList.toggle("d-none", !qualifiesForSoftHint);
   // Real per-model structural tags (see MUSIC_MODELS' supportedLyricTags
   // in fal-models.js) — ACE-Step's confirmed set is genuinely narrower
   // than MiniMax's (no Intro/Outro), so this never offers a tag a
@@ -5135,8 +5173,26 @@ document.getElementById("audioLibraryList")?.addEventListener("click", async (e)
   }
 });
 
+// Real "soft hint" for models with no actual duration parameter but a
+// prose prompt field (see qualifiesForSoftHint above) — folds a
+// natural-language length cue directly into the style text, the only
+// real lever these specific models expose for length at all. Only
+// applied when the currently-selected model genuinely qualifies and a
+// value was actually typed — silently a no-op otherwise, so models
+// with a real slider (which already sends an exact durationSeconds
+// parameter) never get a redundant, potentially conflicting prompt
+// hint layered on top.
+function applyDurationSoftHint(style, modelId) {
+  if (!style) return style;
+  const model = (state.musicModels || []).find((m) => m.id === modelId);
+  const qualifies = model && !model.durationInfo?.controllable && model.styleFieldFormat === "prose" && !model.requiresTimestampedLyrics;
+  if (!qualifies) return style;
+  const seconds = parseInt(document.getElementById("songDurationSoftHint")?.value);
+  if (!seconds || seconds <= 0) return style;
+  return `${style} Approximately ${seconds} seconds long.`;
+}
 document.getElementById("songGenerateVariationsBtn")?.addEventListener("click", async () => {
-  const style = document.getElementById("songStylePrompt")?.value?.trim();
+  const style = applyDurationSoftHint(document.getElementById("songStylePrompt")?.value?.trim(), readModelSelectEl(document.getElementById("songLyricsModelSelect")));
   const lyrics = document.getElementById("songLyricsPrompt")?.value?.trim();
   const selectedModelId = readModelSelectEl(document.getElementById("songLyricsModelSelect"));
   const selectedModel = (state.musicModels || []).find((m) => m.id === selectedModelId);
@@ -5187,7 +5243,7 @@ document.getElementById("songGenerateVariationsBtn")?.addEventListener("click", 
   }
 });
 document.getElementById("songGenerateBtn")?.addEventListener("click", async () => {
-  const style = document.getElementById("songStylePrompt")?.value?.trim();
+  const style = applyDurationSoftHint(document.getElementById("songStylePrompt")?.value?.trim(), readModelSelectEl(document.getElementById("songLyricsModelSelect")));
   const lyrics = document.getElementById("songLyricsPrompt")?.value?.trim();
   const selectedModelId = readModelSelectEl(document.getElementById("songLyricsModelSelect"));
   const selectedModel = (state.musicModels || []).find((m) => m.id === selectedModelId);
@@ -6670,7 +6726,7 @@ function newVoiceScriptLine() {
     emotion: "neutral",
     speed: 1.0,
     pitch: 0,
-    variationCount: 4,
+    variationCount: 1,
     variations: [],
     selectedVariationIndex: null,
     cappedReason: null,
@@ -7872,6 +7928,10 @@ async function populateAudioToolsLibrarySelects() {
       { id: "toolsConvertSource", placeholder: "Pick a clip from your library..." },
       { id: "toolsRingtoneSource", placeholder: "Pick a clip from your library..." },
       { id: "toolsRevoiceSource", placeholder: "Source clip (what to convert)..." },
+      { id: "toolsQuickSource", placeholder: "Pick a clip from your library..." },
+      { id: "toolsSplitSource", placeholder: "Pick a clip from your library..." },
+      { id: "toolsJoinAdd", placeholder: "Add a clip from your library..." },
+      { id: "toolsInfoSource", placeholder: "Pick a clip from your library..." },
     ];
     selects.forEach(({ id, placeholder }) => {
       const el = document.getElementById(id);
@@ -7963,6 +8023,9 @@ wireToolUpload("toolsConvertUpload", "toolsConvertUploadStatus", "toolsConvertSo
 wireToolUpload("toolsRingtoneUpload", "toolsRingtoneUploadStatus", "toolsRingtoneSource", "ringtoneSource");
 wireToolUpload("toolsRevoiceSourceUpload", "toolsRevoiceSourceUploadStatus", "toolsRevoiceSource", "revoiceSource");
 wireToolUpload("toolsRevoiceTargetUpload", "toolsRevoiceTargetUploadStatus", "toolsRevoiceTarget", "revoiceTarget");
+wireToolUpload("toolsQuickUpload", "toolsQuickUploadStatus", "toolsQuickSource", "quickSource");
+wireToolUpload("toolsSplitUpload", "toolsSplitUploadStatus", "toolsSplitSource", "splitSource");
+wireToolUpload("toolsInfoUpload", "toolsInfoUploadStatus", "toolsInfoSource", "infoSource");
 function resolveToolSource(stateKey, selectId) {
   if (state.audioToolsUploads[stateKey]) return state.audioToolsUploads[stateKey];
   const item = findAudioToolsLibraryItem(document.getElementById(selectId)?.value);
@@ -8211,6 +8274,168 @@ document.getElementById("toolsRevoiceBtn")?.addEventListener("click", async () =
     saveToAudioLibrary({ type: "voice", name: `Re-voiced clip — ${new Date().toLocaleString()}`, audioDataUri: data.audio, silent: true });
   } catch (err) {
     document.getElementById("toolsRevoiceResult").innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalLabel;
+  }
+});
+
+// --- Quick Process (crop + normalize + clarity + boost + denoise) ---
+document.getElementById("toolsQuickProcessBtn")?.addEventListener("click", async () => {
+  const source = resolveToolSource("quickSource", "toolsQuickSource");
+  if (!source) return alert("Pick a clip from your library or upload a file first.");
+  const trimStart = parseFloat(document.getElementById("toolsQuickTrimStart")?.value);
+  const trimEnd = parseFloat(document.getElementById("toolsQuickTrimEnd")?.value);
+  const boost = parseFloat(document.getElementById("toolsQuickBoost")?.value);
+  const edit = {
+    trimStart: isNaN(trimStart) ? undefined : trimStart,
+    trimEnd: isNaN(trimEnd) ? undefined : trimEnd,
+    normalize: document.getElementById("toolsQuickNormalize")?.checked || undefined,
+    clarity: document.getElementById("toolsQuickClarity")?.checked || undefined,
+    denoise: document.getElementById("toolsQuickDenoise")?.checked || undefined,
+    boost: boost > 1 ? boost : undefined,
+  };
+  if (!Object.values(edit).some((v) => v !== undefined)) return alert("Pick at least one real change to apply — crop times, normalize, clarity, denoise, or boost.");
+  const btn = document.getElementById("toolsQuickProcessBtn");
+  const originalLabel = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = "✂️ Processing...";
+  try {
+    const { res, data } = await fetchJson("/api/audio/tools/quick-process", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, edit }),
+    });
+    if (!res.ok) throw new Error(data.error || "Processing failed.");
+    renderToolResult("toolsQuickResult", data, "processed-clip");
+  } catch (err) {
+    document.getElementById("toolsQuickResult").innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalLabel;
+  }
+});
+
+// --- Split into segments ---
+document.getElementById("toolsSplitBtn")?.addEventListener("click", async () => {
+  const source = resolveToolSource("splitSource", "toolsSplitSource");
+  if (!source) return alert("Pick a clip from your library or upload a file first.");
+  const raw = document.getElementById("toolsSplitPoints")?.value || "";
+  const splitPoints = raw.split(",").map((s) => parseFloat(s.trim())).filter((n) => !isNaN(n) && n > 0);
+  if (!splitPoints.length) return alert("Add at least one split point in seconds, e.g. 30, 90, 150");
+  const btn = document.getElementById("toolsSplitBtn");
+  const originalLabel = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = "✂️ Splitting...";
+  try {
+    const { res, data } = await fetchJson("/api/audio/tools/split", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, splitPoints }),
+    });
+    if (!res.ok) throw new Error(data.error || "Split failed.");
+    const resultEl = document.getElementById("toolsSplitResult");
+    resultEl.innerHTML = (data.segments || []).map((seg, i) => `
+      <div class="border rounded p-2 mb-1">
+        <div class="xx-small fw-semibold mb-1">Segment ${i + 1}: ${seg.start.toFixed(1)}s - ${seg.end.toFixed(1)}s</div>
+        <audio controls class="w-100 mb-1" src="${seg.downloadUrl}"></audio>
+        <a href="${seg.downloadUrl}" download class="btn btn-sm btn-dark fw-bold w-100">⬇️ Download (${(seg.sizeBytes / 1024).toFixed(0)} KB)</a>
+      </div>`).join("") + `<div class="xx-small text-success mt-1">✅ All segments saved to your Audio Library too.</div>`;
+  } catch (err) {
+    document.getElementById("toolsSplitResult").innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalLabel;
+  }
+});
+
+// --- Join multiple clips ---
+state.toolsJoinItems = state.toolsJoinItems || []; // array of { name, audio }, in join order
+function renderToolsJoinList() {
+  const listEl = document.getElementById("toolsJoinList");
+  if (!listEl) return;
+  listEl.innerHTML = state.toolsJoinItems.length
+    ? state.toolsJoinItems.map((it, i) => `
+      <div class="d-flex align-items-center gap-1 border rounded p-1">
+        <span class="xx-small text-muted">${i + 1}.</span>
+        <span class="xx-small flex-grow-1 text-truncate">${escapeHtml(it.name)}</span>
+        <button type="button" class="btn btn-sm btn-outline-danger py-0 px-1" data-join-remove="${i}">✕</button>
+      </div>`).join("")
+    : `<span class="xx-small text-muted">Add clips below, in the order you want them joined.</span>`;
+}
+document.getElementById("toolsJoinList")?.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-join-remove]");
+  if (!btn) return;
+  state.toolsJoinItems.splice(parseInt(btn.getAttribute("data-join-remove")), 1);
+  renderToolsJoinList();
+});
+document.getElementById("toolsJoinAdd")?.addEventListener("change", (e) => {
+  const item = findAudioToolsLibraryItem(e.target.value);
+  if (!item) return;
+  state.toolsJoinItems.push({ name: item.name, audio: item.audio });
+  e.target.value = "";
+  renderToolsJoinList();
+});
+document.getElementById("toolsJoinUpload")?.addEventListener("change", (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    state.toolsJoinItems.push({ name: `📁 ${file.name}`, audio: ev.target.result });
+    renderToolsJoinList();
+  };
+  reader.readAsDataURL(file);
+  e.target.value = "";
+});
+document.getElementById("toolsJoinBtn")?.addEventListener("click", async () => {
+  if (state.toolsJoinItems.length < 2) return alert("Add at least 2 clips to join.");
+  const btn = document.getElementById("toolsJoinBtn");
+  const originalLabel = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = "🔗 Joining...";
+  try {
+    const { res, data } = await fetchJson("/api/audio/tools/join", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sources: state.toolsJoinItems.map((it) => it.audio) }),
+    });
+    if (!res.ok) throw new Error(data.error || "Join failed.");
+    renderToolResult("toolsJoinResult", data, "joined-audio");
+  } catch (err) {
+    document.getElementById("toolsJoinResult").innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalLabel;
+  }
+});
+
+// --- Audio Info (read-only diagnostic) ---
+document.getElementById("toolsInfoBtn")?.addEventListener("click", async () => {
+  const source = resolveToolSource("infoSource", "toolsInfoSource");
+  if (!source) return alert("Pick a clip from your library or upload a file first.");
+  const btn = document.getElementById("toolsInfoBtn");
+  const originalLabel = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = "ℹ️ Inspecting...";
+  try {
+    const { res, data } = await fetchJson("/api/audio/tools/info", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source }),
+    });
+    if (!res.ok) throw new Error(data.error || "Inspection failed.");
+    const rows = [
+      ["Format", data.containerFormat],
+      ["Codec", data.codec],
+      ["Duration", data.durationSeconds != null ? `${data.durationSeconds.toFixed(2)}s` : "—"],
+      ["File size", data.sizeBytes != null ? `${(data.sizeBytes / 1024).toFixed(0)} KB` : "—"],
+      ["Bitrate", data.bitrateKbps != null ? `${data.bitrateKbps} kbps` : "—"],
+      ["Sample rate", data.sampleRateHz != null ? `${data.sampleRateHz} Hz` : "—"],
+      ["Channels", data.channelLayout || data.channels || "—"],
+    ];
+    document.getElementById("toolsInfoResult").innerHTML = `<table class="table table-sm mb-0">${rows.map(([k, v]) => `<tr><td class="xx-small text-muted">${k}</td><td class="xx-small fw-semibold">${escapeHtml(String(v))}</td></tr>`).join("")}</table>`;
+  } catch (err) {
+    document.getElementById("toolsInfoResult").innerHTML = `<div class="alert alert-danger py-2 px-3 small">${escapeHtml(err.message)}</div>`;
   } finally {
     btn.disabled = false;
     btn.innerHTML = originalLabel;

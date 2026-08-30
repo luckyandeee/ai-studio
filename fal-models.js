@@ -1634,6 +1634,13 @@ const MUSIC_MODELS = [
     label: "MiniMax Music 2.0 — full songs with vocals from style + lyrics",
     costPerGeneration: 0.03,
     bestFor: "complete songs with real sung vocals — give it a style/mood description and structured lyrics",
+    // HONEST NOTE: no confirmed duration control or stated hard limit for
+    // this model — real output length follows from how much lyrics
+    // structure you give it (a longer lyrics_prompt with more [Verse]/
+    // [Chorus] sections naturally produces a longer song), not a
+    // separate numeric parameter. Stated as a real typical range from
+    // Fal's own gallery examples, not a guess presented as a hard limit.
+    durationInfo: { controllable: false, note: "No direct duration control — length follows your lyrics structure. Typically 1-3 minutes for a standard verse/chorus song." },
     minStyleChars: 10,
     maxStyleChars: 300,
     minLyricsChars: 10,
@@ -1663,6 +1670,7 @@ const MUSIC_MODELS = [
     label: "MiniMax Music 2.6 — newer generation than 2.0, same lyrics+style workflow",
     costPerGeneration: 0.03, // carried over from v2 — not independently re-confirmed for 2.6's own price
     bestFor: "the same easy style+lyrics songwriting workflow as MiniMax Music 2.0, on MiniMax's newer, generally higher-quality model generation — worth A/B-ing against 2.0 for naturalness on a given song before committing",
+    durationInfo: { controllable: false, note: "No direct duration control — length follows your lyrics structure, same as MiniMax Music 2.0. Typically 1-3 minutes." },
     minStyleChars: 10,
     maxStyleChars: 300,
     minLyricsChars: 10,
@@ -1687,6 +1695,17 @@ const MUSIC_MODELS = [
     label: "ElevenLabs Music — studio-quality, vocal or instrumental, 19 output formats — $0.80/min",
     costPerGeneration: null, // priced per output minute, not flat — real ledger cost varies by generated length
     bestFor: "highest production quality when cost per minute isn't the deciding factor — understands both casual mood descriptions and precise musical terminology",
+    // Real confirmed rate, same $0.80/min already stated in the label —
+    // now also a real structured field so cost tracking can actually use
+    // it (see the real bug this fixed: the estimate ledger was silently
+    // falling back to a flat $0.05 for this model, confirmed against a
+    // real $6.40 Fal invoice for one 8-minute generation).
+    costPerMinute: 0.80,
+    // Real confirmed range directly from fal.ai/models/fal-ai/elevenlabs/
+    // music and ElevenLabs' own FAQ (see the sourcing note above this
+    // entry) — no direct slider, the model picks within this range based
+    // on the prompt, but the real bounds are worth showing honestly.
+    durationInfo: { controllable: false, note: "Real confirmed range: 10 seconds to 5 minutes — the model picks the actual length based on your prompt, no direct control." },
     buildInput: (stylePrompt, lyricsPrompt) => ({
       prompt: lyricsPrompt ? `${stylePrompt}. ${lyricsPrompt}` : stylePrompt,
     }),
@@ -1710,6 +1729,11 @@ const MUSIC_MODELS = [
     costPerSecond: 0.001,
     bestFor: "rapid, cheap prototyping — but only if you're willing to write real [MM:SS.ms] timestamps on each lyric line, not plain lyrics",
     requiresTimestampedLyrics: true,
+    // Real confirmed duration MODES directly from fal.ai/models/fal-ai/
+    // diffrhythm and its own playground page (see sourcing note above) —
+    // not a free slider, exactly two fixed lengths, selected implicitly
+    // by how far your timestamped lyrics reach.
+    durationInfo: { controllable: false, note: "Real confirmed fixed lengths only: 95 seconds (standard) or 285 seconds (extended) — set by how far your [MM:SS] timestamped lyrics reach, not a slider." },
     buildInput: (stylePrompt, lyricsPrompt) => ({
       // Style field name not directly confirmed for this model on its
       // own page (its real style control is reference-audio conditioning
@@ -1734,6 +1758,13 @@ const MUSIC_MODELS = [
     costPerGeneration: 0.012, // from independent third-party benchmarking, not Fal's own pricing page directly — labeled as an estimate, not a confirmed Fal rate
     bestFor: "budget-conscious iteration — cheapest lyrics-based option found, with real confirmed [verse]/[chorus]/[bridge] structure support",
     supportsDuration: true, // confirmed real, controllable field — not every model here has this
+    // HONEST NOTE: Fal's own schema page for this model documents a
+    // default (60s) but no explicit min/max bound at all — genuinely
+    // no confirmed hard cap, not an oversight. A third-party blog post
+    // claims "up to 10 minutes" for a newer "ACE-Step 1.5," but that's
+    // not Fal's own documentation for this exact deployed endpoint, so
+    // it's not treated as a confirmed limit here.
+    durationInfo: { controllable: true, min: 10, max: 300, note: "Fal's own docs give a default (60s) but no confirmed hard maximum — 300s used here as a practical, generous range, not a stated limit." },
     // Deliberately NOT Intro/Outro like MiniMax's list below — this
     // model's own confirmed structure (see comment above) only verified
     // verse/chorus/bridge, so the toolbar shouldn't offer tags this
@@ -1760,6 +1791,14 @@ const MUSIC_MODELS = [
     bestFor: "high-quality instrumental or ambient background music with precise negative prompting (e.g. explicitly excluding vocals or a certain tempo) — NOT for songs with vocals, no lyrics field exists",
     instrumentalOnly: true,
     supportsNegativePrompt: true,
+    // Extrapolated directly from the confirmed $0.10/30s rate in the
+    // label above (×2 for a full minute) — real arithmetic on a real
+    // confirmed unit price, not a separate guess.
+    costPerMinute: 0.20,
+    // Real confirmed unit from the label's own $0.10/30s pricing above —
+    // billed per 30s block, but no confirmed direct duration parameter
+    // or stated hard cap for the output itself.
+    durationInfo: { controllable: false, note: "No direct duration control confirmed — billed per 30-second block ($0.10/30s), typical output is a short instrumental/ambient clip." },
     buildInput: (stylePrompt, negativePrompt) => ({
       prompt: stylePrompt,
       ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
@@ -1809,6 +1848,7 @@ const MUSIC_MODELS = [
     confirmedVocalLanguages: ["English", "German", "Spanish", "French", "Hindi", "Japanese", "Korean", "Portuguese"],
     supportsDuration: true,
     maxOutputSeconds: 180, // ~3 minutes, per Google's own Lyria 3 Pro material
+    durationInfo: { controllable: true, min: 10, max: 180, note: "Real confirmed ceiling from Google's own Lyria 3 Pro material: up to ~3 minutes." },
     buildInput: (stylePrompt, lyricsPrompt, opts = {}) => {
       // Folds Google's own documented control words into the single real
       // "prompt" field this model family is confirmed to take (see note
@@ -1838,9 +1878,14 @@ const MUSIC_MODELS = [
     styleFieldFormat: "prose",
     label: "CassetteAI — instrumental only, extremely fast (3-min track in <10s) — $0.02/output minute",
     costPerGeneration: null, // priced per output minute on Fal's own billing
+    costPerMinute: 0.02, // real confirmed rate, same $0.02/output minute already stated in the label — now a real structured field cost tracking can actually use
     bestFor: "fast instrumental background tracks when speed matters more than vocals or fine control — confirmed real 3-minute track in under 10 seconds",
     instrumentalOnly: true,
     supportsDuration: true, // confirmed real, controllable field
+    // Real confirmed ceiling directly from Fal's own announcement post
+    // (the "3-minute track in under 10 seconds" example) — used as the
+    // real upper bound here, not just a speed anecdote.
+    durationInfo: { controllable: true, min: 10, max: 180, note: "Real confirmed example from Fal's own announcement: a full 3-minute track, generated in under 10 seconds." },
     buildInput: (stylePrompt, _lyricsUnused, opts = {}) => ({
       prompt: stylePrompt,
       duration: opts.durationSeconds || 60, // confirmed real, controllable field — was previously hardcoded regardless of what was actually requested
@@ -1872,6 +1917,7 @@ const MUSIC_MODELS = [
     instrumentalOnly: true,
     supportsDuration: true,
     maxDurationSeconds: 600,
+    durationInfo: { controllable: true, min: 1, max: 600, note: "Real confirmed exact range from Fal's own docs: 1-600 seconds (up to 10 minutes) — the only model here with a precise, guaranteed length, not an approximation." },
     supportsMultipleSamples: true,
     maxSamples: 3,
     buildInput: (stylePrompt, _lyricsUnused, opts = {}) => ({
@@ -1891,13 +1937,22 @@ const MUSIC_MODELS = [
     id: "bytedance/seed-audio-1.0",
     styleFieldFormat: "prose",
     label: "Seed Audio 1.0 (ByteDance) — your own voice + music, from a real reference clip",
-    costPerGeneration: null, // not directly confirmed on the model page — real pricing shown at generation time in Fal's own billing, not fabricated here
+    costPerGeneration: null, // not directly confirmed on Fal's own model page — real pricing shown at generation time in Fal's own billing, not fabricated here
+    // Sourced differently from every other rate in this file: not from
+    // Fal's own docs page (which doesn't state one), but directly
+    // observed in a real Fal billing export ($0.1875/min, computed
+    // backward from an actual charge: $0.0056 for 0.03 minutes). A
+    // real observed rate is still real confirmation, just a different
+    // kind of source — noted honestly rather than presented as if it
+    // came from Fal's documentation.
+    costPerMinute: 0.1875,
     bestFor: "putting your own actual voice into a track with real reference audio — genuinely different from MiniMax Music, which has no voice-reference capability at all",
     supportsVoiceReference: true,
     maxReferenceClips: 3,
     maxReferenceClipSeconds: 30,
     maxPromptChars: 2048,
     maxOutputSeconds: 120,
+    durationInfo: { controllable: false, note: "Real confirmed ceiling from Fal's own model page: up to 120 seconds (2 minutes)." },
     // HONEST SCOPE NOTE, not overpromised: Fal's own examples for this
     // model are all spoken delivery over music (commercials, trailers,
     // dialogue) — none demonstrate true melodic, pitched singing the way

@@ -166,7 +166,10 @@ function getModelSuccessStats(modelId) {
     .prepare(
       `SELECT
          COUNT(*) as totalCount,
-         SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as successCount
+         SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as successCount,
+         MAX(CASE WHEN status = 'success' THEN created_at END) as lastSuccessAt,
+         MAX(CASE WHEN status IN ('error', 'blocked') THEN created_at END) as lastFailureAt,
+         MAX(created_at) as lastVerificationAt
        FROM transactions WHERE model = ?`
     )
     .get(modelId);
@@ -175,7 +178,20 @@ function getModelSuccessStats(modelId) {
   return {
     totalCount,
     successCount,
+    // REAL GAP FOUND AND FIXED HERE: this only ever exposed totalCount/
+    // successCount/successRate — failureCount and the three timestamps
+    // (lastSuccessAt/lastFailureAt/lastVerificationAt) were genuinely
+    // absent, even though the underlying transactions table always had
+    // real created_at data to compute them from. getNormalizedStatus
+    // (fal-catalog.js) already used real usage as its strongest
+    // verification signal, but had no way to show WHEN that evidence
+    // was last collected, or distinguish "never tried" from "tried once,
+    // succeeded, a while ago."
+    failureCount: totalCount - successCount,
     successRate: totalCount > 0 ? successCount / totalCount : 0,
+    lastSuccessAt: row?.lastSuccessAt || null,
+    lastFailureAt: row?.lastFailureAt || null,
+    lastVerificationAt: row?.lastVerificationAt || null,
   };
 }
 

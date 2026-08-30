@@ -219,6 +219,18 @@ function diagnoseFalError(err) {
   return { status, detail: text || `HTTP ${status || "unknown"}`, isSafetyBlock, isImageContentBlock, isSchemaValidationError, schemaErrorField, schemaErrorExpected };
 }
 
+// REAL BUG FOUND AND FIXED HERE: a 401/403 from Fal's own API was being
+// surfaced completely verbatim — often just the single bare word
+// "Unauthorized," with zero context on what to actually do about it.
+// Technically accurate, genuinely not actionable: it doesn't tell
+// anyone whether their key is missing, mistyped, out of credits, or
+// lacks access to a specific model — all of which look identical from
+// this one word. Wraps the SAME real underlying detail from Fal (never
+// hidden, always included) with the concrete, real things to check.
+function buildActionableAuthErrorMessage(diag) {
+  return `Fal rejected this request as unauthorized (${diag.detail || "no further detail returned"}). Check: (1) your Fal API key in Settings is correct and current, (2) your Fal account has available credits at fal.ai/dashboard/billing, (3) if you've set a custom text/vision model in Advanced Mode, your key has access to it.`;
+}
+
 // ============================================================
 // CIRCUIT BREAKER — same behavior as the old code: after N consecutive
 // failures for a given model this session, later calls make one fast
@@ -306,7 +318,7 @@ async function falImageRequest(modelId, input, { apiKey, retries = 2, costMeta =
 // per-image. Reuses the exact same retry/timeout/error-diagnosis pattern
 // that's already proven reliable for image generation, rather than
 // inventing a new one.
-async function falVoiceRequest(modelId, input, { apiKey, retries = 2, costMeta = null, costPer1kChars = 0.1, textLength = 0, flatCost = null, progressLabel = null } = {}) {
+async function falVoiceRequest(modelId, input, { apiKey, retries = 2, costMeta = null, costPer1kChars = 0.1, textLength = 0, flatCost = null, costPerSecond = null, costPerMinute = null, defaultDurationSecondsForCost = 60, progressLabel = null } = {}) {
   configureFal(apiKey);
   let lastErr;
   for (let i = 1; i <= retries; i++) {
@@ -332,11 +344,37 @@ async function falVoiceRequest(modelId, input, { apiKey, retries = 2, costMeta =
       if (!audioUrl) {
         throw new Error(`Fal returned no audio data from ${modelId}. Raw response: ${JSON.stringify(result?.data || result).slice(0, 400)}`);
       }
-      const cost = flatCost !== null ? flatCost : Number(((textLength / 1000) * costPer1kChars).toFixed(6));
+      const durationMs = result?.data?.duration_ms || result?.duration_ms || null;
+      // REAL BUG FOUND AND FIXED HERE: this used to be
+      // "flatCost !== null ? flatCost : (character-based formula)" —
+      // for any model priced per-minute/per-second (ElevenLabs Music at
+      // $0.80/min, CassetteAI, Lyria 2, Seed Audio), callers had no way
+      // to express that, so they passed `flatCost: model.costPerGeneration
+      // || 0.05` — and since costPerGeneration was null for all of
+      // these (correctly, since they're NOT flat-priced), that always
+      // silently fell through to a flat $0.05 estimate, regardless of
+      // real cost. Confirmed directly against a real Fal billing
+      // export: one ElevenLabs Music generation actually cost $6.40
+      // (8 minutes × $0.80/min) while this app's own estimate ledger
+      // would have shown $0.05 for it — a genuinely misleading ~128x
+      // undercount, not a rounding error. Now computes from the REAL
+      // returned duration_ms whenever a per-time rate is given, falling
+      // back to a documented typical-length estimate only when Fal
+      // doesn't return a duration for that particular response shape.
+      let cost;
+      if (flatCost !== null) {
+        cost = flatCost;
+      } else if (costPerSecond !== null || costPerMinute !== null) {
+        const realSeconds = durationMs ? durationMs / 1000 : defaultDurationSecondsForCost;
+        cost = costPerSecond !== null ? realSeconds * costPerSecond : (realSeconds / 60) * costPerMinute;
+        cost = Number(cost.toFixed(6));
+      } else {
+        cost = Number(((textLength / 1000) * costPer1kChars).toFixed(6));
+      }
       if (costMeta) db.recordTransaction({ ...costMeta, model: modelId, status: "success", cost });
       return {
         url: audioUrl,
-        durationMs: result?.data?.duration_ms || result?.duration_ms || null,
+        durationMs,
         // Only present on the voice-clone endpoint's response — harmless
         // undefined for every regular TTS call.
         customVoiceId: result?.data?.custom_voice_id || result?.custom_voice_id || null,
@@ -461,6 +499,7 @@ async function falTextRequest(prompt, { model, apiKey, retries = 5, costMeta = n
       if ([400, 401, 403].includes(diag.status)) {
         if (costMeta) db.recordTransaction({ ...costMeta, model: `any-llm:${model}`, status: "error", note: diag.detail, cost: 0 });
         console.log(`[Timing] ${label} FAILED after ${Date.now() - startedAt}ms — ${diag.status}: ${(diag.detail || "").slice(0, 200)}`);
+        if (diag.status === 401 || diag.status === 403) throw new Error(buildActionableAuthErrorMessage(diag));
         throw err;
       }
       if (i === retries) {
@@ -625,8 +664,39 @@ async function falVideoRequest(
     if (costMeta) db.recordTransaction({ ...costMeta, model: modelId, status: "blocked", note, cost: 0 });
     throw Object.assign(new Error(`Fal returned no video (${modelId}) — ${note}`), { isSafetyBlock: true, filterReasons: [note] });
   }
-  const servedUrl = await downloadFalVideo(videoUrl, destFilename);
-  if (costMeta) db.recordTransaction({ ...costMeta, model: modelId, status: "success", cost: estimateVideoCost(modelId, durationSeconds) });
+  // REAL BUG FOUND AND FIXED HERE: downloadFalVideo can genuinely throw
+  // (a network hiccup fetching the file, a disk write error) — and
+  // critically, that was happening OUTSIDE the only try/catch in this
+  // function, which only wraps fal.subscribe() above. By this point,
+  // Fal has ALREADY generated the video and ALREADY billed for it —
+  // the generation itself succeeded. A download failure here used to
+  // throw uncaught, which (a) never recorded ANY transaction for a real
+  // charge that had already happened — a genuine blind spot in this
+  // app's own cost ledger — and (b) propagated up to callers like the
+  // Kling avatar route, which has no way to tell "generation failed"
+  // apart from "generation succeeded but the download failed," so it
+  // would retry the WHOLE generation on a different (often pricier)
+  // fallback model. Confirmed directly against a real Fal billing
+  // export: identical duration (198.399s) billed under BOTH Kling
+  // Standard ($11.15) and Kling Pro ($22.82) at the same timestamp —
+  // exactly this failure mode, not two separate real requests. Fixed
+  // the same way persistFalImage already handles this for images:
+  // retry the download a couple of times, then gracefully fall back to
+  // Fal's own (eventually-expiring) URL rather than throwing — and
+  // always record the transaction as a real success, since Fal really
+  // did charge for it regardless of whether the local copy exists.
+  let servedUrl = videoUrl;
+  let downloadSucceeded = false;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      servedUrl = await downloadFalVideo(videoUrl, destFilename);
+      downloadSucceeded = true;
+      break;
+    } catch (err) {
+      console.warn(`[Video] Download attempt ${attempt} failed for ${modelId} (${err.message})${attempt < 2 ? " — retrying once..." : " — falling back to Fal's own URL, which will expire in a few days. The generation itself succeeded and was real money spent, so this is recorded as a success either way."}`);
+    }
+  }
+  if (costMeta) db.recordTransaction({ ...costMeta, model: modelId, status: "success", cost: estimateVideoCost(modelId, durationSeconds), note: downloadSucceeded ? null : "Generated successfully but local download failed — served from Fal's own URL instead." });
   return { url: servedUrl, modelUsed: modelId };
 }
 
